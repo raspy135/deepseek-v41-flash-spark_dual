@@ -50,11 +50,48 @@ err()  { echo "ERROR: $*" >&2; exit 1; }
 : "${EXTRA_FLAGS:=}"
 : "${MIN_FREE_GIB:=90}"
 : "${DOWNLOAD_ON_START:=0}"
+# --- EP2 / dual Spark (docs/dual-spark-plan.md) ---------------------------
+# WORLD_SIZE=2 splits the routed experts across two boxes; everything else is
+# replicated. RANK 0 serves HTTP, RANK 1 runs headless and only participates in
+# the per-layer combines. scripts/dual-up.sh sets all of these; WORLD_SIZE=1 (the
+# image default) is the single-box path with none of it touched.
+: "${WORLD_SIZE:=1}"
+: "${RANK:=0}"
+: "${MASTER_ADDR:=}"
+: "${MASTER_PORT:=29611}"
+: "${EP_LOCAL_IP:=}"
 
 echo "deepseek-v41-flash-spark $(cat /app/VERSION 2>/dev/null || echo dev)"
 
 case "$DEFAULT_THINKING" in on|off) ;; *) err "DEFAULT_THINKING must be on|off (got '$DEFAULT_THINKING')" ;; esac
 case "$SPEC" in 0|1) ;; *) err "SPEC must be 0|1 (got '$SPEC')" ;; esac
+
+# --- EP2 preflight --------------------------------------------------------
+if [[ "$WORLD_SIZE" != "1" ]]; then
+    case "$WORLD_SIZE" in 2) ;; *) err "WORLD_SIZE must be 1 or 2 (the EP2 skeleton is world-2 only)" ;; esac
+    [[ -n "$MASTER_ADDR" ]] || err "WORLD_SIZE=2 needs MASTER_ADDR (rank 0's address on the RoCE link)"
+    [[ -e /dev/infiniband/rdma_cm ]] || err "WORLD_SIZE=2 but /dev/infiniband is not in this container.
+     Run it with --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 --network host,
+     or use scripts/dual-up.sh which does. Without verbs NCCL drops to TCP sockets and the
+     collective tax goes from ~60 us to ~1.9 ms -- 30x over the Gate G0 budget."
+    # Each rank resolves its OWN RoCE GID index. The two boxes do not agree on them (index 5
+    # here, 6 on the peer, whose 5 is an empty slot), and a wrong index does not degrade to
+    # sockets -- NCCL fails the queue-pair transition outright. See scripts/roce_gid.sh.
+    if [[ -z "${NCCL_IB_GID_INDEX:-}" ]]; then
+        if read -r _hca _gid < <(/app/scripts/roce_gid.sh ${EP_LOCAL_IP:+"$EP_LOCAL_IP"}); then
+            export NCCL_IB_HCA="${NCCL_IB_HCA:-$_hca}" NCCL_IB_GID_INDEX="$_gid"
+            info "EP2 rank $RANK: RoCE $NCCL_IB_HCA gid $NCCL_IB_GID_INDEX"
+        else
+            err "cannot resolve this rank's RoCE GID (scripts/roce_gid.sh). Set NCCL_IB_GID_INDEX
+     explicitly -- but resolve it PER BOX, one value for both ranks is the classic bug."
+        fi
+    fi
+    export RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
+    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+    export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
+    info "EP2: rank $RANK of $WORLD_SIZE, rendezvous $MASTER_ADDR:$MASTER_PORT, iface ${NCCL_SOCKET_IFNAME:-auto}"
+fi
 
 # --- the weights ----------------------------------------------------------
 # A 510 GB download is not something to start by accident, so a missing model is
@@ -136,12 +173,22 @@ EK="{"
 EK="${EK%,}}"
 [[ "$EK" != "{}" ]] && FLAGS+=(--engine-kwargs "$EK")
 [[ -n "$TRACE_USED" ]] && FLAGS+=(--trace-stats "$TRACE_USED")
+# Rank > 0 is the headless worker: it loads its own half of the arena, joins the process
+# group and serves rank 0's broadcast queue. It binds no port -- run its container with
+# --no-healthcheck, since the image's HEALTHCHECK curls a socket this rank never opens.
+if [[ "$WORLD_SIZE" != "1" && "$RANK" != "0" ]]; then
+    FLAGS+=(--headless)
+fi
 # shellcheck disable=SC2206
 [[ -n "$EXTRA_FLAGS" ]] && FLAGS+=($EXTRA_FLAGS)
 FLAGS+=("$@")
 
 info "model=$MODEL_DIR  max_seq=$MAX_SEQ  arena=${ARENA_GB:-auto}  spec=$SPEC  thinking=$DEFAULT_THINKING/$DEFAULT_EFFORT"
-info "trace=${TRACE_USED:-none}  listen=$HOST:$PORT"
+if [[ "$WORLD_SIZE" != "1" && "$RANK" != "0" ]]; then
+    info "trace=${TRACE_USED:-none}  headless EP2 worker (no socket)"
+else
+    info "trace=${TRACE_USED:-none}  listen=$HOST:$PORT"
+fi
 info "the warm start reads tens of GB from NVMe before the socket is bound; /health is minutes away"
 
 cd /app

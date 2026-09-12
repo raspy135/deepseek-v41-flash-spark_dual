@@ -1,5 +1,10 @@
 # docker compose up -d  ->  serves DeepSeek-V4.1-Flash on http://127.0.0.1:8000/v1
 #
+# SINGLE BOX only. For the two-Spark EP2 pair use scripts/dual-up.sh: compose cannot span
+# hosts, and running one compose file per box means two copies of a config that must not
+# drift -- skew between EP2 ranks wedges the pair on a mismatched collective instead of
+# failing. See docs/dual-spark-plan.md.
+#
 # Read ./.env first (compose does this by itself), so the same file that configures
 # ./start.sh natively configures the container. See env.example for what the knobs mean
 # and docs/install.md for the host side.

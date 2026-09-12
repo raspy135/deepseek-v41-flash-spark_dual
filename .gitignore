@@ -29,3 +29,6 @@ results/*/state/
 !results/oneshots/
 !results/oneshots/*.html
 !results/oneshots/*.txt
+
+# persistent Triton JIT cache for the container path (scripts/dual-up.sh mounts it)
+.triton-cache/

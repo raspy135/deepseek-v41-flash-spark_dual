@@ -40,8 +40,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # python3.12 is Ubuntu 24.04's system interpreter and has a torch cu130 aarch64 wheel
 # (cp312); curl is the healthcheck, procps is for looking at the box from inside.
+#
+# python3-dev is not optional and not only a build-time convenience: Triton JIT-compiles
+# its CUDA driver shim (cuda_utils.c, which includes Python.h) on the FIRST kernel call,
+# at run time, inside this container. A host without the headers cannot start this engine
+# at all -- which is the state both Sparks are in, and a large part of why the container
+# path is worth having.
+#
+# The RDMA userspace stack is what makes the dual-Spark (EP2) mode work:
+#   libibverbs1        the verbs library NCCL dlopens for the IB/RoCE transport
+#   ibverbs-providers  the mlx5 provider -- WITHOUT it verbs opens zero devices and NCCL
+#                      silently falls back to TCP sockets, which is ~30x slower per
+#                      collective (1.9 ms vs 60 us measured) and blows the Gate G0 budget
+#   librdmacm1         connection management used during NCCL's IB setup
+#   ibverbs-utils      ibv_devinfo / ibv_devices, for telling "no RoCE" from "wrong GID"
+#                      from inside the container instead of guessing
+#   iproute2           `ip`, used by scripts/roce_gid.sh to find the link's local address
+# The kernel side (/dev/infiniband, /sys/class/infiniband) comes from the host at run
+# time -- see scripts/dual-up.sh for the device and capability flags that expose it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-dev ca-certificates curl procps \
+        libibverbs1 ibverbs-providers librdmacm1 ibverbs-utils iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv \
@@ -98,6 +117,13 @@ ENV MODEL_DIR=/models/DeepSeek-V4.1-Flash \
     TOKENIZERS_PARALLELISM=false \
     HF_HOME=/models/.hf \
     PYTHONUNBUFFERED=1
+
+# EP2 (dual Spark) defaults. WORLD_SIZE=1 is the single-box image, byte for byte the
+# behaviour this file had before dual existed; scripts/dual-up.sh overrides these per rank.
+ENV WORLD_SIZE=1 \
+    RANK=0 \
+    MASTER_PORT=29611 \
+    DSV41_DIST_TIMEOUT_S=600
 
 VOLUME ["/models"]
 EXPOSE 8000

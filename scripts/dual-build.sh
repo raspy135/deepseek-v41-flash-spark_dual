@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------------------
+# dual-build.sh -- build the serving image once and put the SAME image on both Sparks.
+#
+# It builds locally and ships the result over the 200G link with `docker save | docker load`
+# rather than running `docker build` on each box. That is deliberate: two independent builds
+# of this Dockerfile are not guaranteed to be the same image (apt and PyPI both move under
+# you, and the base tag is mutable), and EP2 is exactly the workload that punishes skew --
+# two ranks running different torch or different engine code do not disagree about an answer,
+# they wedge on a mismatched collective. One build, one image id, verified on both sides.
+#
+# The transfer is ~10 GB. Over the direct-attach link that is seconds; over WiFi it is not,
+# so this uses the same PEER address the engine does.
+#
+# Usage: scripts/dual-build.sh [--local-only]
+# ---------------------------------------------------------------------------------------
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+info() { echo "--- $*"; }
+err()  { echo "ERROR: $*" >&2; exit 1; }
+
+# shellcheck disable=SC1091
+[[ -f .env ]] && { set -a; . ./.env; set +a; }
+IMAGE="${IMAGE:-deepseek-v41-flash-spark:local}"
+PEER="${PEER:-}"
+
+info "building $IMAGE (this pulls the CUDA 13 devel base and the cu130 torch wheel)"
+docker build -t "$IMAGE" .
+LOCAL_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
+info "built $IMAGE  $LOCAL_ID"
+
+[[ "${1:-}" == "--local-only" ]] && { info "--local-only: not shipping to a peer"; exit 0; }
+[[ -n "$PEER" ]] || { info "PEER unset -- built locally only"; exit 0; }
+
+info "shipping to $PEER (~10 GB over the link; no registry involved)"
+docker save "$IMAGE" | ssh -o BatchMode=yes "$PEER" 'docker load'
+
+PEER_ID=$(ssh -o BatchMode=yes "$PEER" "docker image inspect -f '{{.Id}}' '$IMAGE'")
+[[ "$PEER_ID" == "$LOCAL_ID" ]] \
+    || err "image id mismatch after transfer: local $LOCAL_ID, peer $PEER_ID"
+info "both boxes now run the identical image: $LOCAL_ID"
