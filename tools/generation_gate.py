@@ -68,7 +68,11 @@ PROMPTS = [
     # balanced), and a model can stay perfectly well-formed while its answers rot. Long multi-step
     # work also compounds errors the way free generation does, which is the whole point of gating
     # on generation rather than teacher-forced loss.
-    dict(name="arithmetic", temperature=0.0, kind="arithmetic", min_tokens=400,
+    # min_tokens=0: this is the one workload with ground truth, so its completion signal is the
+    # answer count, not the length. The length floor exists to catch a model that degenerates into
+    # stopping early; a worksheet that is finished is finished, and 387 tokens with 10/10 problems
+    # attempted is a pass, not a failure.
+    dict(name="arithmetic", temperature=0.0, kind="arithmetic", min_tokens=0,
          prompt="Solve each of these, showing your working step by step, and end each one with a "
                 "line of the form 'ANSWER: <number>'.\n"
                 + "\n".join(f"{i + 1}. {q}" for i, q in enumerate(q for q, _ in ARITH_ITEMS))),
