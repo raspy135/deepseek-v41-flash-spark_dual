@@ -60,7 +60,7 @@ services:
       memlock: -1        # pinned, 4 KiB-aligned staging buffers for the O_DIRECT reads
       stack: 67108864
       nofile: 65536      # one fd per shard plus the io thread pool
-    stop_grace_period: 180s
+    stop_grace_period: 30s
 
     deploy:
       resources:

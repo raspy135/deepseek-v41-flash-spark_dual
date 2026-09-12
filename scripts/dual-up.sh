@@ -136,7 +136,7 @@ common_flags=(
     --ipc host
     --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536
     --restart no
-    --stop-timeout 180
+    --stop-timeout "${STOP_TIMEOUT:-30}"   # matches dual-down.sh; see the note there
     -v "$HOST_MODELS:/models"
     -v "$ROOT/results:/app/results"
     -v "$ROOT/.triton-cache:/app/.triton"

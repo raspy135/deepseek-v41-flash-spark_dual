@@ -15,13 +15,18 @@ NAME0="${NAME0:-deepseek-v41-ep2-rank0}"
 NAME1="${NAME1:-deepseek-v41-ep2-rank1}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-90}"
 
-echo "--- stopping rank 0 ($NAME0)"
-docker stop -t 180 "$NAME0" >/dev/null 2>&1 || true
+# Grace is short on purpose. A clean Python unwind of an 88 GB pinned arena rarely finishes
+# inside a few minutes anyway; past STOP_TIMEOUT docker SIGKILLs, and the kernel reclaims the
+# unified pool in seconds. The expensive part of dual-down is wait_mem below, not this grace.
+STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
+
+echo "--- stopping rank 0 ($NAME0) (grace ${STOP_TIMEOUT}s)"
+docker stop -t "$STOP_TIMEOUT" "$NAME0" >/dev/null 2>&1 || true
 docker rm -f "$NAME0" >/dev/null 2>&1 || true
 
 if [[ -n "$PEER" ]]; then
-    echo "--- stopping rank 1 on $PEER ($NAME1)"
-    ssh -o BatchMode=yes "$PEER" "docker stop -t 180 '$NAME1' >/dev/null 2>&1 || true; docker rm -f '$NAME1' >/dev/null 2>&1 || true" || true
+    echo "--- stopping rank 1 on $PEER ($NAME1) (grace ${STOP_TIMEOUT}s)"
+    ssh -o BatchMode=yes "$PEER" "docker stop -t '$STOP_TIMEOUT' '$NAME1' >/dev/null 2>&1 || true; docker rm -f '$NAME1' >/dev/null 2>&1 || true" || true
 fi
 
 wait_mem() {   # $1 = label, $2 = "" local or ssh target
