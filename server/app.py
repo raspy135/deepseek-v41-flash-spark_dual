@@ -634,6 +634,21 @@ class State:
         result.stats.setdefault("server_completion_tok_per_s", round(len(result.gen_ids) / dt, 1) if dt > 0 else None)
         log.info("generation done: prompt=%d completion=%d reasoning=%d finish=%s %.2fs",
                  len(prompt_ids), len(result.gen_ids), result.reasoning_tokens, result.finish_reason, dt)
+        # The measured numbers used to live only in the response body (x_engine_stats), so watching
+        # `docker logs` told you nothing about why a request was slow. This is the repo's own rule --
+        # "a tok/s number without the hit rate and the GB that produced it is an anecdote" -- applied
+        # to the log: one line carrying the figures a slow request has to be explained with.
+        _s = result.stats or {}
+        if _s:
+            log.info("  prefill %.2fs (%s tok/s) | decode %s tok/s accept=%s | hit=%s nvme=%sGB | "
+                     "ep=%sx collective=%ss",
+                     _s.get("prefill_s") or 0.0, _s.get("prefill_tok_s"), _s.get("decode_tok_s"),
+                     _s.get("accept_len_mean"), _s.get("expert_hit_rate"), _s.get("nvme_gb"),
+                     _s.get("ep_world_size") or (_s.get("engine_config") or {}).get("ep_world_size", 1),
+                     _s.get("ep_s"))
+            for _k in ("attn_phases", "gpu_timing", "route_stats", "decode_accounting"):
+                if _s.get(_k):
+                    log.info("  %s: %s", _k, json.dumps(_s[_k], separators=(",", ":")))
 
     # A completion that calls tools is DSML, and the checkpoint's own parser
     # (corpus/sources/dsv41_encoding.py::parse_message_from_completion_text) is strict about it: a

@@ -134,6 +134,20 @@ try:
 except Exception:  # noqa: BLE001
     _prefill_attn = None
 
+# Fused Hyper-Connection coefficients. engine/hc_sinkhorn.py replaces ~160 tiny torch ops per call
+# with one launch, and the decode path has used it all along -- prefill did not, so it ran the
+# reference torch version twice per layer (attention and FFN mixes), i.e. ~160 launches x 2 x 40
+# layers x every chunk. That is what `layer_rest` was.
+#
+# It is also the better shape for chunk invariance: one program per token row, so a row's result
+# cannot depend on how many rows are in the call, which is exactly what v41_ref.tiled_rows exists
+# to fake for the torch version. DSV41_HC_FUSED=0 restores the torch path.
+try:
+    from engine.hc_sinkhorn import hc_split_sinkhorn as _hc_sinkhorn_fused  # noqa: E402
+except Exception:  # noqa: BLE001
+    _hc_sinkhorn_fused = None
+HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1" and _hc_sinkhorn_fused is not None
+
 
 # ----------------------------------------------------------------------------- weights
 class IndexerWeights:
@@ -335,6 +349,19 @@ class Model:
             self.tap(name, L, t)
 
     # ------------------------------------------------------------------ attention
+    def _hc_mixes(self, x, hc_fn, hc_scale, hc_base):
+        """(pre, post, comb) for one hyper-connection site. Same arithmetic as v41_ref.hc_mixes;
+        only the Sinkhorn balancing runs fused. R.mm stays for the projection because chunk
+        invariance depends on its fixed-row tiling."""
+        a = self.args
+        xf = x.flatten(1).float()
+        mixes = R.mm(xf, hc_fn) * R.rms_rsqrt(xf, a.norm_eps)
+        if HC_FUSED:
+            return _hc_sinkhorn_fused(mixes, hc_scale, hc_base, a.hc_mult,
+                                      a.hc_sinkhorn_iters, a.hc_eps)
+        return R.tiled_rows(lambda t: R.hc_split_sinkhorn(t, hc_scale, hc_base, a.hc_mult,
+                                                          a.hc_sinkhorn_iters, a.hc_eps), mixes)
+
     def _window_positions(self, pos: torch.Tensor):
         """[T, 128] absolute positions each query may see in its sliding window, -1 if none."""
         w = self.args.window_size
@@ -415,6 +442,7 @@ class Model:
         # has to run on fixed-size token tiles (it differs most visibly at a 1-token chunk).
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         out = R.qlinear(o.flatten(1), w.wo_b)
+        _mark("o_proj")      # wo_a (grouped) + wo_b; was being charged to the moe gap
         self._tap("attn_out", L, out)
         return out
 
@@ -634,8 +662,9 @@ class Model:
             routed = routed.to(torch.bfloat16).float()
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+        _mark("moe")         # router + slot resolve + the routed-expert kernel + the EP2 combine
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-        _mark("moe")
+        _mark("shared_expert")   # the dense FFN every token passes through, replicated on both ranks
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
@@ -645,7 +674,7 @@ class Model:
               win_lo: int = 0):
         a = self.args
         residual = h
-        attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a)
+        attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
         y = R.hc_pre(h, pre_mix)
         y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
         t0 = time.perf_counter()
@@ -653,7 +682,7 @@ class Model:
         self.stats["attn_s"] += time.perf_counter() - t0
         h = R.hc_post(y, residual, attn_post, attn_comb)
         residual = h
-        ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
         y = R.hc_pre(h, attn_pre)
         y = R.rmsnorm(y, w.ffn_norm, a.norm_eps)
         y = self.moe(y, w, L, prefill, store, arena, n_experts)

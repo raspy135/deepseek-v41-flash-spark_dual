@@ -776,7 +776,12 @@ class V41Engine:
                 "ep_collective": _ep,
                 "engram": sum(t.stats["seconds"] for t in self.tables.values()),
             }
-            _parts["unaccounted"] = max(0.0, t_dec - sum(_parts.values()))
+            # Against the WHOLE request, not decode alone. Every component above is a counter
+            # accumulated from _reset(), so each already includes this request's prefill; dividing
+            # by decode seconds produced shares over 100 % (moe_compute read 349 % on a 16-token
+            # completion) and would mislead anyone reading the log line.
+            _req = max(t_dec + t_prefill, 1e-9)
+            _parts["unaccounted"] = max(0.0, _req - sum(_parts.values()))
             # DSV41_ROUTE_STATS=1: DISTINCT routed experts per layer per verify block. This is the
             # number that sets the expert bytes a step must read -- an expert is read once however
             # many of the block's tokens route to it -- so it is what turns a measured ms/step into
@@ -813,9 +818,9 @@ class V41Engine:
                 self.last_stats["attn_phases"] = {
                     k: {"ms": v, "pct": round(v / tot * 100, 1)} for k, v in _ph.items()}
             self.last_stats["decode_accounting"] = {
-                k: {"s": round(v, 2), "pct": round(v / t_dec * 100, 1) if t_dec > 0 else None}
-                for k, v in _parts.items()
+                k: {"s": round(v, 2), "pct": round(v / _req * 100, 1)} for k, v in _parts.items()
             }
+            self.last_stats["accounting_covers"] = "prefill+decode"
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
         m = self.model
