@@ -32,3 +32,8 @@ results/*/state/
 
 # persistent Triton JIT cache for the container path (scripts/dual-up.sh mounts it)
 .triton-cache/
+
+# editor swap files
+*.swp
+*.swo
+*~
