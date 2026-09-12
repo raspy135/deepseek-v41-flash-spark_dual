@@ -342,7 +342,28 @@ class FastDecoder:
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
-        out = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.store.arena, a.swiglu_limit).float()
+        store = self.m.store
+        if getattr(store, "null_slot", None) is not None:
+            # EP2 (engine/dist.py). This path does NOT go through Model.moe, so the two things
+            # that method does for expert parallel have to be done here as well -- and both are
+            # load-bearing:
+            #   slots_repeat=True  every non-owned expert of the block shares the one null slot,
+            #                      which violates build_routing_small's "<= BM pairs per slot"
+            #                      invariant. Without it the 6-token verify block silently
+            #                      corrupts ~1 token in 10 (tools/fp4_moe.py, and the dual run
+            #                      that produced "mixture-of-experualiayer").
+            #   fp32 + combine     this rank computed only its half of the k-sum; the all-reduce
+            #                      supplies the rest. Rounding to bf16 happens ONCE, after the
+            #                      combine, at the same point the single-box path rounds.
+            # The all-reduce is captured into this graph -- Gate G1 (scripts/gate_g1_graph_nccl.py)
+            # verified NCCL collectives capture and replay correctly on these two boxes.
+            out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit,
+                                out_dtype=torch.float32, slots_repeat=True)
+            store.ep.combine(out)
+            out = out.to(torch.bfloat16).float()
+        else:
+            out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
+        # shared expert is replicated and added AFTER the combine, so it is counted once
         out += R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         h = R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb)
         self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)

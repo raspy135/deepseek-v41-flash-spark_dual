@@ -22,6 +22,7 @@ import importlib.util
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
@@ -447,6 +448,19 @@ class State:
         self.eos_id = tok.token_to_id(enc.eos_token)
         self.think_end_id = tok.token_to_id(THINK_END)
         self.started = int(time.time())
+        # EP2 (docs/dual-spark-plan.md): when the engine joined a process group, every accepted
+        # request must be mirrored to the peer BEFORE it is driven -- the peer computes this
+        # request's half of every routed-expert layer, and its per-layer combine is the only
+        # rendezvous point. Inert (ep_active False) for the whole single-box path.
+        _ep = getattr(engine, "ep", None)
+        self.ep = _ep
+        self.ep_active = bool(_ep is not None and _ep.active)
+        # Set once the pair can no longer be trusted to be in step: a request was broadcast to
+        # rank 1 and then died on rank 0 somewhere the peer could not learn about. From there
+        # the peer is either gone (it exits on its own failures) or waiting on a collective
+        # nobody will issue, so the next request would hang for DSV41_DIST_TIMEOUT_S instead of
+        # failing. Restart is the only recovery in this recipe; say so in a 503 and in /health.
+        self.ep_fault: Optional[str] = None
         if self.eos_id != engine.eos_token_id:
             log.warning("engine.eos_token_id=%s differs from tokenizer EOS id %s", engine.eos_token_id, self.eos_id)
         # Constrained tool calls: only with an engine that can mask its own sampling, and only
@@ -498,11 +512,39 @@ class State:
             gate = self.grammars.for_tools(tools)
         if gate is not None:
             gen_kwargs["grammar"] = gate
+        if self.ep_active:
+            # Lockstep contract (engine/dist.py): rank 0 decides, the peer obeys. Three rules:
+            #  * seed must be concrete and SHARED -- seed=None would leave each rank drawing its
+            #    own rejection-sampling numbers, and the first divergent token means mismatched
+            #    collective counts: an NCCL hang, not a wrong answer.
+            #  * the grammar gate is a rank-0 decoding constraint built from the request's tool
+            #    schemas, which the peer never sees -- refused rather than silently desyncing.
+            #    (Tool CALLING still works: DSV41_TOOL_GRAMMAR=0 is the tolerant-parser path.)
+            #  * ignore_eos rides inside kwargs so the peer's step count clamps identically.
+            if gen_kwargs["seed"] is None:
+                gen_kwargs["seed"] = random.randint(0, 2 ** 31 - 1)
+            if gate is not None:
+                raise APIError(501, "tool-call grammar gating is not available in EP2 mode",
+                               code="ep2_unsupported")
+            if ignore_eos:
+                gen_kwargs["ignore_eos"] = True
+            if self.ep_fault:
+                raise APIError(503, f"EP2 pair is out of step ({self.ep_fault}); restart both ranks",
+                               code="ep2_desynced")
+            # Anything that can raise on rank 0 must raise BEFORE the broadcast, or rank 1 takes
+            # the request, hits the same failure, and exits -- a client-triggered way to lose the
+            # peer. This one is the engine's own context assert, reachable from any HTTP request.
+            over = len(prompt_ids) + max_tokens + 8 - self.engine.max_context
+            if over > 0:
+                raise APIError(400, f"prompt {len(prompt_ids)} + max_tokens {max_tokens} exceeds "
+                                    f"context {self.engine.max_context} by {over} tokens",
+                               code="context_length_exceeded", param="max_tokens")
+            self.ep.broadcast_request({"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs})
         if ignore_eos:
             try:
-                gen = self.engine.generate(prompt_ids, ignore_eos=True, **gen_kwargs)
+                gen = self.engine.generate(prompt_ids, ignore_eos=True, **{k: v for k, v in gen_kwargs.items() if k != "ignore_eos"})
             except TypeError:  # an engine without the kwarg (MockEngine): empty stop set is enough
-                gen = self.engine.generate(prompt_ids, **gen_kwargs)
+                gen = self.engine.generate(prompt_ids, **{k: v for k, v in gen_kwargs.items() if k != "ignore_eos"})
         else:
             gen = self.engine.generate(prompt_ids, **gen_kwargs)
         hit_eos = False
@@ -529,6 +571,20 @@ class State:
                 for _ in range(4):
                     if next(gen, None) is None:
                         break
+        except Exception as e:
+            # GeneratorExit is deliberately NOT caught here: a stop string or a client
+            # disconnect closes this generator, `gen.close()` below raises GeneratorExit into
+            # the decode loop, and engine/v41_engine.py releases rank 1 on the way out -- a
+            # clean, routine abort with the pair still in step.
+            #
+            # A real exception is the other case. The engine died mid-request, or the release
+            # itself failed, and nothing can prove rank 1 is still on the same step. Latch it:
+            # the next request gets a 503 telling the operator to restart the pair, instead of
+            # blocking for DSV41_DIST_TIMEOUT_S on a collective that will never be matched.
+            if self.ep_active:
+                self.ep_fault = f"{type(e).__name__}: {e}"[:200]
+                log.error("EP2: request failed after the peer took it (%s); pair marked out of step", e)
+            raise
         finally:
             gen.close()
 
@@ -745,9 +801,14 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         try:
             if path == "/health":
-                body = {"status": "ok", "model": st.model_name, "engine": st.args.engine,
+                body = {"status": "degraded" if st.ep_fault else "ok",
+                        "model": st.model_name, "engine": st.args.engine,
                         "busy": st.lock.locked(), "max_context": st.engine.max_context,
                         "uptime_s": int(time.time()) - st.started}
+                if st.ep_fault:
+                    # A wedged pair still answers /health; saying "ok" here is what would turn a
+                    # dead peer into a silently half-serving cluster.
+                    body["ep_fault"] = st.ep_fault
                 # Static engine configuration (arena GB/slots, max_seq, spec, trace stats, kernel):
                 # every measured number in RESULTS.md has to be quoted with the config that produced
                 # it, and a bench run should not have to be told what the server was started with.
@@ -981,6 +1042,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--trace-stats", default=None,
                    help="v41 engine: coverage.json from tools/expert_stats.py, ranks the warm-start hot set")
     p.add_argument("--no-spec", action="store_true", help="v41 engine: disable MTP speculative decoding")
+    p.add_argument("--headless", action="store_true",
+                   help="EP2 worker rank: load the engine, serve the head's broadcast queue, bind no port")
     p.add_argument("--max-context", type=int, default=32768, help="context limit for the mock engine")
     p.add_argument("--mock-delay", type=float, default=0.0, help="seconds to sleep per mock burst")
     p.add_argument("--log-level", default="INFO")
@@ -991,12 +1054,64 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+def run_worker(engine) -> None:
+    """EP2 rank > 0: no HTTP, no clients. The engine's constructor already joined the process
+    group and warm-started this rank's half of the arena; this loop just serves the head's
+    broadcast queue forever. Discarding the output is the point -- the value of each forward
+    here is participation in the per-layer combines and identical logits, not text.
+
+    A failed request means the pair is desynced (the head will sit waiting on a collective
+    this rank no longer issues), so there is nothing to recover: exit non-zero loudly and let
+    the launcher's restart story handle it, like everything else in this recipe."""
+    import torch.distributed as X  # noqa: F401  (presence was checked by EPDistributed.init)
+    ep = engine.ep
+    log.info("EP2 rank %d: headless worker, waiting for requests from rank 0", ep.rank)
+    n = 0
+    try:
+        while True:
+            try:
+                req = ep.broadcast_request(None)
+            except Exception:
+                # Head stopped / rendezvous lost -- clean exit, not a desync crash.
+                log.info("EP2 worker: rendezvous lost (head stopped?) -- exiting")
+                break
+            if req is None or req.get("cmd") == "shutdown":
+                break
+            n += 1
+            t0 = time.time()
+            try:
+                for _ in engine.generate(req["prompt_ids"], **req["kwargs"]):
+                    pass
+            except Exception:
+                log.exception("EP2 worker: request %d failed; the pair is desynced, exiting", n)
+                os._exit(1)
+            log.info("EP2 worker: request %d done (%d prompt tokens, %.1f s)",
+                     n, len(req["prompt_ids"]), time.time() - t0)
+    finally:
+        try:
+            engine.close()
+        finally:
+            try:
+                ep.destroy()
+            except Exception:
+                pass
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     tok = Tok(args.model_dir)
     enc = load_encoding_module(args.model_dir)
     engine = make_engine(args, tok, enc)
+    ep = getattr(engine, "ep", None)
+    headless = args.headless or (ep is not None and getattr(ep, "active", False) and ep.rank != 0)
+    if headless:
+        if ep is None or not getattr(ep, "active", False):
+            raise SystemExit("--headless is the EP2 worker mode; it needs WORLD_SIZE > 1")
+        if ep.rank == 0:
+            raise SystemExit("--headless on RANK=0 would serve nobody; the head serves HTTP")
+        run_worker(engine)
+        return
     state = State(args, tok, enc, engine)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
@@ -1010,6 +1125,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         pass
     finally:
         httpd.server_close()
+        # EP2: tell rank 1 to go home. run_worker() blocks in broadcast_request between
+        # requests, so without this the peer sits there holding its half of the pool until the
+        # process-group timeout expires -- and ./stop.sh's peer_wait_mem would watch it do it.
+        # The engine lock is what makes this safe: a request still in flight owns the
+        # collectives, and the shutdown message has to queue behind it, not interleave with it.
+        if state.ep_active and not state.ep_fault:
+            try:
+                with engine.lock:
+                    state.ep.broadcast_request({"cmd": "shutdown"})
+                log.info("EP2: shutdown broadcast to rank %d", 1)
+            except Exception as e:
+                log.warning("EP2: could not tell the peer to shut down (%s); ./stop.sh will", e)
         engine.close()
 
 

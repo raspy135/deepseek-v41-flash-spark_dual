@@ -35,9 +35,18 @@ import torch
 
 ALIGN = 4096
 # every counter reset between requests (engine/v41_engine.py::_reset) lives here
+# sync_s / book_s split route_s into the two things it was hiding, and they answer different
+# questions. sync_s is the blocking device->host copy at the top of resolve(): the host is parked
+# while the GPU finishes everything queued for this layer, so it is GPU work made visible, and
+# CUDA-graph capture does NOT make it go away -- it only stops exposing it 40 times a step.
+# book_s is the numpy/dict slot bookkeeping that follows, during which the GPU has nothing queued
+# and is idle: that IS pure host overhead and is exactly what the graphed fast path removes.
+# Measuring only their sum (route_s, 58 % of decode in the first dual run) cannot tell you which
+# fix to build, which is why they are split here.
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
-              "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
-              "loads": 0, "promoted": 0}
+              "resolve_s": 0.0, "route_s": 0.0, "sync_s": 0.0, "book_s": 0.0, "resolves": 0,
+              "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
+              "loads": 0, "promoted": 0, "remote": 0}
 W13_SHAPE = (2304, 2560)
 S13_SHAPE = (2304, 160)
 W2_SHAPE = (5120, 1152)
@@ -113,10 +122,26 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
                  io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
-                 read_chunk_mb: float | None = None):
+                 read_chunk_mb: float | None = None, ep=None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
-        self.n_slots = arena.slots
+        # EP2 (engine/dist.py): with expert parallel active, this rank only resolves experts it
+        # owns (expert % world == rank), and one arena slot is permanently reserved as the NULL
+        # slot: every NON-owned routed expert maps there. Its zero-filled weights make the
+        # kernel compute an exact 0 for that (token, k) pair -- which is precisely the other
+        # rank's job -- with no change to fp4_moe.py: pair grouping by slot already tolerates
+        # many pairs sharing one expert, and the final sum over k is in fixed k order either
+        # way, so chunk invariance survives. Not owned is therefore NOT a miss: no LRU entry,
+        # no transient ring slot, no NVMe read, no hit-rate denominator -- counted as
+        # stats["remote"]. Only the FP4 arena format is EP-wired; CB3 lands later.
+        self.ep = ep
+        ep_active = ep is not None and getattr(ep, "active", False)
+        self.null_slot = None
+        self.n_slots = arena.slots - 1 if ep_active else arena.slots
+        if ep_active:
+            assert type(arena).__name__ == "ExpertArena", \
+                "EP2 is wired for the FP4 arena only (the CB3 null-slot load is unwritten)"
+            self.null_slot = arena.slots - 1
         self.transient_slots = transient_slots
         self.lru_slots = self.n_slots - transient_slots
         assert self.lru_slots > 0
@@ -155,6 +180,16 @@ class ExpertStore:
         self._tls = threading.local()
         self.n_experts = 384
         self.stats = dict(ZERO_STATS)
+        if ep_active:
+            # Zero-fill the null slot once: packed FP4 code 0 + UE8M0 scale 0 (= 2^-127) is an
+            # exactly-zero expert under the kernel's dequantize path, so every (token, k) pair
+            # routed here contributes exactly 0. The DSpark drafter is NOT ep-parallel: it has
+            # its own resident FP4 arena and a FixedStore, and never consults this class.
+            z = torch.zeros
+            arena.load_slot(self.null_slot,
+                            z(*W13_SHAPE, dtype=torch.uint8), z(*S13_SHAPE, dtype=torch.uint8),
+                            z(*W2_SHAPE, dtype=torch.uint8), z(*S2_SHAPE, dtype=torch.uint8),
+                            z(*W13_SHAPE, dtype=torch.uint8), z(*S13_SHAPE, dtype=torch.uint8))
 
     # ------------------------------------------------------------------ io
     def _shard(self, name: str) -> ShardFile:
@@ -374,8 +409,21 @@ class ExpertStore:
         # back up and gathered it there: two extra launches and a second sync per layer, 40 layers
         # per token, for 36 numbers.
         ex = experts.to("cpu", dtype=torch.int32, non_blocking=False).numpy()
+        t_sync = time.perf_counter()          # everything before here was waiting for the GPU
+        self.stats["sync_s"] += t_sync - t_res
+        self.stats["resolves"] += 1
         uniq = np.unique(ex)
         slot_of = {}
+        # EP2: the experts this rank does not own are NOT residents, NOT misses and NOT
+        # transient-ring traffic -- they map to the arena's zero-filled null slot and their
+        # kernel contribution is an exact 0. Pre-populating slot_of here is what keeps them
+        # out of both passes below (pass 1 gains the `in slot_of` skip; pass 2 already has it).
+        if getattr(self, "null_slot", None) is not None:
+            ep = self.ep
+            for e in uniq.tolist():
+                if not ep.owns(layer, e):
+                    slot_of[e] = self.null_slot
+                    self.stats["remote"] += 1
         to_load = []
         used: set[int] = set()  # slots already promised in this call -- never recycle one of them
         # pass 1: residents. Reserving them before any allocation is what keeps a later miss from
@@ -383,6 +431,8 @@ class ExpertStore:
         # give two experts the same slot: the second load overwrote the first expert's weights and
         # the duplicate index in moe_forward's `y[t] +=` dropped one contribution).
         for e in uniq.tolist():
+            if e in slot_of:
+                continue
             key = (layer, e)
             s = self.lru.get(key)
             if s is None:
@@ -409,12 +459,17 @@ class ExpertStore:
             slot_of[e] = s
             used.add(s)
             to_load.append((key, s))
-        assert len(set(slot_of.values())) == len(slot_of), "slot collision in resolve()"
+        # The null slot is legitimately SHARED by every remote expert of the call (like two
+        # tokens hitting one real expert); uniqueness is asserted over the real assignments only.
+        real = [s for s in slot_of.values() if s != self.null_slot]
+        assert len(set(real)) == len(real), "slot collision in resolve()"
         lut = np.full(self.n_experts, -1, dtype=np.int32)
         for e, s in slot_of.items():
             lut[e] = s
         slots = torch.from_numpy(lut[ex.astype(np.intp)]).to(experts.device)
-        self.stats["route_s"] += time.perf_counter() - t_res
+        _t_end = time.perf_counter()
+        self.stats["book_s"] += _t_end - t_sync
+        self.stats["route_s"] += _t_end - t_res   # == sync_s + book_s, kept for continuity
         if to_load:
             t0 = time.perf_counter()
             list(self.pool.map(lambda ks: self._load_into_slot(*ks), to_load))
@@ -424,6 +479,10 @@ class ExpertStore:
 
     def warm_start(self, ranked_keys: list[tuple], log=print):
         """Fill the LRU with `ranked_keys` (most important first) up to capacity."""
+        if getattr(self, "null_slot", None) is not None:
+            # only this rank's half can live here; filter BEFORE the capacity cut, or every
+            # other ranked expert would be skipped and the arena filled to half its own set.
+            ranked_keys = [k for k in ranked_keys if self.ep.owns(k[0], k[1])]
         keys = [k for k in ranked_keys[: self.lru_slots]]
         t0 = time.time()
         jobs = []

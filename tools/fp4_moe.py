@@ -348,9 +348,26 @@ def _next_pow2(v: int) -> int:
 
 def build_routing_small(slots: torch.Tensor, BM: int):
     """Decode-sized routing (P <= 64 pairs) with plain torch ops: sort the pairs by slot, one BM-block per
-    distinct slot (a slot never has more than BM pairs at this size). Static shapes, graph-capturable,
-    ~10 tiny kernels instead of one program per ARENA slot (the Triton router costs ~29 ms per step
-    with a 4,800-slot arena). Same output contract as build_routing; NB = P."""
+    distinct slot. Static shapes, graph-capturable, ~10 tiny kernels instead of one program per ARENA
+    slot (the Triton router costs ~29 ms per step with a 4,800-slot arena). Same output contract as
+    build_routing; NB = P.
+
+    HARD INVARIANT: **no slot may hold more than BM pairs.** This builder gives each distinct slot
+    exactly one BM-wide block, so a run longer than BM makes `blk * BM + rank` walk out of its own
+    block and overwrite the NEXT block's pair indices -- silently, with no error and no bounds fault,
+    because the buffer is one flat P*BM tensor. The result is a token quietly losing a real expert's
+    contribution (or gaining a stranger's): logits wrong in the third decimal, and text that is ~90 %
+    coherent with mangled tokens sprinkled through it.
+
+    On one box the invariant is free: a token's top-k picks are DISTINCT experts, so a slot collects
+    at most T pairs (T <= 6 in the verify block) against BM = 16. Expert parallel breaks it -- every
+    non-owned expert maps to the one shared null slot (engine/experts.py), so the verify block puts
+    ~T*K/2 ~= 18 pairs there. That is the EP2 decode corruption; `moe_forward(slots_repeat=True)` is
+    the fix, and it is not optional for any caller that can aim many pairs at one slot.
+
+    DSV41_CHECK_ROUTING=1 turns the invariant into a real (host-syncing, decode-path-expensive)
+    assertion. Leave it off in serving; it exists so a test can prove the violation rather than
+    infer it from garbled prose."""
     T, K = slots.shape
     P = T * K
     flat = slots.reshape(-1).to(torch.int32)
@@ -361,6 +378,10 @@ def build_routing_small(slots: torch.Tensor, BM: int):
     blk = torch.cumsum(first.to(torch.int32), 0) - 1            # block id per sorted pair
     start = torch.cummax(torch.where(first, torch.arange(P, device=flat.device, dtype=torch.int32), torch.zeros_like(blk)), 0).values
     rank = torch.arange(P, device=flat.device, dtype=torch.int32) - start
+    if os.environ.get("DSV41_CHECK_ROUTING") == "1":
+        mx = int(rank.max()) + 1
+        assert mx <= BM, (f"build_routing_small: a slot holds {mx} pairs but BM={BM}; the write would "
+                          f"overflow into the next block. Pass slots_repeat=True (or a larger block_m).")
     block_pair = torch.full((P * BM,), -1, dtype=torch.int32, device=flat.device)
     block_pair[blk * BM + rank] = order.to(torch.int32)
     block_slot = torch.full((P,), -1, dtype=torch.int32, device=flat.device)
@@ -416,17 +437,35 @@ def moe_forward(
     block_m: int | None = None,
     up_cfg: tuple[int, int, int] | None = None,
     down_cfg: tuple[int, int, int] | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    slots_repeat: bool = False,
 ) -> torch.Tensor:
-    """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120]."""
+    """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
+
+    `out_dtype` exists for EP2 (engine/dist.py). The k-sum is accumulated in fp32 and rounded to
+    bf16 exactly once, here. Under expert parallel this call returns only *part* of the k-sum --
+    the rest is on the peer -- so rounding it now would put a bf16 rounding on each half and a
+    third on their sum. engine/model.py::moe asks for fp32, all-reduces, and rounds once at the
+    same point the single-node path does. Default unchanged: every existing caller gets bf16.
+
+    `slots_repeat=True` says many (token, k) pairs may land on ONE slot -- true under expert
+    parallel, where every non-owned expert shares the null slot. It only affects the decode-sized
+    path, where it raises BM to 64. That is provably safe rather than merely bigger: this path runs
+    only when P <= 64, and a slot cannot hold more pairs than there are pairs, so BM = 64 >= P > rank
+    always. See build_routing_small's HARD INVARIANT. Default False keeps the single-box BM (and the
+    sweep-tuned configs) exactly as they were."""
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     assert weights.shape == (T, K)
     P = T * K
     dev = x.device
-    BM = block_m or _pick_bm(P)
+    BM = block_m or (64 if (slots_repeat and P <= 64) else _pick_bm(P))
     bn1, nw1, ns1 = up_cfg or _UP_CFG[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
-    if P <= 64:  # decode-sized call (<= 64 pairs, <= 6 per slot < BM): pure-torch routing, see build_routing_small
+    if P <= 64:  # decode-sized call. build_routing_small needs BM >= the longest per-slot run:
+        # distinct top-k picks give <= T <= 6 on one box, but EP2's shared null slot does not --
+        # hence slots_repeat, which lifts BM to 64 >= P. build_routing (below) pads long runs
+        # across multiple blocks itself, so the prefill path was never exposed to this.
         block_slot, block_pair, NB = build_routing_small(slots, BM)
     else:
         block_slot, block_pair, NB = build_routing(slots, arena.slots, BM)
@@ -448,7 +487,7 @@ def moe_forward(
         h.stride(0), parts.stride(0),
         TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2,
     )
-    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+    return parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
 
 
 @torch.no_grad()

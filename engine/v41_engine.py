@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
+from engine import dist as DT  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
 import v41_ref as R  # noqa: E402
@@ -238,7 +239,8 @@ class V41Engine:
                  transient_slots: int = 400, keep_free_gb: float = 20.0, swa_replay: bool | None = None,
                  hot_profile: str | None = None, prune_keep: float | None = None,
                  sim_bits: int | None = None, sim_cold_frac: float = 1.0, prune_select: str = "uniform",
-                 expert_format: str = "fp4", sim_cb2_frac: float = 0.0):
+                 expert_format: str = "fp4", sim_cb2_frac: float = 0.0,
+                 rank: int | None = None, world_size: int | None = None):
         self.model_dir = model_dir
         self.device = device
         self.spec = spec
@@ -280,13 +282,18 @@ class V41Engine:
             self.kernel = "triton-cb3"
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
-        def moe_fn(x, slots, weights, arena, limit):
+        def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.bfloat16, slots_repeat=False):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
-            drafter would cost acceptance for nothing."""
+            drafter would cost acceptance for nothing.
+
+            `out_dtype` is the EP2 hook (engine/model.py::moe): fp32 keeps this rank's HALF of
+            the k-sum unrounded until after the all-reduce. CB3 never sees it -- EP2 asserts the
+            FP4 arena at construction -- so that branch keeps its exact signature."""
             if cb3_cls is not None and isinstance(arena, cb3_cls):
                 return cb3_moe_fn(x, slots, weights, arena, limit)
-            return fp4_moe_fn(x, slots, weights, arena, limit)
+            return fp4_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
+                              slots_repeat=slots_repeat)
 
         self.moe_fn = moe_fn
         arena_cls = fp4_arena_cls
@@ -300,6 +307,19 @@ class V41Engine:
 
         self.expert_bytes = (EX.EXPERT_BYTES if cb3_cls is None
                              else __import__("cb3_moe").CB3_BYTES_PER_SLOT)
+
+        # EP2 (docs/dual-spark-plan.md): two ranks split the 15,360 routed experts by parity and
+        # replicate everything else. Default world 1 = the single-box engine, unchanged.
+        # The process group is initialized BEFORE the arena is sized: NCCL pins buffers out of
+        # the same unified pool, and an arena sized around a not-yet-created PG overcounts what
+        # is left (the keep_free floor then quietly eats itself).
+        self.ep = DT.EPDistributed(rank, world_size)
+        if self.ep.active:
+            assert expert_format in ("", "fp4"), \
+                "EP2 is wired for the FP4 arena only; the CB3 null-slot load is unwritten"
+            self.ep.init(device)
+            log(f"EP2 up: rank {self.ep.rank}/{self.ep.world}; this arena holds only experts"
+                f" where expert % {self.ep.world} == {self.ep.rank}, unowned ones map to its null slot")
 
         self.W = Weights(model_dir, index, self.args, device, log=log, act_quant=act_quant)
         if R.dense_fp4_groups():
@@ -350,7 +370,7 @@ class V41Engine:
             f"({slots / 15360 * 100:.0f}% of all routed experts, {'auto' if auto else 'pinned'})")
         self.arena = make_expert_arena(slots)
         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
-                                    io_threads=io_threads)
+                                    io_threads=io_threads, ep=self.ep)
         # load the DSpark experts (all 3 x 128 resident in their own arena)
         for k in range(3):
             for e in range(128):
@@ -423,8 +443,12 @@ class V41Engine:
                 self.store.cb_bits = pol2
                 log(f"simulated 2-bit codebook on {len(pol2)} of {len(ranked)} kept experts "
                     f"(coldest {self.sim_cb2_frac:.0%} per layer); slot size unchanged")
-            if len(ranked) > self.store.lru_slots:
-                log(f"WARNING: pruned set {len(ranked)} experts > {self.store.lru_slots} LRU slots; the tail will stream")
+            n_here = len(ranked)
+            if self.ep.active:
+                n_here = sum(1 for k in ranked if self.ep.owns(*k))
+                log(f"EP2 rank {self.ep.rank}: {n_here} of the {len(ranked)} kept experts are owned here")
+            if n_here > self.store.lru_slots:
+                log(f"WARNING: {n_here} kept experts here > {self.store.lru_slots} LRU slots; the tail will stream")
             log(f"pruned mode ({prune_select}): keep {prune_keep:.2f}, {len(ranked)} experts total "
                 f"({min(per_layer)}-{max(per_layer)} per layer), {len(ranked) * self.expert_bytes / 1e9:.1f} GB")
         else:
@@ -434,15 +458,41 @@ class V41Engine:
         self.model.prune_mask = self.model_prune_mask
         self.store.warm_start(ranked, log=log)
         self.fast = None
+        # FastDecoder captures CUDA graphs; a graph-captured NCCL all-reduce (EP2) is its own
+        # bring-up (capture-time rendezvous, buffer stability across replays). The skeleton runs
+        # the eager Model.forward loop -- correct, slower by this repo's graph-vs-eager delta --
+        # and the fast path is the first thing to re-enable once Gate G0 numbers are in.
         if spec and os.environ.get("DSV41_FAST", "1") == "1":
+            # EP2 used to be excluded here on the grounds that graph-captured collectives were
+            # unwired. Gate G1 (scripts/gate_g1_graph_nccl.py) measured that claim: NCCL
+            # all-reduces capture and replay correctly on these boxes, values verified, with
+            # TORCH_NCCL_BLOCKING_WAIT either way. The combine now lives inside the captured
+            # layer-B graph (engine/fastdecode.py::_layer_b), so the pair gets the same graphed
+            # decode as one box. DSV41_FAST=0 is the escape hatch back to eager.
             from engine.fastdecode import FastDecoder
             self.fast = FastDecoder(self.model, self, use_graphs=os.environ.get("DSV41_GRAPHS", "1") == "1")
+            # Resident (device slot LUT) mode. Two corrections for EP2:
+            #  * the threshold counts (layer, expert) pairs GLOBALLY, but each rank's LRU holds
+            #    only the experts it owns -- roughly half -- so the unadjusted test can never pass
+            #    on the pair and would silently leave the LUT off.
+            #  * even adjusted, build_lut() maps expert -> slot from this rank's LRU, and a
+            #    non-owned expert is in nobody's LRU: it would resolve to -1 instead of the null
+            #    slot. Mapping remote experts to null_slot inside the LUT is the remaining piece
+            #    of work for Mode A on two boxes, so refuse it loudly rather than emit -1 slots.
+            kept_pairs = 40 * max(6, int(np.ceil((self.prune_keep or 0) * 384)))
+            if self.ep.active:
+                kept_pairs //= self.ep.world
             resident = (self.prune_keep and self.prune_keep < 1.0 and
-                        len(self.store.lru) >= 40 * max(6, int(np.ceil(self.prune_keep * 384))) and
+                        len(self.store.lru) >= kept_pairs and
                         os.environ.get("DSV41_LUT", "1") == "1")
+            if resident and self.ep.active:
+                log("EP2: device slot LUT not yet wired for expert parallel (remote experts would "
+                    "map to -1, not the null slot); staying on the host-resolve graph path")
+                resident = False
             if resident:
                 self.fast.build_lut()
-            log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s)" % (self.fast.use_graphs, self.fast.lut is not None))
+            log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
+                % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
         from engine.fastdecode import T_VERIFY as _TV
@@ -451,6 +501,14 @@ class V41Engine:
         self._vout = torch.empty(_TV + 1, dtype=torch.long, device=device)
         self._vhost = torch.empty(_TV + 1, dtype=torch.long).pin_memory()
         torch.cuda.synchronize()
+        if self.ep.active:
+            # Force the NCCL communicator into existence now instead of inside the first
+            # request's first combine: lazy setup is a multi-second stall on the user's first
+            # token, and a hang HERE fails loudly before /health ever binds (start.sh's health
+            # wait is the right place to watch for it). Both ranks reach this exact point
+            # after their warm start, so the dummy combine is symmetric.
+            self.ep.combine(torch.zeros(1, 1, dtype=torch.float32, device=device))
+            log("EP2 communicator warm (dummy combine done)")
         self.last_stats = {}
         log("ready")
 
@@ -461,7 +519,8 @@ class V41Engine:
         c._chunk_inputs.clear()
         for L in c.pending:
             c.pending[L] = None
-        self.model.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "tokens": 0}
+        self.model.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "ep_s": 0.0, "ep_calls": 0,
+                            "tokens": 0}
         for t in self.tables.values():
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
@@ -508,6 +567,13 @@ class V41Engine:
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
                                          _st := {}, grammar, penalties)
+        except BaseException:
+            # GeneratorExit (stop string / disconnect / server error) or a real exception. The
+            # normal exit already told rank 1 to stop via the loop's own control(); only the
+            # aborted paths still owe it that message, so this is `except`, never `finally` --
+            # an extra broadcast on the happy path would desync the NEXT request.
+            self.ep.release_peer()
+            raise
         finally:
             n_out = _st.get("n_out", n_out)
             steps = _st.get("steps", steps)
@@ -539,13 +605,60 @@ class V41Engine:
                 "engram_s": round(sum(t.stats["seconds"] for t in self.tables.values()), 3),
             "engram_read_s": round(sum(t.stats.get("read_s", 0.0) for t in self.tables.values()), 3),
                 "attn_s": round(m.stats["attn_s"], 2), "moe_s": round(m.stats["moe_s"], 2),
+                # EP2 (engine/dist.py): pure time inside the per-layer combine all-reduce, and
+                # the (layer, expert) pairs this rank skipped because the peer owns them.
+                # A tok/s row under WORLD_SIZE=2 must carry the network share that produced it.
+                "ep_s": round(m.stats.get("ep_s", 0.0), 2),
+                "remote_experts": st.get("remote", 0),
                 # where the MoE time actually goes: routing+slot bookkeeping, waiting for the
                 # NVMe loads of this layer, and the Triton kernel itself (moe_s minus the rest).
                 "route_s": round(st["route_s"], 2), "load_wait_s": round(st["load_s"], 2),
+                # route_s split into the two things it was hiding (engine/experts.py):
+                #   sync_s -- the blocking device->host copy: the host parked while the GPU drains
+                #             what is queued. GPU work made visible; graph capture stops EXPOSING
+                #             it 40x a step but does not remove the work.
+                #   book_s -- numpy/dict slot bookkeeping with nothing queued on the GPU. Pure host
+                #             overhead, and the part the graphed fast path actually deletes.
+                # Their ratio is what says whether re-enabling graphs under EP2 is worth the work.
+                "sync_s": round(st.get("sync_s", 0.0), 2), "book_s": round(st.get("book_s", 0.0), 2),
+                "resolves": st.get("resolves", 0),
+                "ep_calls": m.stats.get("ep_calls", 0),
+                "ep_us_per_call": (round(m.stats["ep_s"] / m.stats["ep_calls"] * 1e6, 1)
+                                   if m.stats.get("ep_calls") else None),
                 "lease_s": round(st["lease_s"], 2), "h2d_s": round(st["h2d_s"], 2),
                 "kernel_s": round(m.stats["moe_s"] - st["resolve_s"], 2),
                 "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
                 "promoted": st["promoted"],
+            }
+            # --- where the decode seconds went -------------------------------------------
+            # One readable decomposition of decode_s, because the individual timers above do
+            # not obviously add up to anything and "moe_s is big" is not an action.
+            #
+            # Relationships that are easy to get wrong when reading them raw:
+            #   moe_s     = resolve_s + (kernel + combine + shared)
+            #   resolve_s = sync_s + book_s + load_s
+            #   kernel_s  = moe_s - resolve_s, and it INCLUDES ep_s
+            # so `compute` below subtracts ep_s back out to leave the actual expert math.
+            #
+            # These are HOST wall-clock timers and some of the work behind them overlaps (the
+            # NVMe loads run on a thread pool), so the parts do not have to sum to decode_s.
+            # `unaccounted` is printed rather than hidden: it is the sampler, the drafter, the
+            # Python of the decode loop itself, and any overlap -- and if it ever dominates,
+            # that is the finding, not a rounding error.
+            _ep = m.stats.get("ep_s", 0.0)
+            _parts = {
+                "attn": m.stats["attn_s"],
+                "moe_sync_gpu_wait": st.get("sync_s", 0.0),
+                "moe_book_host": st.get("book_s", 0.0),
+                "moe_nvme_wait": st["load_s"],
+                "moe_compute": max(0.0, m.stats["moe_s"] - st["resolve_s"] - _ep),
+                "ep_collective": _ep,
+                "engram": sum(t.stats["seconds"] for t in self.tables.values()),
+            }
+            _parts["unaccounted"] = max(0.0, t_dec - sum(_parts.values()))
+            self.last_stats["decode_accounting"] = {
+                k: {"s": round(v, 2), "pct": round(v / t_dec * 100, 1) if t_dec > 0 else None}
+                for k, v in _parts.items()
             }
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
@@ -592,7 +705,12 @@ class V41Engine:
         if grammar is not None:
             grammar.observe([tok])
         yield [tok]
-        while n_out < max_tokens and tok not in stop_ids:
+        # EP2 lockstep (engine/dist.py::control): rank 0 owns this condition and hands the
+        # answer to rank 1 every step. Rank 1 evaluating it independently is what wedges the
+        # pair, because the server-side stops -- a text stop sequence, a client disconnect,
+        # the max_tokens re-clamp against an already-emitted burst -- are invisible there.
+        # Inert at world 1: control() returns its argument before touching anything.
+        while self.ep.control(n_out < max_tokens and tok not in stop_ids):
             if ph is not None:
                 ph.start()
             if self.spec:
@@ -784,6 +902,8 @@ class V41Engine:
         """Static engine configuration -- everything a measured number has to be quoted with."""
         return {
             "engine": "v41",
+            "ep_world_size": self.ep.world,
+            "ep_rank": self.ep.rank,
             "arena_gb": self.arena_gb,
             "arena_slots": self.slots,
             "lru_slots": self.store.lru_slots,

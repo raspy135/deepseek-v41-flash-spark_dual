@@ -249,7 +249,8 @@ class Model:
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
             R.act_qdq_fp8 = lambda x, block=32: x.to(torch.bfloat16)
-        self.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "tokens": 0}
+        self.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "ep_s": 0.0, "ep_calls": 0,
+                      "tokens": 0}
         self.begin_prompt()
 
     def _tap(self, name, L, t):
@@ -495,7 +496,38 @@ class Model:
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
         t0 = time.perf_counter()
         slots = store.resolve(L, indices, prefill)
-        routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+        # EP2 combine: an ExpertStore with a null slot is by construction an ep-enabled main
+        # model store (the DSpark drafter runs on a FixedStore and never has one), and its
+        # `routed` holds only THIS rank's owned subset -- zeros everywhere else. One fp32
+        # all-reduce makes both ranks hold the full routed sum, bit-identically, which is what
+        # keeps the two decode loops computing the same tokens (engine/dist.py). shared is added
+        # AFTER the combine, and only here, so it is counted once and its single-node numerics
+        # are untouched.
+        #
+        # The rounding point matters as much as the sum. The kernel accumulates the k-sum in fp32
+        # and rounds to bf16 on the way out; under EP2 that would round THIS HALF of the sum, the
+        # peer's half separately, and leave their fp32 total carrying both errors -- ~1.4x the
+        # single-node rounding noise on the routed branch, in an engine whose recent history is a
+        # string of precision regressions that only showed up as long-generation degeneration.
+        # So EP2 takes the half in fp32, all-reduces, and rounds once, exactly where the
+        # single-node path rounds: what remains is purely the REGROUPED fp32 addition that
+        # engine/dist.py's docstring claims, and nothing else.
+        if getattr(store, "null_slot", None) is not None:
+            # slots_repeat: under EP2 every non-owned expert of this call shares the ONE null slot,
+            # so the decode block aims ~half its (token, k) pairs at a single slot. The decode-sized
+            # routing builder gives each slot exactly one BM-wide block and silently overflows into
+            # the next block past BM pairs -- with BM=16 and a 6-token verify block (36 pairs, ~18
+            # of them remote) that corrupted roughly one token in ten while staying fluent enough to
+            # look like a sampling quirk. See tools/fp4_moe.py::build_routing_small.
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
+                                 slots_repeat=True)
+            tc = time.perf_counter()
+            store.ep.combine(routed)
+            self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; "moe_s" (outer t0) includes it
+            self.stats["ep_calls"] += 1                      # ep_s/ep_calls is the real per-collective cost
+            routed = routed.to(torch.bfloat16).float()
+        else:
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared

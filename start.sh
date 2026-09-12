@@ -35,7 +35,7 @@ done
 declare -A _CLI=()
 for v in MODEL_DIR PYTHON SERVED_MODEL_NAME HOST PORT MAX_SEQ ARENA_GB \
          TRACE_STATS DEFAULT_THINKING DEFAULT_EFFORT SPEC EXTRA_FLAGS PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB \
-         EXPERT_FORMAT; do
+         EXPERT_FORMAT WORLD_SIZE PEER MASTER_ADDR MASTER_PORT; do
     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
 done
 # shellcheck disable=SC1091
@@ -58,6 +58,20 @@ SPEC="${SPEC:-1}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-90}"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-1200}"
+# --- EP2 (docs/dual-spark-plan.md) -----------------------------------------
+# WORLD_SIZE=2 splits the routed experts across two GB10 boxes over the
+# ConnectX-7 link (rank 1 = a headless worker started on PEER over ssh).
+# Everything else -- weights, KV, sampling -- is replicated, so the two ranks
+# stay in lockstep on every collective. Unset/1 = the single-box recipe,
+# unchanged. Requirements on BOTH boxes: same checkout at the same path, a
+# .venv, the full checkpoint on LOCAL NVMe (O_DIRECT never crosses the
+# network), passwordless ssh head -> peer, RoCE up. WORLD_SIZE/PEER reach the
+# engine through the process environment (RANK/WORLD_SIZE/MASTER_*), which is
+# exactly what engine/dist.py:EPDistributed reads.
+WORLD_SIZE="${WORLD_SIZE:-1}"
+PEER="${PEER:-}"
+MASTER_ADDR="${MASTER_ADDR:-}"
+MASTER_PORT="${MASTER_PORT:-29611}"
 
 LOG_DIR="$SCRIPT_DIR/logs"
 LOG_FILE="$LOG_DIR/server.log"
@@ -73,6 +87,11 @@ PYTHON="$PYTHON_BIN"
 [[ -f server/app.py ]] || err "server/app.py missing -- run this from a full checkout"
 case "$DEFAULT_THINKING" in on|off) ;; *) err "DEFAULT_THINKING must be on|off (got '$DEFAULT_THINKING')" ;; esac
 case "$SPEC" in 0|1) ;; *) err "SPEC must be 0|1 (got '$SPEC')" ;; esac
+case "$WORLD_SIZE" in 1|2) ;; *) err "WORLD_SIZE must be 1 or 2 (the EP2 skeleton is world-2 only)" ;; esac
+if [[ "$WORLD_SIZE" != "1" ]]; then
+    [[ -n "$PEER" ]] || err "WORLD_SIZE=2 needs PEER=<ssh target of the second spark> (e.g. ryan@10.0.0.2)"
+    command -v ssh >/dev/null 2>&1 || err "ssh not found but WORLD_SIZE=2"
+fi
 
 # --- guard: is the port already taken? ------------------------------------
 port_busy() {
@@ -116,6 +135,43 @@ if [[ -r /proc/meminfo ]]; then
     fi
 else
     echo "WARNING: no /proc/meminfo -- skipping the memory guard (not a Linux box?)" >&2
+fi
+
+# --- guard: EP2 pair readiness ----------------------------------------------
+# The peer's arena warms before ITS socket-level participation matters, and a
+# pair that boots half-short wedges on the first collective instead of OOMing
+# loudly -- so run the same memory guard there over ssh, derive MASTER_ADDR
+# from the route to the peer if .env did not set it, and clear any orphaned
+# rank-1 worker (a zombie peer would steal the new head's broadcasts).
+peer_avail_gib() {
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+        'awk "/^MemAvailable:/ {printf \"%d\", \$2/1048576}" /proc/meminfo' 2>/dev/null
+}
+if [[ "$WORLD_SIZE" != "1" ]]; then
+    MASTER_ADDR="${MASTER_ADDR:-$(ip route get "${PEER#*@}" 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1)}"
+    [[ -n "$MASTER_ADDR" ]] || err "cannot derive MASTER_ADDR toward ${PEER#*@}; set MASTER_ADDR in .env"
+    pa=$(peer_avail_gib) || err "cannot ssh to PEER=$PEER (passwordless ssh is a dual-spark prerequisite)"
+    if (( ${pa:-0} < MIN_FREE_GIB )); then
+        err "peer $PEER has only ${pa:-?} GiB available (need >= ${MIN_FREE_GIB}); a half-booted EP2 pair hangs, it does not fail"
+    fi
+    ssh -o BatchMode=yes "$PEER" "pkill -f 'python.*server/app\.p[y]' 2>/dev/null; rm -f '$LOG_DIR/server_peer.pid'" || true
+    # RoCE GID indices are NOT the same on the two boxes (5 here, 6 on the peer -- the peer's
+    # index 5 is an empty slot), and a wrong index does not fall back to sockets: NCCL fails the
+    # QP transition with "ibv_modify_qp failed with 61 ... local GID ::" and the pair never
+    # forms. Gate G0 spent a bring-up on exactly this. Each rank resolves its own; see
+    # scripts/roce_gid.sh, and set NCCL_IB_HCA/NCCL_IB_GID_INDEX by hand only to override.
+    if [[ -z "${NCCL_IB_GID_INDEX:-}" ]]; then
+        read -r HCA0 GID0 < <("$SCRIPT_DIR/scripts/roce_gid.sh" "$MASTER_ADDR") \
+            || err "cannot resolve the local RoCE GID for $MASTER_ADDR (scripts/roce_gid.sh)"
+        read -r HCA1 GID1 < <(ssh -o BatchMode=yes "$PEER" "cd '$SCRIPT_DIR' && ./scripts/roce_gid.sh '${PEER#*@}'") \
+            || err "cannot resolve the peer's RoCE GID for ${PEER#*@}; is the checkout synced? (scripts/sync-peer.sh)"
+    else
+        HCA0="${NCCL_IB_HCA:-}"; GID0="$NCCL_IB_GID_INDEX"
+        HCA1="${NCCL_IB_HCA:-}"; GID1="$NCCL_IB_GID_INDEX"
+        info "EP2: using the NCCL_IB_GID_INDEX override ($GID0) for BOTH ranks -- verify it exists on each box"
+    fi
+    info "EP2: rank 0 here, rank 1 on $PEER (rendezvous $MASTER_ADDR:$MASTER_PORT, peer MemAvailable ${pa} GiB)"
+    info "EP2: RoCE rank0=${HCA0}/gid${GID0}  rank1=${HCA1}/gid${GID1}"
 fi
 
 # --- guard: are we already running? ---------------------------------------
@@ -181,10 +237,52 @@ info "model=$MODEL_DIR  max_seq=$MAX_SEQ  arena=${ARENA_GB:-auto}  spec=$SPEC  t
 info "log: $LOG_FILE"
 
 : > "$LOG_FILE"
-nohup "$PYTHON" server/app.py "${FLAGS[@]}" >>"$LOG_FILE" 2>&1 &
+# EP2 env for rank 0 itself: EPDistributed reads RANK/WORLD_SIZE/MASTER_* from the
+# environment; at WORLD_SIZE=1 nothing is added and the command is what it always was.
+EPEVN=()
+if [[ "$WORLD_SIZE" != "1" ]]; then
+    # Pin both ranks onto the CX7 200G interface. Without this NCCL may bind WiFi
+    # (192.168.x) and hang at init_process_group with empty logs -- Gate G0 failure mode.
+    EPEVN=(
+        RANK=0 WORLD_SIZE="$WORLD_SIZE" MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$MASTER_PORT"
+        NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
+        GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp1s0f1np1}"
+        NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+        TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+        TORCH_NCCL_BLOCKING_WAIT=1
+        DSV41_DIST_TIMEOUT_S="${DSV41_DIST_TIMEOUT_S:-600}"
+    )
+    # `if`, not `[[ ]] && ...`: under `set -e` a false test as the last statement of this block
+    # would exit the script instead of just skipping the append.
+    if [[ -n "$HCA0" ]]; then EPEVN+=(NCCL_IB_HCA="$HCA0"); fi
+    if [[ -n "$GID0" ]]; then EPEVN+=(NCCL_IB_GID_INDEX="$GID0"); fi
+fi
+nohup env ${EPEVN[@]+"${EPEVN[@]}"} "$PYTHON" server/app.py "${FLAGS[@]}" >>"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 info "started pid $SERVER_PID"
+
+# rank 1: same checkout, same flags, --headless (binds no port). Its engine load is
+# the mirror of the head's (same ~63 s of weights + its own half of the arena warm
+# start), and start.sh's health wait doubles as the wait for the rendezvous: the
+# head never binds the socket until its constructor -- including process-group init
+# and the dummy combine -- is through, which needs BOTH ranks present.
+if [[ "$WORLD_SIZE" != "1" ]]; then
+    FLAGS_Q=$(printf '%q ' "${FLAGS[@]}")
+    NCCL_IF="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
+    GLOO_IF="${GLOO_SOCKET_IFNAME:-enp1s0f1np1}"
+    PEER_PID=$(ssh -o BatchMode=yes "$PEER" \
+        "cd '$SCRIPT_DIR' && mkdir -p logs && \
+         RANK=1 WORLD_SIZE='$WORLD_SIZE' MASTER_ADDR='$MASTER_ADDR' MASTER_PORT='$MASTER_PORT' \
+         NCCL_SOCKET_IFNAME='$NCCL_IF' GLOO_SOCKET_IFNAME='$GLOO_IF' NCCL_IB_DISABLE=0 \
+         ${HCA1:+NCCL_IB_HCA='$HCA1'} ${GID1:+NCCL_IB_GID_INDEX='$GID1'} \
+         TORCH_NCCL_ASYNC_ERROR_HANDLING=1 TORCH_NCCL_BLOCKING_WAIT=1 \
+         DSV41_DIST_TIMEOUT_S='${DSV41_DIST_TIMEOUT_S:-600}' \
+         nohup '$PYTHON' server/app.py $FLAGS_Q --headless >> logs/server_peer.log 2>&1 & echo \$!") \
+        || err "failed to start rank 1 on $PEER -- check its $SCRIPT_DIR/logs/server_peer.log"
+    [[ -n "$PEER_PID" ]] && echo "$PEER_PID" > "$LOG_DIR/server_peer.pid"
+    info "rank 1 started on $PEER (pid $PEER_PID; watch it: ssh $PEER tail -f $SCRIPT_DIR/logs/server_peer.log)"
+fi
 
 if [[ "$WAIT" == false ]]; then
     echo "not waiting (--no-wait). Watch it come up with: tail -f $LOG_FILE"
@@ -202,6 +300,11 @@ while :; do
         echo "--- last 30 log lines ---" >&2
         tail -n 30 "$LOG_FILE" >&2
         rm -f "$PID_FILE"
+        if [[ "$WORLD_SIZE" != "1" ]]; then
+            echo "--- rank 1 on $PEER, last 15 log lines ---" >&2
+            ssh -o BatchMode=yes "$PEER" "tail -n 15 '$SCRIPT_DIR/logs/server_peer.log'" 2>/dev/null >&2
+            ssh -o BatchMode=yes "$PEER" "pkill -f 'python.*server/app\.p[y]' 2>/dev/null" || true
+        fi
         err "server exited during startup (see $LOG_FILE)"
     fi
     if curl -sf -o /dev/null "http://$HOST:$PORT/health"; then

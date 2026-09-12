@@ -30,6 +30,46 @@ avail_gib() {
     awk '/^MemAvailable:/ {printf "%d", $2/1048576}' /proc/meminfo
 }
 
+# EP2: the peer rank runs headless on $PEER (logs/server_peer.pid is its REMOTE pid).
+# Nothing cleans it up by itself -- with the head gone it sits in broadcast_request or
+# retries a dead rendezvous forever, holding its half of the pool. Same .env that
+# start.sh read is read here, so PEER is known even when the local pidfile is gone.
+# shellcheck disable=SC1091
+[[ -f .env ]] && { set -a; . ./.env; set +a; }
+PEER="${PEER:-}"
+PEER_PID_FILE="$SCRIPT_DIR/logs/server_peer.pid"
+peer_stop() {
+    [[ -n "$PEER" ]] || return 0
+    local peer_pids
+    peer_pids=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+        "cat '$PEER_PID_FILE' 2>/dev/null; pgrep -f 'python.*server/app\.p[y]' 2>/dev/null" \
+        2>/dev/null | grep -E '^[0-9]+$' | sort -un || true)
+    [[ -z "$peer_pids" ]] && { ssh -o BatchMode=yes "$PEER" "rm -f '$PEER_PID_FILE'" 2>/dev/null || true; return 0; }
+    echo "stopping rank 1 on $PEER: $(echo "$peer_pids" | tr '\n' ' ')"
+    # TERM, grace, KILL. The liveness re-check is `kill -0` and not `pgrep -x $p`: pgrep -x
+    # matches a process NAME, so it was being handed a pid to match against argv[0], never
+    # matched, and the KILL escalation could not fire at all -- a peer that ignored the TERM
+    # stayed up holding ~100 GiB, which is precisely the case this loop exists for.
+    ssh -o BatchMode=yes "$PEER" \
+        "for p in $peer_pids; do kill -TERM \$p 2>/dev/null; done; sleep 5; \
+         for p in $peer_pids; do kill -0 \$p 2>/dev/null && kill -KILL \$p 2>/dev/null; done; \
+         rm -f '$PEER_PID_FILE'" || true
+}
+peer_wait_mem() {
+    [[ -n "$PEER" ]] || return 0
+    echo -n "waiting for the peer's pool to come back (target >= ${MIN_FREE_GIB} GiB): "
+    for _ in $(seq 1 60); do
+        a=$(ssh -o BatchMode=yes "$PEER" 'awk "/^MemAvailable:/ {printf \"%d\", \$2/1048576}" /proc/meminfo' 2>/dev/null)
+        if [[ -n "$a" ]] && (( a >= MIN_FREE_GIB )); then
+            echo "OK, ${a} GiB available on $PEER"
+            return 0
+        fi
+        sleep 3
+    done
+    echo "WARNING: peer still at ${a:-?} GiB -- do not start another server yet" >&2
+    return 1
+}
+
 server_pids() {
     {
         # The pidfile is the normal case.
@@ -47,6 +87,7 @@ server_pids() {
 
 pids=$(server_pids)
 if [[ -z "$pids" ]]; then
+    peer_stop   # a dead head with an orphan peer is still a dual-spark outage
     echo "no DeepSeek-V4.1-Flash server running (MemAvailable $(avail_gib) GiB)"
     rm -f "$PID_FILE"
     exit 0
@@ -74,6 +115,7 @@ if [[ -n "$(server_pids)" ]]; then
     exit 1
 fi
 rm -f "$PID_FILE"
+peer_stop
 
 if [[ ! -r /proc/meminfo ]]; then
     echo "stopped."
@@ -85,7 +127,8 @@ for _ in $(seq 1 60); do
     a=$(avail_gib)
     if (( a >= MIN_FREE_GIB )); then
         echo "OK, ${a} GiB available"
-        exit 0
+        peer_wait_mem
+        exit $?
     fi
     sleep 3
 done
