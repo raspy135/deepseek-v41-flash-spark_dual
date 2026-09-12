@@ -82,6 +82,66 @@ class StepPhases:
         return "\n".join(rows)
 
 
+class MemoryWatchdog:
+    """Kill this process rather than let the host run out of memory.
+
+    A 121 GiB box holding a ~95 GB pinned expert arena has no slack. If something -- a second
+    engine, the transient scratch of the 3-bit packer, a large prompt -- pushes MemAvailable toward
+    zero, the kernel does not OOM-kill cleanly: it thrashes, sshd can no longer fork, and the
+    machine answers ping while being unusable until someone power-cycles it. That happened three
+    times on 2026-09-11/12.
+
+    Exiting immediately is strictly better than continuing: the kernel reclaims everything this
+    process holds the moment it dies, and the box stays reachable. The watchdog samples
+    /proc/meminfo twice a second from a daemon thread and calls os._exit, which is the only way out
+    that does not itself need to allocate.
+    """
+
+    def __init__(self, floor_gb: float = 2.5, interval: float = 0.5, strikes: int = 6, log=print):
+        # `strikes` consecutive samples below the floor before acting: the warm start dips briefly
+        # while the packer's scratch is live and recovers on its own, and killing a configuration
+        # that works is its own kind of failure. A real collision (a second engine, a runaway
+        # allocation) stays below the floor and trips this within a few seconds.
+        self.floor = floor_gb * 1e9
+        self.strikes = strikes
+        self.interval = interval
+        self.log = log
+        self._stop = threading.Event()
+        self.low_water = None
+
+    def start(self):
+        if host_available_bytes() is None:
+            return self  # not Linux, nothing to watch
+        t = threading.Thread(target=self._run, name="mem-watchdog", daemon=True)
+        t.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            avail = host_available_bytes()
+            if avail is None:
+                return
+            if self.low_water is None or avail < self.low_water:
+                self.low_water = avail
+            if avail >= self.floor:
+                self._below = 0
+                continue
+            self._below = getattr(self, "_below", 0) + 1
+            if self._below >= self.strikes:
+                try:
+                    self.log(f"FATAL: host MemAvailable {avail / 1e9:.1f} GB stayed below the "
+                             f"{self.floor / 1e9:.1f} GB floor for {self._below * self.interval:.1f} s; "
+                             f"exiting now so the kernel can reclaim this process instead of "
+                             f"thrashing the machine")
+                    sys.stderr.flush()
+                except Exception:  # noqa: BLE001 - never let logging stop the exit
+                    pass
+                os._exit(3)
+
+
 def host_available_bytes():
     """MemAvailable from /proc/meminfo, or None off Linux."""
     try:
@@ -123,7 +183,8 @@ class Penalties:
     """
 
     def __init__(self, presence: float = 0.0, frequency: float = 0.0, cycle_repeats: int = 4,
-                 cycle_max_period: int = 16, enabled: bool | None = None):
+                 cycle_max_period: int = 16, enabled: bool | None = None,
+                 no_repeat_ngram: int | None = None):
         self.presence = float(presence or 0.0)
         self.frequency = float(frequency or 0.0)
         self.cycle_repeats = int(cycle_repeats)
@@ -131,12 +192,16 @@ class Penalties:
         if enabled is None:
             enabled = os.environ.get("DSV41_CYCLE_BREAK", "1") == "1"
         self.cycle_enabled = bool(enabled)
+        self.no_repeat_ngram = int(no_repeat_ngram if no_repeat_ngram is not None
+                                   else os.environ.get("DSV41_NO_REPEAT_NGRAM", "0"))
         self.counts: dict[int, int] = {}
         self.hits = 0
+        self.ngram_hits = 0
 
     @property
     def active(self) -> bool:
-        return self.presence != 0.0 or self.frequency != 0.0 or self.cycle_enabled
+        return (self.presence != 0.0 or self.frequency != 0.0 or self.cycle_enabled
+                or self.no_repeat_ngram > 0)
 
     def observe(self, tokens) -> None:
         for t in tokens:
@@ -152,6 +217,24 @@ class Penalties:
                 return block[0]
         return None
 
+    def _banned_ngram_tokens(self, history) -> list:
+        """Tokens that would repeat an n-gram of `no_repeat_ngram` already in `history`.
+
+        Same rule as transformers' NoRepeatNGramLogitsProcessor, which is the reference for this
+        behaviour: if the last n-1 tokens have appeared before, every token that followed them is
+        refused. A degenerate loop repeats far more than n tokens, so it is cut on the second turn
+        of the cycle, while ordinary text and code almost never repeat a whole n-gram verbatim.
+        """
+        n = self.no_repeat_ngram
+        if not n or len(history) < n:
+            return []
+        prefix = tuple(history[-(n - 1):])
+        banned = set()
+        for i in range(len(history) - n + 1):
+            if tuple(history[i:i + n - 1]) == prefix:
+                banned.add(history[i + n - 1])
+        return list(banned)
+
     def apply(self, logits: torch.Tensor, history) -> torch.Tensor:
         """logits [V] or [T, V] fp32 -> the same tensor, penalised in place."""
         if self.presence or self.frequency:
@@ -164,6 +247,14 @@ class Penalties:
                     logits[idx] -= pen
                 else:
                     logits[:, idx] -= pen
+        ban = self._banned_ngram_tokens(history)
+        if ban:
+            idx = torch.tensor(ban, device=logits.device, dtype=torch.long)
+            if logits.dim() == 1:
+                logits[idx] = float("-inf")
+            else:
+                logits[:, idx] = float("-inf")
+            self.ngram_hits += 1
         t = self._cycle_token(history)
         if t is not None:
             self.hits += 1
@@ -362,12 +453,35 @@ class V41Engine:
                 log(f"arena {arena_gb:.1f} GB capped to {cap:.1f} GB (MemAvailable {host_avail / 1e9:.1f} GB, "
                     f"keep_free {keep_free_gb} GB)")
                 arena_gb = max(10.0, cap)
+            # A pinned arena is checked against what is free *now*, but the warm start needs more on
+            # top of it: the 3-bit packer works on the GPU in scratch buffers, and a chunked prefill
+            # allocates activations. Reserve that too, and refuse up front rather than discovering it
+            # halfway through a 3-minute warm start with 0.2 GB left.
+            # This check runs after the dense weights are resident, so MemAvailable already
+            # excludes them: what is still to come is the arena itself plus the transient scratch of
+            # the warm start (the 3-bit packer works in GPU buffers). Calibrated against what this
+            # box actually does -- a 98 GB arena loads with ~110 GB available and settles with 6 GB
+            # free -- rather than a pessimistic sum, because refusing a configuration that works is
+            # its own failure. The MemoryWatchdog below is the backstop if this estimate is wrong.
+            pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
+            need = arena_gb * 1e9 + pack_scratch + keep_free_gb * 1e9
+            if need > host_avail:
+                raise RuntimeError(
+                    f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
+                    f"warm-start scratch + {keep_free_gb:.1f} GB floor = {need / 1e9:.1f} GB, but "
+                    f"MemAvailable is {host_avail / 1e9:.1f} GB. Lower --arena-gb by at least "
+                    f"{(need - host_avail) / 1e9:.1f} GB, or stop whatever else holds memory "
+                    f"(on this box a boot-time vLLM container used to take 85 GB).")
         slots = int(arena_gb * 1e9 / self.expert_bytes)
         self.arena_gb, self.slots = round(arena_gb, 1), slots
         log(f"CUDA free {free / 1e9:.1f} GB of {total / 1e9:.1f}; host MemAvailable "
             f"{(host_avail or 0) / 1e9:.1f} GB; arena {arena_gb:.1f} GB = {slots} {self.expert_format} "
             f"expert slots of {self.expert_bytes / 1e6:.2f} MB "
             f"({slots / 15360 * 100:.0f}% of all routed experts, {'auto' if auto else 'pinned'})")
+        # from here on, anything that drives the host out of memory kills this process instead of
+        # the machine (see MemoryWatchdog)
+        self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
+                                           log=log).start()
         self.arena = make_expert_arena(slots)
         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
                                     io_threads=io_threads, ep=self.ep)
@@ -491,6 +605,8 @@ class V41Engine:
                 resident = False
             if resident:
                 self.fast.build_lut()
+                # prefill routes through Model.moe, which takes the same table when it is there
+                self.model.slot_lut = self.fast.lut
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
                 % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
@@ -898,6 +1014,8 @@ class V41Engine:
         out_st.update(n_out=n_out, steps=steps)
 
     # ------------------------------------------------------------------ introspection
+    supports_penalties = True
+
     def config(self):
         """Static engine configuration -- everything a measured number has to be quoted with."""
         return {

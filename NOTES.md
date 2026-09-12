@@ -2369,3 +2369,127 @@ both prose and HTML at the same budget (`DSV41_PRUNE_RANK`, default `sum`).
 At 288.8 GB of FP4 experts and 121 GiB of memory there is no arrangement that keeps every expert
 resident. Either the experts stream on a miss (full quality, NVMe-bound) or some are dropped (fast,
 and a workload the keep-set does not cover degenerates). The recipe now ships the first.
+
+### 2026-09-12 01:05-02:45 -- the keep-set was learned from a corpus with no markup in it
+
+The configurations that degenerated all shared one thing: the expert keep-set came from
+`corpus/trace_corpus.jsonl`, 50 documents, 14 coding and 36 general, whose only content marker is
+Python. No HTML, no JavaScript, no CSS, no SQL, no configuration files. The experts that write
+markup never fired while the trace was taken, so they ranked cold, and every pruned configuration
+dropped them. That is why a story and a Python class survived pruning while an HTML file collapsed
+into `<!DOCTYPE><!DOCTYPE><!DOCTYPE>` at keep 31 %, 40 % and 44 % alike.
+
+`corpus/trace_corpus_v2.jsonl` is 95 sequences / 18,546 tokens over the same two categories, built
+from sources that cover what the server is actually asked for: two complete HTML pages, a
+stylesheet, an ES module, a React component, a SQL schema, a Kubernetes manifest, a deployment
+script, Python, an incident write-up and a short story. Re-traced over all 40 layers
+(`results/trace-v2`, 68 s/layer, 364 of 384 experts touched at layer 39) and re-ranked. The keep-set
+it produces overlaps the old one by a Jaccard of only 0.70 -- 30 % of the kept experts changed.
+
+Generation gate (story / Python class / single-file HTML game, 300 greedy tokens each, distinct-token
+ratio; <= 0.15 is degenerate):
+
+| keep-set | story | code | html |
+|---|---|---|---|
+| old corpus, keep 44 % CB3 | 0.27 | 0.51 | **0.03** |
+| old corpus, keep 44 % CB3 + a 12-gram repeat ban | 0.32 | 0.51 | **0.07** |
+| **new corpus, keep 44 % CB3** | **0.43** | **0.50** | **0.40** |
+
+Nothing else changed between the last two rows. The repeat ban is not needed and never fires.
+
+Two things follow. The 3-bit expert format was never the problem -- unpruned CB3 passes the gate
+(0.57 / 0.57 / 0.41), and its earlier failure was pruning plus two dense quantizations. And with a
+keep-set that covers the workload, the model has enough margin to carry the fp4 attention/`wo_a`
+projections and the fp8 head again: they pass the same gate (0.30 / 0.56 / 0.42).
+
+Shipped configuration and what it measures, one request each through the server, greedy, 400 tokens:
+
+| workload | tok/s | DSpark acceptance |
+|---|---|---|
+| Python class | 25.0 | 3.92 |
+| story | 20.3 | 2.90 |
+| single-file HTML game | 37.5 | 5.39 |
+
+`PRUNE_KEEP=0.44 EXPERT_FORMAT=cb3 ARENA_GB=98 TRANSIENT_SLOTS=8 KEEP_FREE_GB=6`,
+`TRACE_STATS=results/trace-v2/stats/coverage.json`, fp32 router, fp4 dense on attention and `wo_a`,
+fp8 head, fused attention kernel off. 6,779 experts resident = 44.1 % of all routed experts, expert
+hit rate 1.0, no NVMe traffic during decode. The step is ~145 ms in all three cases; the spread is
+entirely how well the drafter predicts each kind of text.
+
+### 2026-09-12 03:50-05:30 -- the keep-set has to cover every workload, and the gate has to be long enough
+
+Two corrections to the entry above.
+
+**The 300-token gate was too short.** Configurations that passed it failed at 900 tokens: a story
+opened well and then collapsed into a semantic loop ("He saw the sea, the sea with the past. He saw
+the past, the past with the keeper."). The gate now runs 900-2000 tokens per prompt and adds a
+structural check, because repetition ratios do not see token corruption.
+
+**A frequency penalty fixes prose and destroys code.** At `frequency_penalty=0.3` the 900-token
+prose cases passed, and the HTML came back with `inset - 00 1 pix - 00 1 pix` in the CSS: the
+penalty accumulates with a token's count, CSS repeats `px` and digits dozens of times, and the model
+gets pushed off its own symbols. A presence penalty (flat per distinct token) does not corrupt code
+but also does not fix prose. Both default to 0; `presence_penalty` / `frequency_penalty` are
+accepted per request for clients that want them, and `DSV41_NO_REPEAT_NGRAM` is available and off.
+Prose repetition is a phrase-level phenomenon and a token-level penalty is the wrong instrument.
+
+**The keep-set has to cover every workload, and one corpus could not.** Tracing on the web/code
+corpus (v2) fixed HTML and left long prose repeating; tracing on a narrative corpus (v3, six fiction
+and dialogue pieces) fixed prose and broke HTML (distinct-token ratio 0.04). At 44 % of the experts
+the two rankings compete for the same slots. The fix needs no third trace: an expert trace is a
+per-token histogram, so `results/trace-union` is the concatenation of both traces' per-layer arrays
+(190 sequences, 36,250 tokens) with the statistics rebuilt from it.
+
+Generation gate on the union keep-set, 900-2000 greedy/sampled tokens per case, no penalties:
+
+| case | tok/s | distinct-token ratio | structure |
+|---|---|---|---|
+| story (temperature 0.7) | 14.1 | 0.56 | ok |
+| essay (temperature 0.7) | 14.3 | 0.50 | ok |
+| Python module | 30.7 | 0.47 | ok |
+| single-file HTML game | 37.6 | 0.59 | ok |
+| JavaScript module | 31.5 | 0.46 | ok |
+
+Eight-workload suite on the same configuration, one request each through the gateway: Python 24.3,
+HTML 36.6, JavaScript 28.2, SQL 31.8, explanation 18.1, German 25.2, arithmetic 25.1, long prose
+17.1 tok/s; thinking on 18.6; a 5,014-token prompt prefills in 14.9 s (**337 tok/s**) and decodes at
+19.4; a tool call returns `finish_reason: tool_calls` with well-formed arguments. The generated HTML
+game passes every structural check (doctype, balanced style and script tags, 3x3 grid, win check,
+reset button, click handlers, no corrupted CSS units) and stops on its own at 982 tokens.
+
+### 2026-09-12 09:30-10:40 -- prefill: what the routing timer was really measuring, and the memory guard
+
+**The device slot table now covers prefill too.** `Model.moe` takes the table the fast decode path
+builds (`self.slot_lut`) instead of resolving every (layer, expert) pair on the host, which turns a
+Python pass over 12,288 pairs per layer per chunk into one GPU gather. `route_s` on a 7,030-token
+prompt goes 13.72 s -> 0.0.
+
+**It did not make prefill faster, and the earlier reading of that timer was wrong.** `route_s` is
+nested inside `moe_s` and overlaps it, so removing it entirely leaves the wall time where it was:
+
+| | prefill | moe_s | route_s |
+|---|---|---|---|
+| host routing, chunk 2048, arena 98 | 17.8 s (396 tok/s) | 15.07 | 13.72 |
+| device table, chunk 2048, arena 88 | 19.0 s (369 tok/s) | 15.27 | **0.0** |
+
+The change is kept because it is correct and removes host work from the loop, but the claim that
+routing was three quarters of prefill was an artefact of reading a nested timer as if it were
+additive.
+
+**What prefill actually costs is the 3-bit unpack.** A CB3 expert cannot be used by the prefill
+kernel directly, so every chunk unpacks the experts it touches back into packed FP4 and runs the FP4
+kernel over them (`tools/cb3_moe.py::moe_forward_prefill`). A 2,048-token chunk touches nearly all
+384 experts in all 40 layers, and the unpack repeats for every chunk, so the cost scales with chunk
+*count*: at chunk 512 prefill is 291 tok/s, at 1024 it is 326, at 2048 it is 369.
+
+**Two memory guards, both earned.** The engine now refuses to start when the arena plus warm-start
+scratch plus the floor exceeds MemAvailable, and a watchdog thread samples `/proc/meminfo` twice a
+second and calls `os._exit` when it stays under 2.5 GB for three seconds. The kernel does not
+OOM-kill cleanly on this box: it thrashes until sshd can no longer fork, the machine answers ping
+while being unreachable, and only a power cycle recovers it. Exiting immediately lets the kernel
+reclaim everything at once. The watchdog fired correctly during a 7,030-token prefill at a 98 GB
+arena (MemAvailable 0.2 GB) and the box stayed up. Prefill memory, not the arena, is what bounds
+the arena size: 2,048-token chunks need roughly 10 GB of headroom on top of the resident experts.
+
+Also relevant on this box: a crontab entry started a Qwen vLLM container 90 seconds after every
+boot, on the same port, holding ~85 GB. It is what collided with the expert arena twice. Disabled.

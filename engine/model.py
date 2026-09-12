@@ -495,36 +495,48 @@ class Model:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
         t0 = time.perf_counter()
-        slots = store.resolve(L, indices, prefill)
-        # EP2 combine: an ExpertStore with a null slot is by construction an ep-enabled main
-        # model store (the DSpark drafter runs on a FixedStore and never has one), and its
-        # `routed` holds only THIS rank's owned subset -- zeros everywhere else. One fp32
-        # all-reduce makes both ranks hold the full routed sum, bit-identically, which is what
-        # keeps the two decode loops computing the same tokens (engine/dist.py). shared is added
-        # AFTER the combine, and only here, so it is counted once and its single-node numerics
-        # are untouched.
+        # All-resident configurations carry a device slot table (built by the engine from the
+        # store's LRU). Using it here turns routing into one GPU gather instead of a host round-trip
+        # plus a Python pass over every (layer, expert) pair in the chunk. The table is only valid
+        # while nothing is evicted, which is exactly the pruned all-resident case; anything else
+        # takes the host path.
+        #
+        # EP2: the table is built from THIS rank's LRU, which holds only the experts this rank
+        # owns, so a non-owned expert would gather -1 rather than the null slot. v41_engine.py
+        # refuses to build it under expert parallel for exactly that reason; the assert is the
+        # backstop, because the failure mode is silent wrong slots, not an error.
+        lut = getattr(self, "slot_lut", None)
+        if lut is not None and n_experts != 128:
+            assert getattr(store, "null_slot", None) is None, \
+                "device slot table is not wired for EP2: remote experts gather -1, not the null slot"
+            slots = lut[L][indices]
+            self.stats["hits"] = self.stats.get("hits", 0) + indices.numel()
+        else:
+            slots = store.resolve(L, indices, prefill)
+        # EP2 combine: an ExpertStore with a null slot is by construction an ep-enabled main model
+        # store (the DSpark drafter runs on a FixedStore and never has one), and its `routed` holds
+        # only THIS rank's owned subset -- zeros everywhere else. One fp32 all-reduce makes both
+        # ranks hold the full routed sum, which is what keeps the two decode loops computing the
+        # same tokens (engine/dist.py). shared is added AFTER the combine, and only here, so it is
+        # counted once and its single-node numerics are untouched.
         #
         # The rounding point matters as much as the sum. The kernel accumulates the k-sum in fp32
-        # and rounds to bf16 on the way out; under EP2 that would round THIS HALF of the sum, the
-        # peer's half separately, and leave their fp32 total carrying both errors -- ~1.4x the
-        # single-node rounding noise on the routed branch, in an engine whose recent history is a
-        # string of precision regressions that only showed up as long-generation degeneration.
-        # So EP2 takes the half in fp32, all-reduces, and rounds once, exactly where the
-        # single-node path rounds: what remains is purely the REGROUPED fp32 addition that
-        # engine/dist.py's docstring claims, and nothing else.
+        # and rounds to bf16 on the way out; under EP2 that would round THIS HALF, the peer's half
+        # separately, and leave their fp32 total carrying both errors. So EP2 takes the half in
+        # fp32, all-reduces, and rounds once, exactly where the single-box path rounds: what
+        # remains is purely the REGROUPED fp32 addition engine/dist.py documents.
         if getattr(store, "null_slot", None) is not None:
-            # slots_repeat: under EP2 every non-owned expert of this call shares the ONE null slot,
-            # so the decode block aims ~half its (token, k) pairs at a single slot. The decode-sized
-            # routing builder gives each slot exactly one BM-wide block and silently overflows into
-            # the next block past BM pairs -- with BM=16 and a 6-token verify block (36 pairs, ~18
-            # of them remote) that corrupted roughly one token in ten while staying fluent enough to
-            # look like a sampling quirk. See tools/fp4_moe.py::build_routing_small.
+            # slots_repeat: every non-owned expert of this call shares the ONE null slot, so the
+            # decode block aims ~half its (token, k) pairs at a single slot. The decode-sized
+            # routing builder gives each slot one BM-wide block and silently overflows past BM
+            # pairs -- with BM=16 and a 6-token verify block that corrupted ~1 token in 10 while
+            # staying fluent enough to look like a sampling quirk. tools/fp4_moe.py.
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
                                  slots_repeat=True)
             tc = time.perf_counter()
             store.ep.combine(routed)
-            self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; "moe_s" (outer t0) includes it
-            self.stats["ep_calls"] += 1                      # ep_s/ep_calls is the real per-collective cost
+            self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
+            self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
             routed = routed.to(torch.bfloat16).float()
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
