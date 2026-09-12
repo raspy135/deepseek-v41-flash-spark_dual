@@ -99,9 +99,31 @@ class FP8Weight:
         return (self.N, self.K)
 
     def dequant(self) -> torch.Tensor:
-        s = torch.exp2(self.s.float() - 127.0)
-        s = s.repeat_interleave(32, 0)[: self.N].repeat_interleave(32, 1)[:, : self.K]
-        return (self.w.float() * s).to(torch.bfloat16)
+        """fp8 + UE8M0 32x32 block scales -> bf16 [N, K]. Bit-identical to the fp32 round-trip
+        this replaced, and ~3.6x faster on the big attention projection.
+
+        Why it is safe to drop the fp32 intermediate: a UE8M0 scale is 2^(e-127), an exact power
+        of two, and fp8 e4m3 carries 3 mantissa bits against bf16's 7. So fp8 -> bf16 is exact and
+        multiplying by the scale only adjusts the exponent -- there is nothing for fp32 to round
+        more accurately. `torch.equal` on all three attention projections confirms it.
+
+        Why it was slow: `self.w.float()` materialised an fp32 [N, K] (201 MB for wq_b), the two
+        repeat_interleaves built a second fp32 [N, K] scale matrix, and the product a third --
+        ~700 MB of traffic to expand a 50 MB weight. Broadcasting over a blocked view moves the
+        scale to where it belongs (one value per 32x32 tile) and keeps everything in bf16, so the
+        call reads 50 MB and writes 100 MB.
+
+        This runs on the PREFILL path of v41_ref.dense() for every dense projection of every
+        layer of every chunk -- it was 77 % of the wq_b call and ~60 % of prefill wall time.
+        """
+        n32, k32 = (self.N + 31) // 32, (self.K + 31) // 32
+        s = torch.exp2(self.s.float() - 127.0).to(torch.bfloat16)      # [n32, k32], tiny
+        w = self.w
+        pad = n32 * 32 - self.N                                        # K % 32 == 0 is asserted
+        if pad:
+            w = torch.cat([w, w.new_zeros(pad, self.K)])
+        out = (w.to(torch.bfloat16).view(n32, 32, k32, 32) * s[:, None, :, None]).view(n32 * 32, self.K)
+        return out[: self.N] if pad else out
 
 
 def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:

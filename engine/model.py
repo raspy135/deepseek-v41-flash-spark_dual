@@ -54,6 +54,22 @@ MM_TILE = 16
 # The attention softmax is a *batched* GEMM (one independent problem per token), which is already
 # offset-invariant, so it can use a bigger tile.
 ATTN_TILE = 64
+# DSV41_ATTN_TIMING=1: split Model.attention into its phases. Each mark synchronises, so this is a
+# diagnosis switch and not something to leave on -- but prefill spends ~36 % of its time inside
+# attention and the host timers outside it cannot say which part, which has now cost several wrong
+# guesses (a banded-window rewrite benchmarked at 1.04x for 120x less gather traffic: the window
+# math is not where the time is).
+ATTN_TIMING = os.environ.get("DSV41_ATTN_TIMING", "0") == "1"
+ATTN_PHASES: dict = {}
+
+
+def _aph(name, t0):
+    if not ATTN_TIMING:
+        return t0
+    torch.cuda.synchronize()
+    t = time.perf_counter()
+    ATTN_PHASES[name] = ATTN_PHASES.get(name, 0.0) + t - t0
+    return t
 KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_topk)
 R.MM_TILE = MM_TILE
 
@@ -280,13 +296,16 @@ class Model:
         fq = freqs[S:S + T]
 
         self._tap("attn_x", L, x)
+        _t = time.perf_counter() if ATTN_TIMING else 0.0
         qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
         q = R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim)
         q = torch.cat([q[..., :-rd], R.apply_rotary(q[..., -rd:], fq)], dim=-1)
+        _t = _aph("q_proj", _t)
         self._tap("q", L, q)
 
         kv = R.rmsnorm(R.qlinear(x, w.wkv), w.kv_norm, a.norm_eps)
         kv = torch.cat([kv[:, :-rd], R.apply_rotary(kv[:, -rd:], fq)], dim=-1)
+        _t = _aph("kv_proj", _t)
         self._tap("kv_new", L, kv)
         if mtp_extra is None:
             # gather the window BEFORE writing (a chunk may overwrite slots older queries still need)
@@ -296,8 +315,10 @@ class Model:
             wmask = wpos >= win_lo if win_lo else wpos >= 0
             self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
             kv_all, mask = wkv, wmask
+            _t = _aph("window_gather", _t)
             if w.ratio:
                 ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
+                _t = _aph("compressed", _t)
                 self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
                 kv_all = torch.cat([wkv, ckv_rows], dim=1)
                 mask = torch.cat([wmask, cmask], dim=1)
@@ -315,7 +336,9 @@ class Model:
         # fp32 PV product, like tools/v41_ref: rounding the probabilities to bf16 first is a
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
+        _t = time.perf_counter() if ATTN_TIMING else _t
         o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
+        _t = _aph("softmax_attn", _t)
         o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)
         # grouped output projection: "sgd,grd->sgr" is a GEMM with M = number of tokens, so it too

@@ -22,6 +22,7 @@ from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
+from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 import v41_ref as R  # noqa: E402
 
 
@@ -806,6 +807,12 @@ class V41Engine:
                             owned * self.args.n_layers * self.expert_bytes / 1e9, 2),
                         "steps_counted": rep["steps"],
                     }
+            if M_.ATTN_TIMING and M_.ATTN_PHASES:
+                tot = sum(M_.ATTN_PHASES.values())
+                self.last_stats["attn_phases"] = {
+                    k: {"s": round(v, 2), "pct": round(v / tot * 100, 1)}
+                    for k, v in sorted(M_.ATTN_PHASES.items(), key=lambda kv: -kv[1])}
+                M_.ATTN_PHASES.clear()
             self.last_stats["decode_accounting"] = {
                 k: {"s": round(v, 2), "pct": round(v / t_dec * 100, 1) if t_dec > 0 else None}
                 for k, v in _parts.items()
