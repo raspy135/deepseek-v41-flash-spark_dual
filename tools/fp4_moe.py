@@ -468,7 +468,23 @@ def moe_forward(
         # across multiple blocks itself, so the prefill path was never exposed to this.
         block_slot, block_pair, NB = build_routing_small(slots, BM)
     else:
-        block_slot, block_pair, NB = build_routing(slots, arena.slots, BM)
+        # Compact the call's slot ids before routing. build_routing's cost tracks `n_slots` -- it
+        # reserves and scans block space per ARENA slot -- not the number of experts this call
+        # actually touches, and the two diverge badly once the arena is large. At the live 4,680
+        # slot arena a 2,048-token chunk spent 162 ms here against 0.44 ms compacted (367x), and
+        # with 40 layers per chunk that made it the single dominant cost of prefill: ~19.5 s of a
+        # 23 s TTFT on a 5.5k-token prompt, against a measured 15.05 s of GPU time in the whole
+        # MoE. The (slot, pair) assignments are identical; only the block ids are relabelled.
+        #
+        # A negative slot means "no pair here" and must NOT be compacted: run it through unique()
+        # and it becomes a real compact id, routing pairs that were meant to be dropped.
+        valid = slots >= 0
+        uniq, inv = torch.unique(slots[valid], return_inverse=True)
+        compact = torch.full_like(slots, -1, dtype=torch.int32)
+        compact[valid] = inv.to(torch.int32)
+        block_slot, block_pair, NB = build_routing(compact, int(uniq.numel()), BM)
+        block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)],
+                                 block_slot)
     wgt = weights.reshape(-1)
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
         wgt = wgt.float().contiguous()
