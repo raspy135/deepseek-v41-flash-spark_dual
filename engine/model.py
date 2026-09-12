@@ -64,6 +64,22 @@ ATTN_PHASES: dict = {}
 _PHASE_MARKS: list = []   # [(name, cuda_event)] in stream order; read once, at report time
 
 
+def _use_fused(mtp_extra, T: int) -> bool:
+    """Whether this attention call takes the fused kernel (tools/decode_attn.py).
+
+    Decided in one place because the key tensors are BUILT differently for it: the fused path takes
+    the window and the compressed rows as two base pointers and walks them as one key axis, so it
+    never wants the concatenated [T, 640, d] tensor at all. At a 2,048-token chunk that tensor is
+    ~1.5 GB written and re-read per layer.
+
+    T > 16 keeps the decode-sized calls (verify blocks, drafts) on the torch path, where the split
+    tuning and the graph capture live. mtp_extra is the DSpark draft, whose second key block is a
+    stride-0 broadcast; left alone for now.
+    """
+    return (mtp_extra is None and T > 16 and _prefill_attn is not None
+            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1")
+
+
 def _mark(name):
     """Record a CUDA event on the current stream. NOT a host timestamp.
 
@@ -360,14 +376,15 @@ class Model:
             wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             wmask = wpos >= win_lo if win_lo else wpos >= 0
             self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
-            kv_all, mask = wkv, wmask
+            kv_all, mask, ckv_rows = wkv, wmask, None
             _t = _aph("window_gather", _t)
             if w.ratio:
                 ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
                 _t = _aph("compressed", _t)
                 self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
-                kv_all = torch.cat([wkv, ckv_rows], dim=1)
-                mask = torch.cat([wmask, cmask], dim=1)
+                mask = torch.cat([wmask, cmask], dim=1)   # [T, 640] of bool: 3.8 kB, always built
+                if not _use_fused(mtp_extra, T):
+                    kv_all = torch.cat([wkv, ckv_rows], dim=1)   # only the torch path needs it
         else:
             # DSpark draft attention: window from the main stream's ring (positions <= S-1) + all draft kvs
             main_last = mtp_extra  # position of the last main token in the ring
@@ -383,7 +400,14 @@ class Model:
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
         _t = time.perf_counter() if ATTN_TIMING else _t
-        o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
+        if _use_fused(mtp_extra, T):
+            # Same math as _softmax_attn (sinked softmax, fp32 scores, split-precision PV), fused:
+            # no [T, H, N] score tensor, no concatenated key tensor. Measured 3.6x faster than the
+            # torch path at T=512 once decode_attn picks SPLIT from the available parallelism --
+            # the old constant SPLIT=2 is tuned for a 6-token verify block and is a slowdown here.
+            o = _prefill_attn(q, wkv, ckv_rows, mask, w.attn_sink, a.head_dim ** -0.5)
+        else:
+            o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
         _t = _aph("softmax_attn", _t)
         o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)

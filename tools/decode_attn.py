@@ -190,6 +190,10 @@ N_SPLIT = int(os.environ.get("DSV41_ATTN_SPLIT", 2))
 PV_SPLIT = int(os.environ.get("DSV41_ATTN_PV_SPLIT", 1))
 NUM_WARPS = int(os.environ.get("DSV41_ATTN_WARPS", 4))
 NUM_STAGES = int(os.environ.get("DSV41_ATTN_STAGES", 2))
+try:
+    _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+except Exception:  # noqa: BLE001 - no device at import time
+    _SM_COUNT = 48
 
 
 def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | None,
@@ -211,7 +215,18 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     DBP = max(DB, 16)
     bn = BLOCK_N if block_n is None else block_n
     pv = PV_SPLIT if pv_split is None else pv_split
-    sp = N_SPLIT if split is None else split
+    # Splitting the key axis only pays when there are too few programs to fill the GPU. That is
+    # the decode case the default was tuned for (T=6, 64 heads -> 24 programs against 48 SMs), and
+    # it is exactly wrong at prefill sizes, where T alone gives hundreds of programs and the split
+    # only adds a second pass over a T*H*SPLIT*D fp32 partial buffer. Measured at D=576, N=640:
+    #   T=6    SPLIT=1 0.06 ms   SPLIT=2 0.04 ms   SPLIT=4 0.04 ms
+    #   T=512  SPLIT=1 2.81 ms   SPLIT=2 3.94 ms   SPLIT=4 5.72 ms
+    # so pick on the parallelism the launch already has rather than on a constant.
+    if split is None:
+        progs = triton.cdiv(H, BLOCK_H) * T
+        sp = 1 if progs >= 2 * _SM_COUNT else N_SPLIT
+    else:
+        sp = split
     sp = max(1, min(sp, triton.cdiv(N, bn)))
     if sp & (sp - 1):  # the combine kernel indexes the splits with a power-of-two arange
         sp = 1 << (sp.bit_length() - 1)

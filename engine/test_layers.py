@@ -41,7 +41,16 @@ def rows_from_store(L, hashes):
 m.engram_rows = rows_from_store
 TRACE = sorted(glob.glob("results/trace-*"))[-1]  # newest results/trace-<name>/
 meta = json.load(open(f"{TRACE}/meta.json"))
-corpus = {json.loads(l)["id"]: json.loads(l)["text"] for l in open("corpus/trace_corpus.jsonl")}
+# The trace corpora were renamed when the keep-set moved to results/trace-union (v0.4.0-wip):
+# corpus/trace_corpus.jsonl became _v2 / _v3. Read whichever files exist and merge by id, so this
+# test keeps working against any trace directory rather than hard-coding one corpus name.
+_CORPORA = sorted(glob.glob("corpus/trace_corpus*.jsonl"))
+assert _CORPORA, "no corpus/trace_corpus*.jsonl found"
+corpus = {}
+for _c in _CORPORA:
+    for _l in open(_c):
+        _r = json.loads(_l)
+        corpus[_r["id"]] = _r["text"]
 enc = {i: torch.tensor(tok.encode(corpus[meta["seqs"][i]["id"]], add_special_tokens=False), device=dev) for i in SEQS}
 
 
