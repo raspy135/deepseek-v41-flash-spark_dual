@@ -507,8 +507,9 @@ class Model:
         # backstop, because the failure mode is silent wrong slots, not an error.
         lut = getattr(self, "slot_lut", None)
         if lut is not None and n_experts != 128:
-            assert getattr(store, "null_slot", None) is None, \
-                "device slot table is not wired for EP2: remote experts gather -1, not the null slot"
+            # EP2-safe: build_lut fills non-owned entries with the null slot rather than -1, and
+            # validates that once at construction -- checking it here would be a device->host sync
+            # per layer per chunk, which is the cost this path exists to remove.
             slots = lut[L][indices]
             self.stats["hits"] = self.stats.get("hits", 0) + indices.numel()
         else:

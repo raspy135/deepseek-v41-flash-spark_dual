@@ -561,6 +561,7 @@ class V41Engine:
             if self.ep.active:
                 n_here = sum(1 for k in ranked if self.ep.owns(*k))
                 log(f"EP2 rank {self.ep.rank}: {n_here} of the {len(ranked)} kept experts are owned here")
+            self._kept_here = n_here   # the resident test below needs the real count, see there
             if n_here > self.store.lru_slots:
                 log(f"WARNING: {n_here} kept experts here > {self.store.lru_slots} LRU slots; the tail will stream")
             log(f"pruned mode ({prune_select}): keep {prune_keep:.2f}, {len(ranked)} experts total "
@@ -585,24 +586,21 @@ class V41Engine:
             # decode as one box. DSV41_FAST=0 is the escape hatch back to eager.
             from engine.fastdecode import FastDecoder
             self.fast = FastDecoder(self.model, self, use_graphs=os.environ.get("DSV41_GRAPHS", "1") == "1")
-            # Resident (device slot LUT) mode. Two corrections for EP2:
-            #  * the threshold counts (layer, expert) pairs GLOBALLY, but each rank's LRU holds
-            #    only the experts it owns -- roughly half -- so the unadjusted test can never pass
-            #    on the pair and would silently leave the LUT off.
-            #  * even adjusted, build_lut() maps expert -> slot from this rank's LRU, and a
-            #    non-owned expert is in nobody's LRU: it would resolve to -1 instead of the null
-            #    slot. Mapping remote experts to null_slot inside the LUT is the remaining piece
-            #    of work for Mode A on two boxes, so refuse it loudly rather than emit -1 slots.
-            kept_pairs = 40 * max(6, int(np.ceil((self.prune_keep or 0) * 384)))
-            if self.ep.active:
-                kept_pairs //= self.ep.world
+            # Resident (device slot LUT) mode: every routable expert is in the arena, so routing
+            # is a device gather and the whole layer captures as one graph.
+            #
+            # The test is "is every expert this rank must serve actually resident", and under EP2
+            # that is NOT the global keep count, nor the global count halved. The parity split is
+            # not exactly even -- at keep 0.60 rank 0 owned 4,582 of 9,240 kept pairs, where
+            # 9,240/2 = 4,620 -- so dividing by world size sets a threshold this rank can never
+            # meet and silently leaves the LUT off. Use the count the pruning block actually
+            # computed.
+            kept_pairs = getattr(self, "_kept_here", None)
+            if kept_pairs is None:
+                kept_pairs = 40 * max(6, int(np.ceil((self.prune_keep or 0) * 384)))
             resident = (self.prune_keep and self.prune_keep < 1.0 and
                         len(self.store.lru) >= kept_pairs and
                         os.environ.get("DSV41_LUT", "1") == "1")
-            if resident and self.ep.active:
-                log("EP2: device slot LUT not yet wired for expert parallel (remote experts would "
-                    "map to -1, not the null slot); staying on the host-resolve graph path")
-                resident = False
             if resident:
                 self.fast.build_lut()
                 # prefill routes through Model.moe, which takes the same table when it is there
@@ -640,6 +638,12 @@ class V41Engine:
         for t in self.tables.values():
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
+        if self.fast is not None:
+            self.fast.gpu_timing_reset()
+            # DSV41_ROUTE_STATS: per-request counts. Capture's own warm-up runs _layer_a and would
+            # otherwise be counted, so the FIRST request after a (re)capture reads high; later ones
+            # are clean. No-op when the flag is off.
+            self.fast.route_stats_reset()
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
@@ -772,6 +776,36 @@ class V41Engine:
                 "engram": sum(t.stats["seconds"] for t in self.tables.values()),
             }
             _parts["unaccounted"] = max(0.0, t_dec - sum(_parts.values()))
+            # DSV41_ROUTE_STATS=1: DISTINCT routed experts per layer per verify block. This is the
+            # number that sets the expert bytes a step must read -- an expert is read once however
+            # many of the block's tokens route to it -- so it is what turns a measured ms/step into
+            # a "what fraction of the box's streaming ceiling are we at" answer. Without it the
+            # byte count is a guess (6 per layer is the PER-TOKEN figure, and a 6-token verify
+            # block asks for far more).
+            if self.fast is not None:
+                gt = self.fast.gpu_timing_report()
+                if gt:
+                    # Real GPU-timeline milliseconds per phase, so the step can finally be split
+                    # into "the model" and "the drafter" instead of inferred from host waits.
+                    n_steps = max(1, gt.get("layers_n", 1))
+                    self.last_stats["gpu_timing"] = {
+                        "layers_ms_total": gt.get("layers"), "draft_ms_total": gt.get("draft"),
+                        "layers_ms_per_step": round(gt.get("layers", 0) / n_steps, 2),
+                        "draft_ms_per_step": round(gt.get("draft", 0) / max(1, gt.get("draft_n", 1)), 2),
+                        "draft_share": (round(gt.get("draft", 0) /
+                                              max(1e-9, gt.get("draft", 0) + gt.get("layers", 0)), 3)),
+                    }
+                rep = self.fast.route_stats_report()
+                if rep:
+                    per_layer_mean = rep["mean"]
+                    owned = per_layer_mean / max(1, self.ep.world) if self.ep.active else per_layer_mean
+                    self.last_stats["route_stats"] = {
+                        "distinct_experts_per_layer": round(per_layer_mean, 2),
+                        "distinct_per_layer_this_rank": round(owned, 2),
+                        "expert_gb_per_step_this_rank": round(
+                            owned * self.args.n_layers * self.expert_bytes / 1e9, 2),
+                        "steps_counted": rep["steps"],
+                    }
             self.last_stats["decode_accounting"] = {
                 k: {"s": round(v, 2), "pct": round(v / t_dec * 100, 1) if t_dec > 0 else None}
                 for k, v in _parts.items()

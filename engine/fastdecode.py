@@ -162,6 +162,14 @@ class FastDecoder:
         self.sc_buf = {L: torch.zeros(T, a.head_dim, dtype=torch.float32, device=dev) for L in self.pend_buf}
         R.MM_TILE = 0  # plain GEMMs in this path (and from now on in prefill too); the 16-row tiling was a test aid
         self.stats = {"steps": 0, "graph_s": 0.0, "resolve_s": 0.0, "engram_s": 0.0, "draft_s": 0.0}
+        # DSV41_GPU_TIMING=1: CUDA events around each phase of a step. Host timers cannot decompose
+        # this path -- every one of them measures the host waiting for, or launching into, an async
+        # queue, which is why removing route_s, the host resolve and the pageable engram copy each
+        # collapsed its own timer and moved the wall clock not at all. Events sit ON the GPU
+        # timeline and measure the work itself. Pairs are recorded per step and only read at the
+        # end of the request, so no step pays a synchronise for being measured.
+        self.gpu_timing = os.environ.get("DSV41_GPU_TIMING", "0") == "1"
+        self._ev_pairs: dict[str, list] = {"draft": [], "layers": []}
         # DSV41_ROUTE_STATS=1 counts, per backbone layer, how many DISTINCT routed experts the
         # T_VERIFY tokens of a verify block ask for -- the quantity that sets the expert bytes a step
         # has to read, since one expert is read once however many of the block's tokens route to it.
@@ -425,11 +433,33 @@ class FastDecoder:
 
     def build_lut(self):
         """Device slot table from the store's LRU. Only valid while no expert is evicted/loaded; the
-        engine rebuilds it whenever the store reports a miss."""
+        engine rebuilds it whenever the store reports a miss.
+
+        EP2: this rank's LRU holds only the experts it OWNS, so every other routable expert would
+        be left at the -1 fill and gather garbage. The right value for them is the null slot --
+        zero-filled weights, an exact 0 contribution, and the peer's all-reduce supplies the real
+        one. That is the same substitution ExpertStore.resolve makes on the host path, so the
+        graphed and eager paths agree. Experts pruned out of the keep set also land on the null
+        slot and never matter: the router masks them to -inf, so they are never routed at all.
+
+        This is what unlocks the segmented capture. `self.lut is not None` gates the branch in
+        capture() that records whole runs of layers as one graph -- 41 replays per step become 3,
+        with no host round-trip between A and B -- which is where the 40 blocking device->host
+        syncs per step go.
+        """
         st = self.m.store
-        lut = torch.full((self.a.n_layers, self.a.n_routed_experts), -1, dtype=torch.int32)
+        null = getattr(st, "null_slot", None)
+        fill = -1 if null is None else int(null)
+        lut = torch.full((self.a.n_layers, self.a.n_routed_experts), fill, dtype=torch.int32)
         for (L, e), slot in st.lru.items():
             lut[L, e] = slot
+        # Validate ONCE, on the host tensor, before it goes to the device: a -1 left in the table
+        # indexes the arena out of bounds inside a captured graph, where there is no bounds check
+        # and the symptom would be corrupted experts rather than an error. Checking per call would
+        # be a device->host sync per layer, which is what this table exists to remove.
+        bad = int((lut < 0).sum())
+        assert bad == 0, (f"slot table has {bad} unmapped (layer, expert) entries; every routable "
+                          f"expert must map to a real slot or the null slot")
         self.lut = lut.to(self.dev)
         self.lut_version = st.stats.get("misses", 0)
 
@@ -437,6 +467,30 @@ class FastDecoder:
         self._layer_a(L, sh_state)
         self.slots.copy_(self.lut[L][self.route_idx])  # -1 never occurs while the LUT is valid
         self._layer_b(L)
+
+    # ------------------------------------------------------------------ gpu timing
+    def _ev_begin(self, phase):
+        if not self.gpu_timing:
+            return None
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        self._ev_pairs[phase].append((a, b))
+        return b
+
+    def gpu_timing_reset(self):
+        for v in self._ev_pairs.values():
+            v.clear()
+
+    def gpu_timing_report(self):
+        """{phase: total ms on the GPU timeline}. Synchronises once, here, not per step."""
+        if not self.gpu_timing or not any(self._ev_pairs.values()):
+            return None
+        torch.cuda.synchronize()
+        out = {}
+        for phase, pairs in self._ev_pairs.items():
+            out[phase] = round(sum(a.elapsed_time(b) for a, b in pairs), 1)
+            out[phase + "_n"] = len(pairs)
+        return out
 
     # ------------------------------------------------------------------ route stats
     def route_stats_reset(self):
@@ -564,6 +618,7 @@ class FastDecoder:
             self.prepare_pending_buffers()  # capture's warm-up/capture runs overwrite the buffers
         t0 = time.perf_counter()
         futs = rows_fn() if rows_fn is not None else None  # {layer: Future} -- reads already in flight
+        _ev_layers = self._ev_begin("layers")
         if self.use_graphs:
             gA, gB, gF, gD, segs = self.graphs[parity]
             if segs is not None:
@@ -608,6 +663,8 @@ class FastDecoder:
                                      self.sc_buf[L][T_VERIFY - 1].clone())  # the last token is unpaired
             else:
                 self.c.pending[L] = None
+        if _ev_layers is not None:
+            _ev_layers.record()
         self.c.len = S + T_VERIFY
         self.stats["steps"] += 1
         self.stats["graph_s"] += time.perf_counter() - t0
@@ -621,10 +678,13 @@ class FastDecoder:
             u = torch.rand_like(self.d_noise).clamp_min(1e-30)
             self.d_noise.copy_(-torch.log(-torch.log(u)))
         t0 = time.perf_counter()
+        _ev_draft = self._ev_begin("draft")
         if self.use_graphs and self.graphs:
             self.graphs[next(iter(self.graphs))][3].replay()
         else:
             self._draft()
+        if _ev_draft is not None:
+            _ev_draft.record()
         self.stats["draft_s"] += time.perf_counter() - t0
         return self.d_out, self.d_probs
 

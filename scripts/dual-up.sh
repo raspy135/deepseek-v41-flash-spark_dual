@@ -38,7 +38,7 @@ err()  { echo "ERROR: $*" >&2; exit 1; }
 # overwrites anything already exported, so `SPEC=0 scripts/dual-up.sh` would silently run with
 # .env's SPEC=1 -- capture what the caller set, source, then put it back.
 declare -A _CLI=()
-for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT MIN_FREE_GIB NAME0 NAME1 NCCL_SOCKET_IFNAME \
+for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT BIND_HOST MIN_FREE_GIB NAME0 NAME1 NCCL_SOCKET_IFNAME \
          MODELS_DIR MODEL_DIR MODEL_NAME SERVED_MODEL_NAME MAX_SEQ SPEC ARENA_GB TRACE_STATS \
          PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS \
          DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S; do
@@ -57,6 +57,15 @@ NAME0="${NAME0:-deepseek-v41-ep2-rank0}"
 NAME1="${NAME1:-deepseek-v41-ep2-rank1}"
 IFACE="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"
+# Where rank 0's API binds. Loopback by default: with --network host an open port is 510 GB of
+# weights answering the whole LAN with no authentication of any kind. BIND_HOST=0.0.0.0 opts in to
+# reaching it from another machine -- do that only on a network you trust, or put a reverse proxy
+# with auth in front. BIND_HOST=192.168.11.206 (one interface) is the narrower middle ground.
+# Falls back to HOST so .env stays the single place this is configured: HOST is what the native
+# path (start.sh) and the entrypoint already call it, and having a container-only second name for
+# the same thing meant editing .env had no effect on the pair. BIND_HOST still wins when set, for
+# a one-off `BIND_HOST=0.0.0.0 scripts/dual-up.sh`.
+BIND_HOST="${BIND_HOST:-${HOST:-127.0.0.1}}"
 WAIT=true
 CHECK_ONLY=false
 case "${1:-}" in
@@ -102,6 +111,9 @@ check_box "rank 1 ($PEER)" "$PEER"
 g0=$("$ROOT/scripts/roce_gid.sh" "$MASTER_ADDR") || err "local RoCE GID unresolved for $MASTER_ADDR"
 g1=$(ssh_peer "cd '$ROOT' && ./scripts/roce_gid.sh '$PEER_IP'") || err "peer RoCE GID unresolved for $PEER_IP"
 info "RoCE: rank 0 = $g0   rank 1 = $g1   (rendezvous $MASTER_ADDR:$MASTER_PORT)"
+if [[ "$BIND_HOST" != "127.0.0.1" && "$BIND_HOST" != "localhost" ]]; then
+    info "WARNING: the API will bind $BIND_HOST:$PORT and this server has NO authentication."
+fi
 
 if [[ "$CHECK_ONLY" == true ]]; then
     info "--check: preflight passed on both boxes; nothing started"
@@ -149,6 +161,14 @@ common_env=(
 for v in ARENA_GB TRACE_STATS PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS; do
     [[ -n "${!v:-}" ]] && common_env+=(-e "$v=${!v}")
 done
+# Every DSV41_* knob in the caller's environment, forwarded verbatim to BOTH ranks. The engine's
+# experiment switches all share that prefix (DSV41_ENGRAM_PINNED, DSV41_GRAPHS, DSV41_LUT,
+# DSV41_GRAPH_SEGMENTS, ...) and there is no reason to grow this script a line per knob. Both
+# ranks get the same value, which is the part that matters: a switch that changes numerics on one
+# rank only would desync the pair rather than produce a slow answer.
+while IFS='=' read -r k _; do
+    [[ -n "$k" ]] && common_env+=(-e "$k=${!k}")
+done < <(env | grep -E '^DSV41_[A-Z0-9_]+=' | sort)
 
 # --- rank 0: the head, and the TCPStore server -------------------------------------------
 # It goes first for the reason Gate G0 cost a bring-up to learn: rank 0 BINDS the rendezvous
@@ -159,7 +179,7 @@ done
 info "starting rank 0 locally ($IMAGE)"
 docker run -d --name "$NAME0" "${common_flags[@]}" "${common_env[@]}" \
     -e RANK=0 -e EP_LOCAL_IP="$MASTER_ADDR" \
-    -e HOST=127.0.0.1 -e PORT="$PORT" \
+    -e HOST="$BIND_HOST" -e PORT="$PORT" \
     "$IMAGE" >/dev/null
 
 echo -n "--- waiting for the rendezvous port $MASTER_ADDR:$MASTER_PORT: "
@@ -199,10 +219,10 @@ for _ in $(seq 1 "$HEALTH_TIMEOUT_S"); do
         echo "--- rank 1 ---"; ssh_peer "docker logs --tail 20 '$NAME1'" || true
         exit 1
     fi
-    if curl -sf -o /dev/null "http://127.0.0.1:$PORT/health"; then
+    if curl -sf -o /dev/null "http://${BIND_HOST/0.0.0.0/127.0.0.1}:$PORT/health"; then
         echo "OK"
         curl -s "http://127.0.0.1:$PORT/health" | head -c 400; echo
-        info "EP2 pair serving on http://127.0.0.1:$PORT/v1"
+        info "EP2 pair serving on http://$BIND_HOST:$PORT/v1"
         exit 0
     fi
     sleep 1

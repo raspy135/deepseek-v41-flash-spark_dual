@@ -1083,12 +1083,21 @@ def run_worker(engine) -> None:
         while True:
             try:
                 req = ep.broadcast_request(None)
-            except Exception:
-                # Head stopped / rendezvous lost -- clean exit, not a desync crash.
-                log.info("EP2 worker: rendezvous lost (head stopped?) -- exiting")
+            except Exception as e:
+                # With the heartbeat running, reaching the process-group timeout means several
+                # pings in a row went missing, so the head really is gone -- but log WHAT failed.
+                # This used to say "head stopped?" for every exception, which is how a plain idle
+                # timeout (600 s with no traffic) got reported as the head stopping, while rank 0
+                # was healthy and the next real request died on a closed gloo pair.
+                log.info("EP2 worker: broadcast failed (%s: %s) -- exiting", type(e).__name__, e)
                 break
             if req is None or req.get("cmd") == "shutdown":
                 break
+            if req.get("cmd") == "ping":
+                # Idle keepalive from rank 0 (see _ep_heartbeat). The blocking collective this
+                # loop sits in is bounded by the process-group timeout, so without traffic it
+                # would expire and take this worker down; the ping keeps it inside the window.
+                continue
             n += 1
             t0 = time.time()
             try:
@@ -1107,6 +1116,32 @@ def run_worker(engine) -> None:
                 ep.destroy()
             except Exception:
                 pass
+
+
+def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
+    """rank 0 -> rank 1 keepalive, so an idle pair does not dismantle itself.
+
+    run_worker() blocks in broadcast_request between requests, and that collective is bounded by
+    the process group's timeout (DSV41_DIST_TIMEOUT_S, 600 s). A server with no traffic for ten
+    minutes therefore expired the collective, the worker exited, and the NEXT request failed on a
+    closed gloo pair -- with rank 0 still perfectly healthy and reporting itself fine. Raising the
+    timeout only moves the cliff; an idle serving process waits for an unbounded time by nature.
+
+    `state.lock` is the request lock, so a ping can never land between a request's broadcast and
+    its generate -- which would leave rank 1 consuming the ping as though it were the request and
+    desync the pair on the very next collective.
+    """
+    while not stop.wait(interval):
+        if state.ep_fault:
+            return
+        try:
+            with state.lock:
+                if stop.is_set():
+                    return
+                state.ep.broadcast_request({"cmd": "ping"})
+        except Exception as e:  # noqa: BLE001
+            log.warning("EP2 heartbeat failed (%s: %s); the pair is probably gone", type(e).__name__, e)
+            return
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1131,11 +1166,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     log.info("serving %s (engine=%s, tokenizer=%s, thinking default=%s effort=%d) on http://%s:%d",
              args.served_model_name, args.engine, tok.backend, "on" if args.default_thinking else "off",
              args.default_effort, args.host, args.port)
+    hb_stop = threading.Event()
+    if state.ep_active:
+        # A quarter of the process-group timeout: four pings have to go missing before the worker
+        # concludes the head is gone, which keeps a transient stall from tearing the pair down.
+        _t = float(os.environ.get("DSV41_DIST_TIMEOUT_S", "600"))
+        _iv = float(os.environ.get("DSV41_EP_PING_S", max(30.0, _t / 4)))
+        threading.Thread(target=_ep_heartbeat, args=(state, _iv, hb_stop),
+                         name="ep-heartbeat", daemon=True).start()
+        log.info("EP2: idle keepalive every %.0f s (process-group timeout %.0f s)", _iv, _t)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        hb_stop.set()          # before the shutdown broadcast, or the two race on the same group
         httpd.server_close()
         # EP2: tell rank 1 to go home. run_worker() blocks in broadcast_request between
         # requests, so without this the peer sits there holding its half of the pool until the
@@ -1144,7 +1189,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         # collectives, and the shutdown message has to queue behind it, not interleave with it.
         if state.ep_active and not state.ep_fault:
             try:
-                with engine.lock:
+                with state.lock:
                     state.ep.broadcast_request({"cmd": "shutdown"})
                 log.info("EP2: shutdown broadcast to rank %d", 1)
             except Exception as e:
