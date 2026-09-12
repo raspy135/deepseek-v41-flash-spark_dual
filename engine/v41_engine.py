@@ -807,12 +807,11 @@ class V41Engine:
                             owned * self.args.n_layers * self.expert_bytes / 1e9, 2),
                         "steps_counted": rep["steps"],
                     }
-            if M_.ATTN_TIMING and M_.ATTN_PHASES:
-                tot = sum(M_.ATTN_PHASES.values())
+            _ph = M_.phase_report()
+            if _ph:
+                tot = sum(_ph.values()) or 1.0
                 self.last_stats["attn_phases"] = {
-                    k: {"s": round(v, 2), "pct": round(v / tot * 100, 1)}
-                    for k, v in sorted(M_.ATTN_PHASES.items(), key=lambda kv: -kv[1])}
-                M_.ATTN_PHASES.clear()
+                    k: {"ms": v, "pct": round(v / tot * 100, 1)} for k, v in _ph.items()}
             self.last_stats["decode_accounting"] = {
                 k: {"s": round(v, 2), "pct": round(v / t_dec * 100, 1) if t_dec > 0 else None}
                 for k, v in _parts.items()

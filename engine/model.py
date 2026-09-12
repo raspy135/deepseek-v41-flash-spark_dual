@@ -54,24 +54,69 @@ MM_TILE = 16
 # The attention softmax is a *batched* GEMM (one independent problem per token), which is already
 # offset-invariant, so it can use a bigger tile.
 ATTN_TILE = 64
-# DSV41_ATTN_TIMING=1: split Model.attention into its phases. Each mark synchronises, so this is a
-# diagnosis switch and not something to leave on -- but prefill spends ~36 % of its time inside
-# attention and the host timers outside it cannot say which part, which has now cost several wrong
-# guesses (a banded-window rewrite benchmarked at 1.04x for 120x less gather traffic: the window
-# math is not where the time is).
+# DSV41_ATTN_TIMING=1: split a prefill layer into GPU-timeline phases using CUDA events (see
+# _mark). Cheap enough to leave on, and unlike the host-timer version it replaced it does not
+# reattribute the work: that one synchronised, so the first phase in the function swallowed the
+# whole queued backlog and reported q_proj at 72 % of attention. Several prefill rewrites were
+# proposed off that bad number and measured at 1.0x or worse before being written.
 ATTN_TIMING = os.environ.get("DSV41_ATTN_TIMING", "0") == "1"
 ATTN_PHASES: dict = {}
+_PHASE_MARKS: list = []   # [(name, cuda_event)] in stream order; read once, at report time
+
+
+def _mark(name):
+    """Record a CUDA event on the current stream. NOT a host timestamp.
+
+    The first version of this used torch.cuda.synchronize() + perf_counter and it lied: a sync
+    drains everything queued, so whichever phase is first in the function absorbs the whole
+    backlog. That is how q_proj came out at 72 % of attention, and why merely enabling the flag
+    moved attn_s from 8.93 s to 25.91 s -- the same work measured three times larger. Host
+    timestamps cannot attribute asynchronous work: without a sync they time the launch, with a
+    blocking op they time the wait for unrelated kernels queued earlier.
+
+    A CUDA event is a timestamp ON the stream, between kernels. The gap between consecutive events
+    is the GPU time of the work queued between them. A few microseconds to record, so the ~700 of
+    them in a prefill are free.
+    """
+    if ATTN_TIMING:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        _PHASE_MARKS.append((name, e))
+
+
+def phase_report():
+    """{phase: total GPU ms}. One synchronise, here, after everything has already run."""
+    if not ATTN_TIMING or len(_PHASE_MARKS) < 2:
+        return None
+    torch.cuda.synchronize()
+    out: dict = {}
+    for (n0, e0), (n1, e1) in zip(_PHASE_MARKS, _PHASE_MARKS[1:]):
+        if n1.endswith("_begin"):
+            # The gap from the last attention mark to the next layer's region is the rest of the
+            # block: output projection, the HC residual mixes, and anything not marked below.
+            out["layer_rest"] = out.get("layer_rest", 0.0) + e0.elapsed_time(e1)
+            continue
+        out[n1] = out.get(n1, 0.0) + e0.elapsed_time(e1)
+    _PHASE_MARKS.clear()
+    return {k: round(v, 1) for k, v in sorted(out.items(), key=lambda kv: -kv[1])}
 
 
 def _aph(name, t0):
-    if not ATTN_TIMING:
-        return t0
-    torch.cuda.synchronize()
-    t = time.perf_counter()
-    ATTN_PHASES[name] = ATTN_PHASES.get(name, 0.0) + t - t0
-    return t
+    """Call-site compatible with the old host-timer helper; records an event instead."""
+    _mark(name)
+    return t0
 KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_topk)
 R.MM_TILE = MM_TILE
+
+# Fused sinked-softmax attention for prefill-sized calls (T > 16). Same kernel the decode path
+# uses (tools/decode_attn.py). Microbench at fixed keys=640 looks ~6x faster than the torch tile
+# path, but on the live EP2 prefill (variable topk/compressed width, 40 layers) it measured
+# attn_s 3.16 -> 13.3 s and sank overall tok/s. Default OFF until that is fixed; set
+# DSV41_PREFILL_FUSED_ATTN=1 to re-enable. Independent of DSV41_FUSED_ATTN (decode graphs).
+try:
+    from decode_attn import decode_attention as _prefill_attn  # noqa: E402
+except Exception:  # noqa: BLE001
+    _prefill_attn = None
 
 
 # ----------------------------------------------------------------------------- weights
@@ -296,7 +341,8 @@ class Model:
         fq = freqs[S:S + T]
 
         self._tap("attn_x", L, x)
-        _t = time.perf_counter() if ATTN_TIMING else 0.0
+        _mark("attn_begin")
+        _t = 0.0
         qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
         q = R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim)
         q = torch.cat([q[..., :-rd], R.apply_rotary(q[..., -rd:], fq)], dim=-1)
@@ -565,6 +611,7 @@ class Model:
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        _mark("moe")
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
@@ -703,6 +750,7 @@ class Model:
                 h = R.engram_forward(h, rows, self.W.engram[L], a)
                 self._tap("engram_out", L, h)
                 self.stats["engram_s"] += time.perf_counter() - t0
+                _mark("engram")
             if L in a.dspark_target_layer_ids:
                 main_hiddens.append(h.float().mean(dim=1))
             freqs = self.freqs_c if w.ratio else self.freqs_w
