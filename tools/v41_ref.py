@@ -329,6 +329,12 @@ class LayerWeights:
         self.hc_ffn_scale = f32("hc_ffn_scale")
         self.gate_w = f32("ffn.gate.weight")
         self.gate_bias = f32("ffn.gate.bias")
+        # Image tokens route through a SEPARATE router bias (inference/model.py:819). Absent on a
+        # text-only checkpoint, so this stays None and the vision branch never runs.
+        try:
+            self.gate_bias_vl = f32("ffn.gate.bias_vl")
+        except Exception:  # noqa: BLE001
+            self.gate_bias_vl = None
         self.sh_w1 = fp8lin("ffn.shared_experts.w1")
         self.sh_w2 = fp8lin("ffn.shared_experts.w2")
         self.sh_w3 = fp8lin("ffn.shared_experts.w3")
