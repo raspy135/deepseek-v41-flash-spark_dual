@@ -107,9 +107,18 @@ cmd_summary() {
     "experts     : keep \($h.engine_config.prune_keep), \($h.engine_config.arena_gb) GB arena, \($h.engine_config.resident_expert_pct)% resident",
     ( if $s.prune_miss == null then "pruning     : miss tracking off (DSV41_PRUNE_MISS=1)"
       else "pruning     : miss \($s.prune_miss.miss_rate*1000|round/10)% cumulative (\($s.prune_miss.missed_slots)/\($s.prune_miss.total_slots) slots)" end ),
-    "prefill     : \($s.prefill_tok_s // "n/a") tok/s",
-    "decode      : \($s.decode_tok_s // "n/a") tok/s, accept \($s.accept_len_mean // "n/a")",
     "experts nvme: \($s.nvme_gb // 0) GB, hit rate \($s.expert_hit_rate // "n/a")"'
+  # prefill/decode rates are PER REQUEST, and the probe above is a 1-token request -- reporting
+  # $s for those would show the probe's own numbers (8.7 tok/s prefill, 0 decode) rather than
+  # real traffic. Only the cumulative counters survive the probe, so speed comes from the log.
+  local last
+  last="$(docker logs --tail 400 "${CONTAINER:-deepseek-v41-ep2-rank0}" 2>&1 \
+          | grep -E 'prefill .*tok/s.*decode' | grep -v 'accept=None' | tail -1 || true)"
+  if [[ -n "$last" ]]; then
+    echo "last real req: ${last#*INFO dsv41.server:   }"
+  else
+    echo "last real req: (no completed request in the recent log)"
+  fi
 }
 
 cmd_watch() {
