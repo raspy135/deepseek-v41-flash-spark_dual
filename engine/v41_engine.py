@@ -1086,6 +1086,8 @@ class V41Engine:
                         "layers_ms_per_step": round(envelope_ms / n_steps, 2),
                         "segment_busy_ms_per_step": round(segment_ms / n_steps, 2),
                         "boundary_gap_ms_per_step": round(max(0.0, envelope_ms - segment_ms) / n_steps, 2),
+                        "sample_envelope_ms_per_step": round(
+                            gt.get("sample", 0) / max(1, gt.get("sample_n", n_steps)), 2),
                         "draft_ms_per_step": round(gt.get("draft", 0) / max(1, gt.get("draft_n", 1)), 2),
                         "draft_share": (round(gt.get("draft", 0) /
                                               max(1e-9, gt.get("draft", 0) + gt.get("layers", 0)), 3)),
@@ -1579,6 +1581,13 @@ class V41Engine:
                     if ph is not None:
                         ph.steps = steps
                     continue
+                # The sampled verifier is deliberately sequential: accepting draft i decides
+                # whether row i+1 is inspected, and preserving its variable-length RNG stream was
+                # why the greedy lean-step work left this path alone.  Time its whole device
+                # envelope separately.  The pair starts after the verify graph on the same stream,
+                # so it excludes the backbone; host gaps between scalar decisions are included,
+                # which is exactly the latency a batched sampler could remove.
+                _ev_sample = self.fast._ev_begin("sample") if self.fast is not None else None
                 a = 0
                 new = []
                 bonus = None
@@ -1607,6 +1616,8 @@ class V41Engine:
                 if bonus is None and not (new and new[-1] in stop_ids):
                     pt = sample_probs(logits[a] if a < 5 else logits[5], temperature, top_p)
                     bonus = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
+                if _ev_sample is not None:
+                    _ev_sample.record()
                 if ph is not None:
                     ph.mark("verify")
                 # caches valid for positions < pos + a + 1 (tok + accepted drafts)

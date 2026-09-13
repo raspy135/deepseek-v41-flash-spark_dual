@@ -207,7 +207,9 @@ class FastDecoder:
         # timeline and measure the work itself. Pairs are recorded per step and only read at the
         # end of the request, so no step pays a synchronise for being measured.
         self.gpu_timing = os.environ.get("DSV41_GPU_TIMING", "0") == "1"
-        self._ev_pairs: dict[str, list] = {"draft": [], "layers": [], "segments": [], "hash": []}
+        self._ev_pairs: dict[str, list] = {
+            "draft": [], "layers": [], "segments": [], "hash": [], "sample": [],
+        }
         # DSV41_ROUTE_STATS=1 counts, per backbone layer, how many DISTINCT routed experts the
         # T_VERIFY tokens of a verify block ask for -- the quantity that sets the expert bytes a step
         # has to read, since one expert is read once however many of the block's tokens route to it.
