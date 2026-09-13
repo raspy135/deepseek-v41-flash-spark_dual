@@ -1025,6 +1025,10 @@ class V41Engine:
             # Python of the decode loop itself, and any overlap -- and if it ever dominates,
             # that is the finding, not a rounding error.
             _ep = m.stats.get("ep_s", 0.0)
+            # m.stats' timers live in the EAGER forward. With CUDA graphs on, decode replays a
+            # captured graph and those lines never execute again -- so attn/moe below are the
+            # PREFILL figures, and decode's compute showed up only as "unaccounted", which read
+            # 46-75% and looked like the GPU idling. It was the decomposition, not the GPU.
             _parts = {
                 "attn": m.stats["attn_s"],
                 "moe_sync_gpu_wait": st.get("sync_s", 0.0),
@@ -1034,12 +1038,28 @@ class V41Engine:
                 "ep_collective": _ep,
                 "engram": sum(t.stats["seconds"] for t in self.tables.values()),
             }
+            # The graphed decode step, from fastdecode's own host timers. graph_s wraps the whole
+            # layer loop and the engram waits happen inside it, so the wait is subtracted out to
+            # keep these disjoint. What is left in `unaccounted` after this is the sampler, the
+            # accept/reject, and the Python of the decode loop -- and THAT number is the one worth
+            # reading as GPU idle time.
+            _fd0p = _st.get("fd0")
+            if _fd0p is not None and self.fast is not None:
+                _g = self.fast.stats["graph_s"] - _fd0p["graph_s"]
+                _ge = self.fast.stats["engram_s"] - _fd0p["engram_s"]
+                _parts["decode_graphs"] = max(0.0, _g - _ge)
+                _parts["decode_engram_wait"] = _ge
+                _parts["decode_draft"] = self.fast.stats["draft_s"] - _fd0p["draft_s"]
             # Against the WHOLE request, not decode alone. Every component above is a counter
             # accumulated from _reset(), so each already includes this request's prefill; dividing
             # by decode seconds produced shares over 100 % (moe_compute read 349 % on a 16-token
             # completion) and would mislead anyone reading the log line.
             _req = max(t_dec + t_prefill, 1e-9)
-            _parts["unaccounted"] = max(0.0, _req - sum(_parts.values()))
+            # NOT clamped at zero. Some of these overlap by construction -- the engram reads run on
+            # a thread pool while the GPU works, so `engram` and `decode_engram_wait` count the same
+            # seconds from two sides -- and clamping turned that into a confident 0.0% instead of a
+            # visible sign that the parts double-count. A negative value here means exactly that.
+            _parts["unaccounted"] = _req - sum(_parts.values())
             # DSV41_ROUTE_STATS=1: DISTINCT routed experts per layer per verify block. This is the
             # number that sets the expert bytes a step must read -- an expert is read once however
             # many of the block's tokens route to it -- so it is what turns a measured ms/step into
@@ -1415,9 +1435,11 @@ class V41Engine:
         pos = P  # position of `tok` (not yet forwarded)
         accepted_hist = []
         ph = StepPhases() if STEP_TIMING else None
-        if ph is not None and self.fast is not None:
+        if self.fast is not None:
             # the engram row wait and the graph queueing both live inside the "step" phase; record
-            # where they started so the table can break that phase down
+            # where they started so the table can break that phase down. Taken unconditionally --
+            # it is a dict of four floats, and decode_accounting below needs it to say anything
+            # true about the graphed path, which is where all of decode's time actually goes.
             out_st["fd0"] = dict(self.fast.stats)
         out_st.update(n_out=1, steps=0, accepted=accepted_hist, t_decode0=time.perf_counter(), phases=ph)
         steps = 0
