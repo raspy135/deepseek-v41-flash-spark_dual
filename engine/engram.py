@@ -201,7 +201,14 @@ class EngramTable:
         """
         t0 = time.perf_counter()
         n = raw.shape[0]
-        if not self.pinned:
+        # Pinned staging and the row split are mutually exclusive per call, not per config: the
+        # split needs an all-reduce on the device tensor, which the non_blocking path has not
+        # queued yet. Since the split is now size-gated, decode (144 rows, never split) can take
+        # the pinned path while prefill (49k rows, split) keeps the pageable one -- and decode is
+        # exactly where the synchronising copy hurts, because there it blocks the host mid-step
+        # with 40 layers of graphs already queued.
+        staged = self.pinned and not self._split_call(n)
+        if not staged:
             rawt = torch.from_numpy(raw).to(self.device)
             invt = torch.from_numpy(inv.reshape(-1)).to(self.device)
             if self._split_call(n):
@@ -212,8 +219,6 @@ class EngramTable:
                 import torch.distributed as _dist
                 _dist.all_reduce(rawt, op=_dist.ReduceOp.SUM)
         else:
-            assert not self._splitting(), \
-                "DSV41_ENGRAM_PINNED and DSV41_ENGRAM_ROW_SPLIT are not wired together"
             i = self._cur
             self._cur ^= 1  # two buffers: the wait is on the copy from two calls ago
             if self._stage[i] is None or self._stage[i].shape[0] < n:
@@ -232,7 +237,7 @@ class EngramTable:
         scales = torch.exp2(rawt[:, 256:].float() - 127.0)
         deq = (vals.unflatten(-1, (8, 32)) * scales.unsqueeze(-1)).flatten(-2)
         out = deq[invt].view(shape[0], shape[1], 256)
-        if self.pinned:
+        if staged:      # not `self.pinned`: a split call takes the pageable branch and has no `i`
             self._ev[i].record()
         self.stats["seconds"] += time.perf_counter() - t0
         return out

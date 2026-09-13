@@ -12,6 +12,7 @@ import os, sys, json
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
+import torch
 import v41_ref as R
 from engine.engram import EngramTable
 
@@ -83,5 +84,28 @@ assert a0 == a1, "the two ranks disagree about which gathers to split -- this we
 t.ep, t.row_split = None, False
 print(f"split gate: decode {DECODE_N} rows -> local, prefill {PREFILL_N} rows -> split, "
       f"both ranks agree at every size")
+
+# --- pinned staging must not change a single row ---------------------------------------------
+# to_device's pinned path copies through a reused double buffer and transfers non_blocking, so a
+# missing event wait would let the next call overwrite bytes the previous H2D had not read yet --
+# which shows up as plausible-looking wrong rows, never as an error. Needs a free GPU: run this
+# while the server is down.
+if torch.cuda.is_available():
+    try:
+        tt = EngramTable(MD, idx, a.engram_layer_ids[0], "cuda")
+        h = rng.integers(0, tt.n_rows, size=(T_VERIFY, N_HASH), dtype=np.int64)
+        raw, inv, shape = tt.read_raw(h)
+        tt.pinned = False
+        want = tt.to_device(raw, inv, shape).clone()
+        tt.pinned = True
+        for k in range(4):      # >2 calls, so both stage buffers are reused at least once
+            got = tt.to_device(raw, inv, shape).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(got, want), f"pinned call {k} differs from pageable"
+        print(f"pinned == pageable over 4 calls, {tuple(want.shape)} {want.dtype}")
+    except torch.OutOfMemoryError:
+        print("pinned check SKIPPED: no free GPU memory (is the server up?)")
+else:
+    print("pinned check skipped: no CUDA")
 
 print("\nENGRAM GATHER IS PARALLEL AT DECODE SIZE AND BYTE-IDENTICAL")
