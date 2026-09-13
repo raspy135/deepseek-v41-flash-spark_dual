@@ -726,9 +726,13 @@ class State:
         # to the log: one line carrying the figures a slow request has to be explained with.
         _s = result.stats or {}
         if _s:
-            log.info("  prefill %.2fs (%s tok/s) | decode %s tok/s accept=%s | hit=%s nvme=%sGB | "
-                     "ep=%sx collective=%ss",
-                     _s.get("prefill_s") or 0.0, _s.get("prefill_tok_s"), _s.get("decode_tok_s"),
+            _cached = int(_s.get("prefix_cached_tokens") or 0)
+            _prompt = int(_s.get("prompt_tokens") or len(prompt_ids))
+            _reuse_pct = 100.0 * _cached / max(1, _prompt)
+            log.info("  prefill %.2fs (%s tok/s) | prefix=%d/%d (%.1f%%), suffix=%d | "
+                     "decode %s tok/s accept=%s | hit=%s nvme=%sGB | ep=%sx collective=%ss",
+                     _s.get("prefill_s") or 0.0, _s.get("prefill_tok_s"),
+                     _cached, _prompt, _reuse_pct, _prompt - _cached, _s.get("decode_tok_s"),
                      _s.get("accept_len_mean"), _s.get("expert_hit_rate"), _s.get("nvme_gb"),
                      _s.get("ep_world_size") or (_s.get("engine_config") or {}).get("ep_world_size", 1),
                      _s.get("ep_s"))
