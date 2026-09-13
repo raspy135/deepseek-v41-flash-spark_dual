@@ -195,3 +195,29 @@ What did NOT help, both measured rather than reasoned about:
 
 The residual utilization dip is therefore real but small. Anything further has to come from the
 GPU side: fewer bytes per step, or more accepted tokens per step (`accept_len` is ~2.5 of 6).
+
+## Prefill halved when the fused attention kernel was defaulted off
+
+`DSV41_PREFILL_FUSED_ATTN` went from `"1"` to `"0"` in `692d5c1`, three minutes after `8ccf9a3`
+landed the prefix cache. Neither commit has a message. Prefill went 1045–1135 → 544 tok/s on the
+same 4,513-token prompt, and `softmax_attn` went back to dominating attention, which is ~73% of
+prefill.
+
+The apparent reasoning: the fused kernel rounds differently from the torch path (~1e-2 relative,
+bf16 level), and a cache that resumes a prefill has to agree with itself. But that compares the
+wrong two things. Nothing requires the fused path to match the torch path. What must match is a
+**resumed prefill against a cold one under the same kernel** — and the fused kernel is internally
+chunk-invariant: each query row is its own program and the key axis is reduced in fixed `BLOCK_N`
+tiles, neither of which depends on the chunk length. (`split` must stay 1 at prefill; it is
+derived from available parallelism, which *does* depend on T.)
+
+`tools/test_prefix_invariance.py` is the test that was missing. It resumes at 2,259 tokens —
+deliberately not a multiple of the 2,048 chunk size, so the two runs tile the same tokens
+differently — and asserts both halves: that the output is identical, **and** that the cache was
+actually used (`prefix_cached_tokens == 2259`). Equality alone proves nothing, since a cache that
+silently stopped working leaves both runs cold and agreeing.
+
+Back on by default: prefill 544 → 1047 tok/s, `generation_gate.py` 6/6, cache used and
+byte-identical. Note that `DSV41_PREFILL_ATTN_BLOCK_H`/`_BLOCK_N` in `.env` were tuned in
+`df74991` while this path was switched off, so those values measured nothing — they are read per
+call at the `_prefill_attn` call site and are worth re-tuning now that the path is live.

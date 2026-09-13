@@ -19,13 +19,15 @@ HEAD = "Explain the following code and identify patterns.\n"
 
 
 def complete(base, prompt, n=48):
+    """-> (text, prompt_tokens, tokens served from the prefix cache)."""
     body = json.dumps(dict(model="deepseek", prompt=prompt, max_tokens=n,
                            temperature=0, seed=42)).encode()
     req = urllib.request.Request(base + "/v1/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900) as r:
         d = json.loads(r.read())
-    return d["choices"][0]["text"], d["usage"]["prompt_tokens"]
+    cached = int((d.get("x_engine_stats") or {}).get("prefix_cached_tokens") or 0)
+    return d["choices"][0]["text"], d["usage"]["prompt_tokens"], cached
 
 
 def main():
@@ -36,14 +38,20 @@ def main():
     half = HEAD + "".join(CODE[:150])
     other = "Write one sentence about tide pools.\n"
 
-    complete(args.base, other, 8)                    # evict: the engine holds one prefix
-    cold, n_full = complete(args.base, full)
-    complete(args.base, other, 8)                    # evict again
-    _, n_half = complete(args.base, half, 8)         # this run leaves `half` in the cache
-    warm, n_full2 = complete(args.base, full)        # ...so this one resumes from it
+    complete(args.base, other, 8)                       # evict: the engine holds one prefix
+    cold, n_full, cold_cached = complete(args.base, full)
+    complete(args.base, other, 8)                       # evict again
+    _, n_half, _ = complete(args.base, half, 8)         # this run leaves `half` in the cache
+    warm, n_full2, warm_cached = complete(args.base, full)   # ...so this one resumes from it
 
     assert n_full == n_full2, f"prompt lengths differ: {n_full} vs {n_full2}"
-    print(f"prompt {n_full} tokens, resumed after a {n_half}-token prefix")
+    # Equality alone is not enough: if the cache quietly stopped being used, BOTH runs would be
+    # cold prefills and would of course agree. Assert the second run really resumed.
+    assert cold_cached == 0, f"the 'cold' run reused {cold_cached} tokens -- eviction failed"
+    assert warm_cached == n_half, \
+        f"prefix cache NOT USED: resumed run reused {warm_cached} tokens, expected {n_half}"
+    print(f"prompt {n_full} tokens, resumed after a {n_half}-token prefix "
+          f"(cold reused {cold_cached}, warm reused {warm_cached})")
     if cold != warm:
         print("COLD:", repr(cold[:300]))
         print("WARM:", repr(warm[:300]))
@@ -52,7 +60,7 @@ def main():
         print(f"first difference at character {i} of {min(len(cold), len(warm))}")
         sys.exit("PREFIX CACHE IS NOT INVARIANT: resuming changed the answer")
     print(f"cold == resumed, {len(cold)} chars identical")
-    print("\nPREFIX CACHE IS INVARIANT")
+    print("\nPREFIX CACHE IS USED AND INVARIANT")
 
 
 if __name__ == "__main__":

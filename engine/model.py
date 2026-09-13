@@ -86,9 +86,19 @@ def _use_fused(mtp_extra, T: int) -> bool:
     T > 16 keeps the decode-sized calls (verify blocks, drafts) on the torch path, where the split
     tuning and the graph capture live. mtp_extra is the DSpark draft, whose second key block is a
     stride-0 broadcast; left alone for now.
+
+    Back on by default. It was defaulted off three minutes after the prefix cache landed, with no
+    message; the evident worry is that this kernel rounds differently from the torch path (~1e-2
+    relative, bf16 level) and a cache that resumes a prefill has to agree with itself. But that is
+    the wrong comparison: what has to match is a RESUMED prefill against a COLD one under the same
+    kernel, not this kernel against the other one. tools/test_prefix_invariance.py checks exactly
+    that -- resuming at 2259 tokens, deliberately not a multiple of the 2048 chunk size, so the two
+    runs tile the same tokens differently -- and it passes here, with the cache demonstrably used
+    (2259 tokens reused, byte-identical output). Prefill 544 -> 1047 tok/s on a 4513-token prompt,
+    and tools/generation_gate.py is 6/6.
     """
     return (mtp_extra is None and T > 16 and _prefill_attn is not None
-            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "0") == "1")
+            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1")
 
 
 def _mark(name):
