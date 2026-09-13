@@ -1181,7 +1181,15 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
                     # no way for them to disagree about which slots moved.
                     state.ep.broadcast_request({"cmd": "maintain", "swaps": swaps})
                     t0 = time.time()
-                    n = state.engine.apply_swaps(swaps)
+                    try:
+                        n = state.engine.apply_swaps(swaps)
+                    except Exception:
+                        # The peer has the plan and is applying it. If this rank does not finish
+                        # the same work the two routers disagree about which experts are routable
+                        # and the pair diverges silently, which is worse than stopping. Same
+                        # verdict the worker reaches for the same reason.
+                        log.exception("expert adaptation failed on rank 0; the pair would desync, exiting")
+                        os._exit(1)
                     log.info("expert adaptation: %d slots in %.2fs", n, time.time() - t0)
                 else:
                     state.ep.broadcast_request({"cmd": "ping"})

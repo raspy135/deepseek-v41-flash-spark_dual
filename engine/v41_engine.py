@@ -664,6 +664,9 @@ class V41Engine:
             _db = load_prune_db()
             if _db is not None:
                 self.model.load_demand(*_db)
+                # the swap trigger measures GROWTH, so the clock starts at what we just loaded --
+                # otherwise the first idle tick would fire on the seeded history
+                self._swap_baseline = float(_db[0].sum())
                 log(f"prune demand DB loaded: {_db[0].sum():,.0f} recorded routing slots")
             else:
                 self.model.alloc_prune_miss(self.args.n_routed_experts, self.device)
@@ -995,7 +998,15 @@ class V41Engine:
     def apply_swaps(self, swaps) -> int:
         """Move the arena slots this rank owns and update the routing state in place.
 
-        The mask and the device LUT are read from inside the captured decode graphs, so they are
+        ALL OR NOTHING, and any failure is fatal. The mask is global and both ranks must end
+        with the same one: a rank that skipped a swap the other applied would keep a different
+        set of experts routable, so the two routers would pick different top-k, emit different
+        tokens, and diverge with no error anywhere -- the pair is meant to be bit-identical.
+        Only the owning rank touches the arena, so a rank-local "skip this one" is itself the
+        divergence; the only safe responses are apply everything or die loudly, and a desynced
+        pair is unrecoverable anyway (see run_worker).
+
+        The mask and the device LUT are read from inside the captured decode graphs, so both are
         mutated IN PLACE: the graph holds their addresses, and a fresh tensor would be ignored
         while the stale one kept driving the router.
         """
@@ -1003,33 +1014,40 @@ class V41Engine:
             return 0
         st = self.store
         world, rank = max(1, self.ep.world), self.ep.rank
-        done = 0
-        for L, e_out, e_in, _gain in swaps:
-            mine = (e_in % world) == rank
-            if mine:
-                slot = st.lru.pop((L, e_out), None)
-                if slot is None:
-                    continue                      # not resident here; nothing to recycle
+        null = int(getattr(st, "null_slot", -1))
+
+        # Validate before touching anything: a plan that is wrong is wrong before the first load,
+        # and stopping here leaves the arena exactly as it was.
+        for L, e_out, e_in, _g in swaps:
+            if (e_in % world) != (e_out % world):
+                raise RuntimeError(f"swap plan pairs across ownership classes: L{L} {e_out}->{e_in}")
+            if (e_in % world) != rank:
+                continue                                  # the peer owns this pair's arena slot
+            if (L, e_out) not in st.lru:
+                raise RuntimeError(f"swap plan evicts a non-resident expert: L{L} e{e_out}")
+            if (L, e_in) in st.lru:
+                raise RuntimeError(f"swap plan promotes an already-resident expert: L{L} e{e_in}")
+
+        for L, e_out, e_in, _g in swaps:
+            if (e_in % world) == rank:
+                slot = st.lru.pop((L, e_out))
                 try:
                     st._load_into_slot((L, e_in), slot)
-                except Exception as e:            # noqa: BLE001
-                    log(f"swap load failed for layer {L} expert {e_in}: {e}")
-                    st.lru[(L, e_out)] = slot      # put it back exactly as it was
-                    continue
+                except Exception as e:
+                    st.lru[(L, e_out)] = slot              # restore, then die: see the docstring
+                    raise RuntimeError(f"swap load failed L{L} e{e_in}; pair would desync") from e
                 st.lru[(L, e_in)] = slot
                 st.slot_key[slot] = (L, e_in)
                 if self.fast is not None and getattr(self.fast, "lut", None) is not None:
                     self.fast.lut[L, e_in] = slot
-                    self.fast.lut[L, e_out] = int(getattr(st, "null_slot", -1))
-            # the router mask is global and must stay identical on both ranks
+                    self.fast.lut[L, e_out] = null
+            # unconditional: identical on both ranks, whoever owns the slot
             self.model_prune_mask[L][e_out] = False
             self.model_prune_mask[L][e_in] = True
-            done += 1
-        if done:
-            torch.cuda.synchronize()
-            self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
-            log(f"adapted {done} expert slots to observed demand")
-        return done
+        torch.cuda.synchronize()
+        self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
+        log(f"adapted {len(swaps)} expert slots to observed demand")
+        return len(swaps)
 
     def swaps_due(self, min_growth: float = 5e6) -> bool:
         """Only re-plan once the database has grown enough for the answer to have changed."""
