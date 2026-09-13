@@ -485,6 +485,43 @@ class State:
             ids.add(self.eos_id)
         return ids
 
+    def maintain_experts(self) -> bool:
+        """Re-fit the resident experts to observed demand. Returns True if anything was moved.
+
+        The caller must hold ``self.lock`` and the pair must be between requests: rank 1 is back
+        in broadcast_request, so the maintain command lands on the same path the keepalive uses.
+
+        A cycle costs ~0.1 s for 128 slots, so this runs at the end of every response rather than
+        waiting for an idle tick -- a workload that switches between news, research and coding
+        moves the resident set within a request or two instead of a couple of minutes.
+        """
+        if not self.ep_active or self.ep_fault:
+            return False
+        try:
+            if not self.engine.maintain_demand():
+                return False
+            swaps = self.engine.plan_swaps(
+                max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
+        except Exception as e:  # noqa: BLE001
+            # Planning is rank-local and nothing has been broadcast yet, so giving up here is
+            # safe -- unlike a failure after the broadcast, which desyncs the pair.
+            log.warning("expert adaptation planning failed (%s: %s); skipping", type(e).__name__, e)
+            return False
+        if not swaps:
+            return False
+        self.ep.broadcast_request({"cmd": "maintain", "swaps": swaps})
+        t0 = time.time()
+        try:
+            n = self.engine.apply_swaps(swaps)
+        except Exception:
+            # The peer has the plan and is applying it. If this rank does not finish the same
+            # work the two routers disagree about which experts are routable and the pair
+            # diverges silently, which is worse than stopping.
+            log.exception("expert adaptation failed on rank 0; the pair would desync, exiting")
+            os._exit(1)
+        log.info("expert adaptation: %d slots in %.2fs", n, time.time() - t0)
+        return True
+
     def generate(self, prompt_ids: List[int], sampling: dict, *, thinking: bool,
                  detect_tool_calls: bool, result: GenerationResult,
                  tools: Optional[List[dict]] = None) -> Iterator[Tuple[str, str]]:
@@ -650,6 +687,10 @@ class State:
             for _k in ("attn_phases", "gpu_timing", "route_stats", "decode_accounting"):
                 if _s.get(_k):
                     log.info("  %s: %s", _k, json.dumps(_s[_k], separators=(",", ":")))
+        # Last step of the response. Both ranks have just finished the same generate, so this is
+        # the earliest moment the pair is known synchronised and idle -- no need to wait for a
+        # keepalive tick to notice.
+        self.maintain_experts()
 
     # A completion that calls tools is DSML, and the checkpoint's own parser
     # (corpus/sources/dsv41_encoding.py::parse_message_from_completion_text) is strict about it: a
@@ -1168,30 +1209,9 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
                 # generate can be in flight, and the next one waits. That makes the keepalive
                 # tick the natural place to re-fit the resident experts to observed demand --
                 # it is the one moment both ranks are known quiet and already synchronised.
-                swaps = []
-                try:
-                    if state.engine.maintain_demand():
-                        swaps = state.engine.plan_swaps(
-                            max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("expert adaptation planning failed (%s: %s); skipping", type(e).__name__, e)
-                    swaps = []
-                if swaps:
-                    # Both ranks recompute nothing: the plan travels with the command, so there is
-                    # no way for them to disagree about which slots moved.
-                    state.ep.broadcast_request({"cmd": "maintain", "swaps": swaps})
-                    t0 = time.time()
-                    try:
-                        n = state.engine.apply_swaps(swaps)
-                    except Exception:
-                        # The peer has the plan and is applying it. If this rank does not finish
-                        # the same work the two routers disagree about which experts are routable
-                        # and the pair diverges silently, which is worse than stopping. Same
-                        # verdict the worker reaches for the same reason.
-                        log.exception("expert adaptation failed on rank 0; the pair would desync, exiting")
-                        os._exit(1)
-                    log.info("expert adaptation: %d slots in %.2fs", n, time.time() - t0)
-                else:
+                # End-of-response is the usual trigger; this catches a server that went idle
+                # with demand still unapplied (the last response's swaps were capped, say).
+                if not state.maintain_experts():
                     state.ep.broadcast_request({"cmd": "ping"})
         except Exception as e:  # noqa: BLE001
             log.warning("EP2 heartbeat failed (%s: %s); the pair is probably gone", type(e).__name__, e)
