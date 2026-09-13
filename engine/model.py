@@ -359,6 +359,12 @@ class Model:
         # single value handed to the model.
         self._positions = torch.arange(caches.max_seq + 8, device=self.dev)
         self._window_offsets = torch.arange(a.window_size - 1, -1, -1, device=self.dev)
+        # DSV41_PREFILL_EP_OVERLAP runs the per-layer EP2 all-reduce on this side stream so it
+        # overlaps compute (combine_async / wait_stream below). DEFAULT OFF, and not merely out of
+        # caution: measured 2026-09-13, with it on rank 1 dies with a CUDA device-side assert -- an
+        # out-of-bounds index, surfacing late at prune_miss_report()'s .cpu() because CUDA errors
+        # are asynchronous, so the failing kernel is earlier in this path. It takes the pair down.
+        # Do not flip it back looking for prefill speed without finding that first.
         ep = getattr(store, "ep", None)
         self._ep_comm_stream = (torch.cuda.Stream(device=self.dev)
                                 if (torch.cuda.is_available() and getattr(ep, "active", False)
