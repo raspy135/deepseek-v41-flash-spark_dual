@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 
 from engine.fastdecode import FastDecoder, T_VERIFY, R
-from engine.model import HC_OPS as _HC_OPS, _hc_post_fused
+from engine.model import Caches, HC_OPS as _HC_OPS, Model, _hc_post_fused
 
 
 class Batch2FastDecoder:
@@ -189,3 +189,36 @@ def MIN_BUCKET(used_tokens: int, max_seq: int) -> int:
     """Late import avoids making fastdecode's private helper part of this module's API."""
     from engine.fastdecode import _index_bucket
     return _index_bucket(used_tokens, max_seq)
+
+
+def clone_lane(engine, source: FastDecoder | None = None) -> FastDecoder:
+    """Create an independent mutable lane over an engine's shared immutable weights/arena.
+
+    This is intentionally explicit and relatively expensive (~one additional KV cache).  The
+    eventual scheduler owns two lanes for its lifetime; constructing a lane per request would erase
+    the throughput benefit and fragment the unified-memory pool.
+    """
+    src = source or engine.fast
+    caches = Caches(engine.args, src.c.max_seq, engine.device)
+    model = Model(engine.W, engine.store, caches, src.m.moe_fn, act_quant=engine.act_quant)
+    model.prune_mask = src.m.prune_mask
+    model.slot_lut = src.m.slot_lut
+    model.prefill_routes = getattr(src.m, "prefill_routes", None)
+    model.hash_state = src.m.hash_state
+    model.engram_rows = src.m.engram_rows
+    lane = FastDecoder(model, engine, use_graphs=src.use_graphs)
+    lane.lut = src.lut
+    lane.lut_version = src.lut_version
+
+    for dst, old in zip(caches.win, src.c.win):
+        dst.copy_(old)
+    for dst, old in zip(caches.mtp_win, src.c.mtp_win):
+        dst.copy_(old)
+    for layer in caches.ckv:
+        caches.ckv[layer].copy_(src.c.ckv[layer])
+        caches.ik[layer].copy_(src.c.ik[layer])
+        pending = src.c.pending[layer]
+        caches.pending[layer] = (None if pending is None else
+                                  (pending[0].clone(), pending[1].clone()))
+    caches.len = src.c.len
+    return lane
