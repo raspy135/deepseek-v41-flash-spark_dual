@@ -199,7 +199,7 @@ except Exception:  # noqa: BLE001 - no device at import time
 def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | None,
                      mask: torch.Tensor, sink: torch.Tensor, scale: float,
                      split: int | None = None, pv_split: int | None = None,
-                     block_n: int | None = None) -> torch.Tensor:
+                     block_n: int | None = None, block_h: int | None = None) -> torch.Tensor:
     """q bf16 [T, H, D]; kv1 bf16 [T, N1, D] and optional kv2 bf16 [T, N2, D] (either may be a
     stride-0 broadcast along T); mask bool [T, N1+N2]; sink fp32 [H] -> o bf16 [T, H, D]."""
     T, H, D = q.shape
@@ -214,6 +214,8 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     DA, DB = _split_d(D)   # head_dim 512 is a power of two -> DB = 0 and the second block vanishes
     DBP = max(DB, 16)
     bn = BLOCK_N if block_n is None else block_n
+    bh = BLOCK_H if block_h is None else block_h
+    assert bh in (1, 2, 4, 8, 16, 32) and bh <= H, bh
     pv = PV_SPLIT if pv_split is None else pv_split
     # Splitting the key axis only pays when there are too few programs to fill the GPU. That is
     # the decode case the default was tuned for (T=6, 64 heads -> 24 programs against 48 SMs), and
@@ -223,7 +225,7 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     #   T=512  SPLIT=1 2.81 ms   SPLIT=2 3.94 ms   SPLIT=4 5.72 ms
     # so pick on the parallelism the launch already has rather than on a constant.
     if split is None:
-        progs = triton.cdiv(H, BLOCK_H) * T
+        progs = triton.cdiv(H, bh) * T
         sp = 1 if progs >= 2 * _SM_COUNT else N_SPLIT
     else:
         sp = split
@@ -234,9 +236,9 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     k2 = kv1 if kv2 is None else kv2
     s2t, s2n = k2.stride(0), k2.stride(1)
     o = torch.empty(T, H, D, dtype=torch.bfloat16, device=q.device)
-    grid = (triton.cdiv(H, BLOCK_H), T, sp)
+    grid = (triton.cdiv(H, bh), T, sp)
     args = (q, kv1, k2, msk, sink)
-    common = dict(DA=DA, DB=DB, DBP=DBP, BLOCK_H=BLOCK_H, BLOCK_N=bn, PV_SPLIT=pv,
+    common = dict(DA=DA, DB=DB, DBP=DBP, BLOCK_H=bh, BLOCK_N=bn, PV_SPLIT=pv,
                   TWO=1 if kv2 is not None else 0, num_warps=NUM_WARPS, num_stages=NUM_STAGES)
     if sp == 1:
         _dattn_kernel[grid](*args, o, o, o, T, H, N, N1,

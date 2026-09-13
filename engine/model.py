@@ -80,7 +80,7 @@ def _use_fused(mtp_extra, T: int) -> bool:
     stride-0 broadcast; left alone for now.
     """
     return (mtp_extra is None and T > 16 and _prefill_attn is not None
-            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1")
+            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "0") == "1")
 
 
 def _mark(name):
@@ -465,7 +465,10 @@ class Model:
             # no [T, H, N] score tensor, no concatenated key tensor. Measured 3.6x faster than the
             # torch path at T=512 once decode_attn picks SPLIT from the available parallelism --
             # the old constant SPLIT=2 is tuned for a 6-token verify block and is a slowdown here.
-            o = _prefill_attn(q, wkv, ckv_rows, mask, w.attn_sink, a.head_dim ** -0.5)
+            o = _prefill_attn(q, wkv, ckv_rows, mask, w.attn_sink, a.head_dim ** -0.5,
+                              block_h=int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_H", "4")),
+                              block_n=int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_N", "32")),
+                              split=1)
         else:
             o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
         _t = _aph("softmax_attn", _t)
