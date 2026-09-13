@@ -693,16 +693,22 @@ class Model:
         attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
         y = R.hc_pre(h, pre_mix)
         y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
+        _mark("hc_attn_mix")
         t0 = time.perf_counter()
         y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
         self.stats["attn_s"] += time.perf_counter() - t0
         h = R.hc_post(y, residual, attn_post, attn_comb)
+        _mark("hc_post_attn")
         residual = h
         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
         y = R.hc_pre(h, attn_pre)
         y = R.rmsnorm(y, w.ffn_norm, a.norm_eps)
+        # Everything above since o_proj is hyper-connection bookkeeping on the 4x-wide residual
+        # stream, not MoE -- it was being charged to the moe_kernel gap.
+        _mark("hc_ffn_mix")
         y = self.moe(y, w, L, prefill, store, arena, n_experts)
         h = R.hc_post(y, residual, ffn_post, ffn_comb)
+        _mark("hc_post_ffn")
         return h, ffn_pre
 
     # ------------------------------------------------------------------ SWA bounded replay
