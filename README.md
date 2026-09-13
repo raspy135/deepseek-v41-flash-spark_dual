@@ -34,7 +34,7 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
 | prefill | **~1047 tok/s** on a 4,513-token prompt, when cache hits it can go 10k+ token/sec |
 | decode | **13–24 tok/s**, set by draft acceptance (2.1 on prose, 4.5 on code) at a ~163 ms step |
 | context | 256k (`MAX_SEQ=262144`) |
-| residency | 4,361 of 15,360 experts (28.4 %), 82 GB arena per box, total about 60% of expert is loaded |
+| residency | 4,361 of 15,360 experts (28.4 %), 82 GB arena per box, total about 60% of expert is loaded. Loaded expert will be swapped live. See adaptive expert loading for details. |
 
 
 ## About this recipe
@@ -44,7 +44,7 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
 - Expert weight quant is fp4. 
 - It can't load all expert weight to two machines, so some of weights are not loaded and not reffered.
   However, adaptive expert loading measures missed expert weight and the engine will load missed 
-  expert mode eventually. It works well with continuous conversation, normally with harness.
+  expert eventually. It works well with continuous conversation with harness.
 
 ## What this fork adds on top of the upstream engine
 
