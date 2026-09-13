@@ -835,7 +835,11 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     inv = torch.full((arena.slots,), -1, dtype=torch.int32, device=dev)
     ar = torch.arange(batch, dtype=torch.int32, device=dev)
     BM = _pick_bm(P)
-    bn1, nw1, ns1 = F4._UP_CFG[BM]
+    # Mirror fp4_moe.moe_forward: with DSV41_FP4_DOT_SCALED the up kernel takes a different
+    # config table AND a SCALED constexpr. These paths call F4's kernels directly, so they have to
+    # track that signature -- they silently did not, and it surfaced only when CB3 first became
+    # reachable under EP2 ("dynamic_func() missing 1 required positional argument: 'SCALED'").
+    bn1, nw1, ns1 = (F4._UP_CFG_SCALED if F4.DOT_SCALED else F4._UP_CFG)[BM]
     bn2, nw2, ns2 = F4._DOWN_CFG[BM]
     wgt = weights.reshape(-1)
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
@@ -855,10 +859,12 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
         F4._moe_up_kernel[(NB, INTER // bn1)](
             x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
             x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
+            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=F4.DOT_SCALED, NULL_SLOT=-1,
+            num_warps=nw1, num_stages=ns1)
         F4._moe_down_kernel[(NB, DIM // bn2)](
             h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
-            TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
+            TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=F4.DOT_SCALED, NULL_SLOT=-1,
+            num_warps=nw2, num_stages=ns2)
     out = parts.view(K, T, DIM).sum(dim=0)
     return out if out_dtype == torch.float32 else out.to(out_dtype)
 
@@ -1216,7 +1222,11 @@ def moe_forward_cb2_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch
     inv = torch.full((arena.slots,), -1, dtype=torch.int32, device=dev)
     ar = torch.arange(batch, dtype=torch.int32, device=dev)
     BM = _pick_bm(P)
-    bn1, nw1, ns1 = F4._UP_CFG[BM]
+    # Mirror fp4_moe.moe_forward: with DSV41_FP4_DOT_SCALED the up kernel takes a different
+    # config table AND a SCALED constexpr. These paths call F4's kernels directly, so they have to
+    # track that signature -- they silently did not, and it surfaced only when CB3 first became
+    # reachable under EP2 ("dynamic_func() missing 1 required positional argument: 'SCALED'").
+    bn1, nw1, ns1 = (F4._UP_CFG_SCALED if F4.DOT_SCALED else F4._UP_CFG)[BM]
     bn2, nw2, ns2 = F4._DOWN_CFG[BM]
     wgt = weights.reshape(-1)
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
@@ -1234,9 +1244,10 @@ def moe_forward_cb2_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch
         F4._moe_up_kernel[(NB, INTER // bn1)](
             x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
             x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
+            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=F4.DOT_SCALED, NULL_SLOT=-1,
+            num_warps=nw1, num_stages=ns1)
         F4._moe_down_kernel[(NB, DIM // bn2)](
             h, scratch.w2, scratch.s2, parts, block_slot, block_pair,
             h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
-            num_warps=nw2, num_stages=ns2)
+            SCALED=F4.DOT_SCALED, NULL_SLOT=-1, num_warps=nw2, num_stages=ns2)
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
