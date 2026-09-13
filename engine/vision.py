@@ -15,6 +15,7 @@ n-gram hasher, which must not let an n-gram span an image.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -48,6 +49,27 @@ def load_vision(model_dir: str, device: str = "cuda", dtype=torch.bfloat16):
         raise RuntimeError("this checkpoint has no vision tower (vision_n_layers == 0)")
     sys.path.insert(0, os.path.join(model_dir, "inference"))
     import vision as V  # noqa: E402
+
+    # The reference builds its 2D-RoPE tables with no device argument, so they are always CPU --
+    # fine in the reference, which runs the tower on CPU tensors it has just created, but here the
+    # ViT is on the GPU and apply_rotary then multiplies cuda activations by cpu tables:
+    # "Expected all tensors to be on the same device". It raises rather than falling back, and
+    # under EP2 a raise mid-forward leaves the peer mid-generate and the pair out of step, so the
+    # symptom is a hung request rather than an error. Cache them per device instead.
+    if not getattr(V, "_dsv41_device_rope", False):
+        _orig_cos_sin = V.get_vision_cos_sin
+
+        @functools.lru_cache(16)
+        def _cos_sin_on(n_h, n_w, dim, theta, _dev=None):
+            cos, sin = _orig_cos_sin(n_h, n_w, dim, theta)
+            return cos.to(_dev), sin.to(_dev)
+
+        def get_vision_cos_sin(n_h, n_w, dim, theta):
+            return _cos_sin_on(n_h, n_w, dim, theta, _dev=V._dsv41_rope_device)
+
+        V.get_vision_cos_sin = get_vision_cos_sin
+        V._dsv41_device_rope = True
+    V._dsv41_rope_device = torch.device(device)
 
     vit, aligner = V.ViT(args), V.Aligner(args)
     index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
