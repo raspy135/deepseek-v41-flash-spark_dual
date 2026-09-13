@@ -89,7 +89,7 @@ case "$DEFAULT_THINKING" in on|off) ;; *) err "DEFAULT_THINKING must be on|off (
 case "$SPEC" in 0|1) ;; *) err "SPEC must be 0|1 (got '$SPEC')" ;; esac
 case "$WORLD_SIZE" in 1|2) ;; *) err "WORLD_SIZE must be 1 or 2 (the EP2 skeleton is world-2 only)" ;; esac
 if [[ "$WORLD_SIZE" != "1" ]]; then
-    [[ -n "$PEER" ]] || err "WORLD_SIZE=2 needs PEER=<ssh target of the second spark> (e.g. ryan@10.0.0.2)"
+    [[ -n "$PEER" ]] || err "WORLD_SIZE=2 needs PEER=<ssh target of the second spark> (e.g. user@10.0.0.2)"
     command -v ssh >/dev/null 2>&1 || err "ssh not found but WORLD_SIZE=2"
 fi
 

@@ -17,10 +17,18 @@
 # it to cover G1 silently removed that protection and killed the launcher.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PEER="${PEER:-ryan@10.0.0.2}"
-MASTER_ADDR="${MASTER_ADDR:-10.0.0.1}"
+[[ -n "${PEER:-}" ]] || { echo "PEER is required (e.g. PEER=user@10.0.0.2)" >&2; exit 1; }
+[[ -n "${MASTER_ADDR:-}" ]] || { echo "MASTER_ADDR is required (this box on the link)" >&2; exit 1; }
 MASTER_PORT="${MASTER_PORT:-29613}"
-IFACE="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
+# enp1s0f1np1 is the direct-attach CX7 port on the pair this was developed on. Fall back to it
+# only if this box actually has an interface by that name -- otherwise NCCL binds a name that does
+# not exist and reports it as a hang at init rather than as a bad interface.
+IFACE="${NCCL_SOCKET_IFNAME:-}"
+if [[ -z "$IFACE" ]]; then
+    [[ -d /sys/class/net/enp1s0f1np1 ]] \
+        || { echo "ERROR: set NCCL_SOCKET_IFNAME to the interface facing the peer" >&2; exit 1; }
+    IFACE=enp1s0f1np1
+fi
 BACKEND="${G0_BACKEND:-nccl}"
 # Which gate to launch. The ordering, the per-node GID resolution and the container plumbing
 # below are the same for any 2-rank probe, so G1 (graph-captured collectives) reuses all of it

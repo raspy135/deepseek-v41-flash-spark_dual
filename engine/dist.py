@@ -42,9 +42,17 @@ def _apply_default_net_env() -> None:
     port and hang at init_process_group with no useful log -- which is exactly the
     Gate G0 failure mode we hit on first bring-up.
     """
-    # Prefer the direct-attach 10.0.0.0/24 CX7 (enp1s0f1np1) used between the two Sparks.
-    os.environ.setdefault("NCCL_SOCKET_IFNAME", "enp1s0f1np1")
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", "enp1s0f1np1")
+    # The interface name is site-specific: `enp1s0f1np1` is the direct-attach CX7 port on the
+    # pair this was developed on, and hardcoding it as a default meant any other machine silently
+    # got a name it does not have -- which NCCL reports as a hang at init, not as a bad interface.
+    # Set NCCL_SOCKET_IFNAME in .env (scripts/dual-up.sh forwards it to both ranks); the default
+    # is only applied when an interface by that name actually exists here.
+    _iface = os.environ.get("NCCL_SOCKET_IFNAME") or os.environ.get("GLOO_SOCKET_IFNAME")
+    if not _iface and os.path.isdir("/sys/class/net/enp1s0f1np1"):
+        _iface = "enp1s0f1np1"
+    if _iface:
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", _iface)
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", _iface)
     os.environ.setdefault("NCCL_IB_DISABLE", "0")
     # Don't force NCCL_NET=IB: on some DGX OS builds the RoCE path needs explicit HCA;
     # leaving it unset lets NCCL probe. Set NCCL_IB_HCA=mlx5_0 if probe fails.

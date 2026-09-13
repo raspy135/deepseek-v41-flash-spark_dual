@@ -61,7 +61,15 @@ PORT="${PORT:-8000}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-90}"
 NAME0="${NAME0:-deepseek-v41-ep2-rank0}"
 NAME1="${NAME1:-deepseek-v41-ep2-rank1}"
-IFACE="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
+# enp1s0f1np1 is the direct-attach CX7 port on the pair this was developed on. Fall back to it
+# only if this box actually has an interface by that name -- otherwise NCCL binds a name that does
+# not exist and reports it as a hang at init rather than as a bad interface.
+IFACE="${NCCL_SOCKET_IFNAME:-}"
+if [[ -z "$IFACE" ]]; then
+    [[ -d /sys/class/net/enp1s0f1np1 ]] \
+        || { echo "ERROR: set NCCL_SOCKET_IFNAME to the interface facing the peer" >&2; exit 1; }
+    IFACE=enp1s0f1np1
+fi
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"
 # Where rank 0's API binds. Loopback by default: with --network host an open port is 510 GB of
 # weights answering the whole LAN with no authentication of any kind. BIND_HOST=0.0.0.0 opts in to
@@ -81,14 +89,14 @@ case "${1:-}" in
     *)         err "unknown argument '${1}' (expected --no-wait or --check)" ;;
 esac
 
-[[ -n "$PEER" ]] || err "PEER is required (e.g. PEER=ryan@10.0.0.2), set it in .env"
+[[ -n "$PEER" ]] || err "PEER is required (e.g. PEER=user@10.0.0.2), set it in .env"
 PEER_IP="${PEER#*@}"
 MASTER_ADDR="${MASTER_ADDR:-$(ip route get "$PEER_IP" 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1)}"
 [[ -n "$MASTER_ADDR" ]] || err "cannot derive MASTER_ADDR toward $PEER_IP; set it in .env"
 
 # The checkpoint directory on each HOST. MODEL_DIR in .env is a host path; inside every
 # container the checkpoint is always /models/<name>, so only the directory name varies.
-HOST_MODELS="${MODELS_DIR:-$(dirname "${MODEL_DIR:-/home/ryan/models/DeepSeek-V4.1-Flash}")}"
+HOST_MODELS="${MODELS_DIR:-$(dirname "${MODEL_DIR:-$HOME/models/DeepSeek-V4.1-Flash}")}"
 MODEL_NAME="${MODEL_NAME:-$(basename "${MODEL_DIR:-DeepSeek-V4.1-Flash}")}"
 
 ssh_peer() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" "$@"; }

@@ -40,3 +40,9 @@ results/*/state/
 *.swo
 *~
 results/captured_request.pt
+
+# The adaptive-expert demand database. The engine rewrites it after every request, so tracking it
+# makes the tree permanently dirty and every commit carries a 244 KB binary diff. A fresh clone
+# starts from the shipped routing trace (results/trace-union/stats/coverage.json) and rebuilds
+# this within a few requests, which is the designed cold-start path.
+results/prune_demand.npz

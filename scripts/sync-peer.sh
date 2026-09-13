@@ -26,7 +26,7 @@
 # Usage: scripts/sync-peer.sh [--dry-run]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PEER="${PEER:-ryan@10.0.0.2}"
+[[ -n "${PEER:-}" ]] || { echo "PEER is required (e.g. PEER=user@10.0.0.2)" >&2; exit 1; }
 DEST="${DEST:-$ROOT}"
 DRY=()
 [[ "${1:-}" == "--dry-run" ]] && DRY=(--dry-run)

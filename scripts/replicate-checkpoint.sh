@@ -7,7 +7,7 @@
 #                                                     # then replicate + verify
 #   ./scripts/replicate-checkpoint.sh --now           # skip the watcher (download
 #                                                     # already complete)
-#   ./scripts/replicate-checkpoint.sh --peer ryan@10.0.0.2
+#   ./scripts/replicate-checkpoint.sh --peer user@10.0.0.2
 #   PARTS=12 STREAMS=10 ./scripts/replicate-checkpoint.sh   # tuning knobs
 #
 # Why this exists: dual Spark needs the FULL checkpoint on each box's LOCAL
@@ -48,9 +48,9 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
-PEER="${PEER:-ryan@10.0.0.2}"
-[[ "$PEER" != *@* ]] && PEER="ryan@$PEER"   # bare ip gets the user it needs
-MODEL_DIR="${MODEL_DIR:-/home/ryan/models/DeepSeek-V4.1-Flash}"
+[[ -n "${PEER:-}" ]] || { echo "PEER is required (e.g. --peer user@10.0.0.2)" >&2; exit 1; }
+[[ "$PEER" != *@* ]] && PEER="${USER}@$PEER"   # bare ip gets THIS box's login, not a hardcoded one
+MODEL_DIR="${MODEL_DIR:-$HOME/models/DeepSeek-V4.1-Flash}"
 [[ "$MODEL_DIR" != /* ]] && err "MODEL_DIR must be absolute (it is reused verbatim on $PEER): $MODEL_DIR"
 PARTS="${PARTS:-12}"          # parallel streams
 STREAM_TIMEOUT_S="${STREAM_TIMEOUT_S:-3600}"

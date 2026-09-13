@@ -1,3 +1,57 @@
+# DeepSeek-V4.1-Flash on TWO DGX Sparks (EP2 fork)
+
+> This is a fork of [0xBakeer/deepseek-v41-flash-spark](https://github.com/0xBakeer/deepseek-v41-flash-spark),
+> which serves this model on **one** GB10 box. This fork adds a **second box**: the 15,360 routed
+> experts are split by parity across the pair (expert parallel, world size 2) and everything else
+> — attention, Engram, router, the DSpark drafter, KV, sampling — stays bit-identically replicated.
+> The original README follows unchanged below, and still describes the engine this is built on.
+
+**What the second box buys.** Not raw FLOPs — decode on this model is bound by the bytes a step
+moves, and a step reads the same replicated dense weights on both machines. What it buys is
+**residency**: 82 GB of expert arena per box instead of one box's 73.8 GB, so 28.4 % of the routed
+experts stay resident with the rest streamed from NVMe, and the working set is re-fitted to the
+traffic as it arrives.
+
+Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach RoCE):
+
+| | |
+|---|---|
+| prefill | **~1047 tok/s** on a 4,513-token prompt |
+| decode | **13–24 tok/s**, set by draft acceptance (2.1 on prose, 4.5 on code) at a ~163 ms step |
+| context | 256k (`MAX_SEQ=262144`) |
+| residency | 4,361 of 15,360 experts (28.4 %), 82 GB arena per box |
+
+**What this fork adds on top of the upstream engine**
+
+- **EP2 expert parallelism** — routed experts split `expert % 2 == rank`, one fp32 all-reduce per
+  MoE layer, captured inside the decode CUDA graphs. A boot-time guard refuses to start when the
+  two ranks disagree about how to compute, because a skewed pair does not fail — it quietly
+  computes different things.
+- **Adaptive expert residency** — the engine records what the router *wanted* (not what it got),
+  blends it with the shipped trace, and swaps the arena toward observed demand. It adapts twice
+  per request: once at the prefill→decode boundary, so a long prompt's demand is applied before
+  the answer is written, and once after. The database survives restarts.
+- **Exact prompt-prefix reuse** — a continuing conversation re-prefills only its new tokens
+  (95–100 % hits in practice). `tools/test_prefix_invariance.py` asserts the property the cache
+  rests on: resuming from a cached prefix reproduces a cold prefill **byte for byte**, and that
+  the cache was actually used.
+- **Vision** — the ViT + aligner path, with image spans aligned to prefill chunk boundaries.
+- **Speed work, all measured** — the engram row gather was running single-threaded at decode
+  (83 ms of a 196 ms step); the fused prefill attention had been switched off and is worth
+  544 → 1047 tok/s.
+
+**Read [`docs/gotchas.md`](docs/gotchas.md) before tuning anything.** It records the negative
+results too — dense tensor parallelism, a wider speculation block, pinned engram staging and the
+EP row split at decode all made things *worse*, some of them while making GPU utilization look
+better. [`docs/dual-spark-plan.md`](docs/dual-spark-plan.md) has the parallelism arithmetic.
+
+**Honest status.** Same caveat as upstream, doubled: this runs on exactly one pair of machines,
+the numbers above are from that pair, and the interesting failure mode of a two-box setup is not
+a crash but a silent divergence. The guards and tests exist because each of those was found the
+hard way.
+
+---
+
 # DeepSeek-V4.1-Flash on a single NVIDIA DGX Spark
 
 > **Status: WORK IN PROGRESS.** It serves, it is correct, and it is slow. One benchmark row
