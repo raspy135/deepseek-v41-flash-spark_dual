@@ -1336,7 +1336,16 @@ class V41Engine:
         logits = None
         if prefix_start == 0:
             self._miss_at_request_start = m.miss_snapshot() if hasattr(m, "miss_snapshot") else None
-        m.begin_prompt()
+            # begin_prompt() EMPTIES the replay buffer, and on a prefix-cache hit _restore_prefix
+            # has already filled it with the cached window tail -- so resetting here threw away
+            # exactly the state the cache exists to keep. Two failures came out of that: a prompt
+            # that hits the cache in FULL prefills nothing, so nothing refills the buffer and
+            # _save_prefix -> _rep_tail did torch.cat([]) (a 500 that also marked the EP pair out
+            # of step, i.e. every later request 503); and on a partial hit the decoder replay ran
+            # over the suffix alone instead of the last window_size prompt tokens, which is a
+            # short window rather than a crash and so said nothing at all. A restored prefix is a
+            # continuation of its own prompt, not a new one.
+            m.begin_prompt()
         # Hash the whole prompt once so chunk k+1's engram rows can be read off NVMe while chunk k
         # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
         # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
@@ -1640,6 +1649,11 @@ class V41Engine:
             "expert_format": self.expert_format,
             "expert_mb": round(self.expert_bytes / 1e6, 2),
             "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
+            # Which parallelization is actually live. EP2 is what ships (dense TP measured
+            # slower, see R.tp_dense), so the useful question this answers is "did the restart
+            # really go back?" -- the flag lives in the launcher's environment, not in .env, and
+            # there was otherwise no way to tell the two modes apart from outside the container.
+            "tp_dense": "on" if R.tp_dense()[1] > 1 else "off",
             "head_fmt": R.head_fmt(),
             "routed_topk": self.args.n_activated_experts,
             "sim_cb2_frac": self.sim_cb2_frac,
