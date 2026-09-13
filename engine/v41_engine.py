@@ -813,6 +813,7 @@ class V41Engine:
                     # into "the model" and "the drafter" instead of inferred from host waits.
                     n_steps = max(1, gt.get("layers_n", 1))
                     self.last_stats["gpu_timing"] = {
+                        "hash_ms_per_step": round(gt.get("hash", 0) / max(1, gt.get("hash_n", 1)), 2),
                         "layers_ms_total": gt.get("layers"), "draft_ms_total": gt.get("draft"),
                         "layers_ms_per_step": round(gt.get("layers", 0) / n_steps, 2),
                         "draft_ms_per_step": round(gt.get("draft", 0) / max(1, gt.get("draft_n", 1)), 2),
@@ -913,7 +914,17 @@ class V41Engine:
                         block = torch.cat([torch.tensor([tok], device=self.device), drafts])
                     if ph is not None:
                         ph.mark("block")
+                    # The n-gram hashes are computed on the GPU and then pulled to the host so the
+                    # engram reads can be issued, and that D2H blocks the host for ~14 ms/step.
+                    # It looked like idle worth overlapping until this event pair priced the hash
+                    # itself at 0.17 ms: the D2H is not waiting on the hash, it is waiting on the
+                    # ~15.7 ms drafter graph queued ahead of it. The GPU is busy for that whole
+                    # window, so there is nothing there to overlap -- keep the measurement so the
+                    # next person does not rediscover it. `hash` (the host phase) only queues it.
+                    _evh = self.fast._ev_begin("hash") if self.fast is not None else None
                     hashes = m.hash_state(block[None], pos)[0]
+                    if _evh is not None:
+                        _evh.record()
                     if ph is not None:
                         ph.mark("hash")
                     # both tables' rows are read in background threads (NVMe only, no CUDA calls there) and
