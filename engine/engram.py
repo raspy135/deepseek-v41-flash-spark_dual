@@ -54,9 +54,6 @@ class EngramTable:
                 except (AttributeError, OSError):
                     pass
         self.gather_threads = int(os.environ.get("DSV41_ENGRAM_GATHER_THREADS", "64"))
-        # pacing: sleep this long after every `pace_rows` rows, per worker (see _gather_rows)
-        self.read_pace = float(os.environ.get("DSV41_ENGRAM_READ_PACE_S", "0"))
-        self.pace_rows = int(os.environ.get("DSV41_ENGRAM_PACE_ROWS", "16"))
         # EP2 row split: both ranks hash the same tokens, so both were reading the SAME rows off
         # their own NVMe -- the work was duplicated, and it is the prefill bottleneck. With the
         # split each rank reads only `uniq % world == rank` into a zero-filled full array and one
@@ -99,33 +96,22 @@ class EngramTable:
         """Parallel memmap gather of the unique rows. Page faults do the I/O, so the threads are
         blocked in the kernel rather than fighting over the GIL.
 
-        DSV41_ENGRAM_READ_PACE_S paces the gather: each worker yields for that long between
-        sub-slices. This box has unified memory, so the gather and the GPU kernels pull on the
-        same DRAM -- a burst that saturates the bus stalls the GPU behind it. Spreading the same
-        reads thinly leaves bandwidth headroom continuously, which is a different thing from
-        DELAYING the burst (that only moves the contention window). The read has slack to give up:
-        roughly 400 ms of reading against 1000 ms of compute per chunk.
+        Throttling this was tried and measured harmful, twice: pacing it (a short yield every 16
+        rows, per worker) gave 434 tok/s and deferring the whole read 400 ms gave 217, against
+        1135 with neither. The read is not background work with slack to spare -- the next chunk
+        cannot start its layer-1 engram until its rows land, so slowing the read by any mechanism
+        directly delays the chunk waiting on it. What paid was removing work: splitting the rows
+        across ranks halved per-box volume and took prefill 509 -> 1045 tok/s.
         """
         out = np.empty((len(ids), 264), np.uint8)
         nt = max(1, self.gather_threads)
         step = max(1024, len(ids) // nt + 1)
-        pace = self.read_pace
-        sub = max(64, self.pace_rows) if pace > 0 else 0
 
         def one(i):
-            end = min(i + step, len(ids))
-            if not pace:
-                sl = slice(i, end)
-                rows = ids[sl]
-                out[sl, :256] = self.w_mm[rows]
-                out[sl, 256:] = self.s_mm[rows]
-                return
-            for j in range(i, end, sub):               # same work, handed out in sips
-                sl = slice(j, min(j + sub, end))
-                rows = ids[sl]
-                out[sl, :256] = self.w_mm[rows]
-                out[sl, 256:] = self.s_mm[rows]
-                time.sleep(pace)
+            sl = slice(i, min(i + step, len(ids)))
+            rows = ids[sl]
+            out[sl, :256] = self.w_mm[rows]
+            out[sl, 256:] = self.s_mm[rows]
 
         starts = range(0, len(ids), step)
         if len(ids) <= step:
@@ -276,12 +262,10 @@ class EngramReadAhead:
     32-thread pool.
     """
 
-    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2,
-                 read_delay: float = 0.0):
+    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2):
         self.tables, self.pool, self.layer_ids = tables, pool, list(layer_ids)
         self.hashes, self.chunk = hashes_np, chunk
         self.depth = max(1, depth)
-        self.read_delay = max(0.0, read_delay)
         self.total = hashes_np.shape[0]
         self.futures: dict[int, dict] = {}
 
@@ -289,22 +273,7 @@ class EngramReadAhead:
         if s in self.futures or s >= self.total:
             return
         hs = self.hashes[s:s + self.chunk]
-        delay = self.read_delay
-        if delay <= 0:
-            self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
-                               for li, L in enumerate(self.layer_ids)}
-            return
-
-        # Deliberately hold the read back. On unified memory the gather and the GPU kernels pull
-        # on the same DRAM, so a read issued the instant it is known competes with the chunk that
-        # is running RIGHT NOW -- and the chunk that needs it is the one after. Starting late
-        # trades read-ahead slack (there is plenty: ~400 ms of reading against ~1000 ms of
-        # compute) for a quieter memory bus while the GPU is busiest.
-        def _later(layer, h, wait):
-            time.sleep(wait)
-            return self.tables[layer].read_raw(h)
-
-        self.futures[s] = {L: self.pool.submit(_later, L, hs[:, li, :], delay)
+        self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
                            for li, L in enumerate(self.layer_ids)}
 
     def rows_for(self, s: int):
