@@ -415,11 +415,11 @@ class FastDecoder:
             # EP2 (engine/dist.py). This path does NOT go through Model.moe, so the two things
             # that method does for expert parallel have to be done here as well -- and both are
             # load-bearing:
-            #   slots_repeat=True  every non-owned expert of the block shares the one null slot,
-            #                      which violates build_routing_small's "<= BM pairs per slot"
-            #                      invariant. Without it the 6-token verify block silently
-            #                      corrupts ~1 token in 10 (tools/fp4_moe.py, and the dual run
-            #                      that produced "mixture-of-experualiayer").
+            #   slots_repeat=True + null_slot  every non-owned expert shares one zero slot. The
+            #                      decode router gives those pairs temporary unique keys, skips
+            #                      their compute, and keeps BM=16 for the real experts. Omitting
+            #                      both hooks either overflows build_routing_small or falls back to
+            #                      the substantially slower BM=64 path (tools/fp4_moe.py).
             #   fp32 + combine     this rank computed only its half of the k-sum; the all-reduce
             #                      supplies the rest. Rounding to bf16 happens ONCE, after the
             #                      combine, at the same point the single-box path rounds.

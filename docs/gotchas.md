@@ -259,3 +259,25 @@ tiles are not the goal; tokens per byte read is.
 Note also that the documented `DSV41_BLOCK` range (odd, 1–15) is wrong. The graph-capturable
 routing path (`build_routing_small`) handles P ≤ 64 pairs and P = T_VERIFY × 6, so T_VERIFY ≤ 10
 caps it at 9; above that the MoE falls into a `torch.unique` path that cannot be captured at all.
+
+## Low decode utilization is mostly skinny work, but EP null routing made it worse
+
+The GPU timeline on the live FP4/EP2 configuration is nearly full: 140.9 ms of backbone plus
+14.7 ms of DSpark drafting in a 162.6 ms decode loop. A 70–90% utilization reading therefore does
+not imply 10–30% host-idle time. The work consists mostly of small-row dense projections and FP4
+routed-expert kernels, interleaved with one collective per layer; occupancy and arithmetic-unit
+utilization are low even while the device is continuously executing.
+
+There was still one exact EP2 loss. Every non-owned route mapped to a shared zero expert, so about
+half of a 36-pair verify block collided on one arena slot. The safe implementation raised the MoE
+tile from the single-device-tuned BM=16 to BM=64 for *all* experts. Passing the known null slot and
+giving each null pair a temporary unique routing key lets the kernels skip those pairs and restores
+BM=16 for the real experts. On the focused GB10 kernel test the call moved 1.58 → 1.03 ms; at full
+model scale, with essentially matched demand (~21.8 distinct experts/layer), backbone time moved
+from roughly 150 to 140.9 ms/step. The mathematical result is unchanged; the EP2 oracle test keeps
+the same 0.16% FP4-kernel error against dequantized GEMM.
+
+After that change only about 7 ms/step is outside the GPU timeline. The next single-request gains
+must reduce executed bytes/work or improve DSpark acceptance. Dense TP and a wider verify block
+have both been measured in the wrong direction; top-k 5 is faster but exceeds the prose loss gate,
+and the BF16 LM head remains intentionally unquantized.

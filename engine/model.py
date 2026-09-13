@@ -849,11 +849,11 @@ class Model:
             route_args = {}
             if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
                 route_args = {"routing_ids": route[0][indices], "routing_slot_map": route[1]}
-            # slots_repeat: every non-owned expert of this call shares the ONE null slot, so the
-            # decode block aims ~half its (token, k) pairs at a single slot. The decode-sized
-            # routing builder gives each slot one BM-wide block and silently overflows past BM
-            # pairs -- with BM=16 and a 6-token verify block that corrupted ~1 token in 10 while
-            # staying fluent enough to look like a sampling quirk. tools/fp4_moe.py.
+            # slots_repeat + null_slot: every non-owned expert of this call shares ONE zero slot.
+            # At decode size the router gives those pairs temporary unique keys, then maps them
+            # back to the skipped null slot, so real experts retain the tuned BM=16. Without the
+            # special route, ~18 null pairs overflow one 16-row block; using BM=64 avoids the
+            # corruption but makes every real expert slower. See tools/fp4_moe.py.
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
                                  slots_repeat=True,
                                  null_slot=(store.null_slot if (not prefill or
