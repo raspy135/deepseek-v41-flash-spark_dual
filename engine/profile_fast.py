@@ -2,8 +2,11 @@
 import os, sys, time, torch
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, ".."))
 from engine.v41_engine import V41Engine, log
-md = os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
-eng = V41Engine(md, max_seq=8192, trace_stats="results/trace-full-20260910/stats/coverage.json", spec=True,
+md = os.environ.get("MODEL_DIR") or os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
+# MODEL_DIR first: ~ is /root in the serving image, where the checkpoint is bind-mounted
+# somewhere else entirely, and this script is most useful run against that image.
+TRACE = os.environ.get("TRACE_STATS", "results/trace-union/stats/coverage.json")
+eng = V41Engine(md, max_seq=8192, trace_stats=TRACE, spec=True,
                 prune_keep=float(os.environ.get("PK", "0.31")), arena_gb=float(os.environ.get("AG", "90.5")),
                 transient_slots=int(os.environ.get("TRANSIENT_SLOTS", "8")),
                 keep_free_gb=float(os.environ.get("KEEP_FREE_GB", "10")),

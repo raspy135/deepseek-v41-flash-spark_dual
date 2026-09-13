@@ -457,9 +457,21 @@ class FastDecoder:
         # indexes the arena out of bounds inside a captured graph, where there is no bounds check
         # and the symptom would be corrupted experts rather than an error. Checking per call would
         # be a device->host sync per layer, which is what this table exists to remove.
-        bad = int((lut < 0).sum())
-        assert bad == 0, (f"slot table has {bad} unmapped (layer, expert) entries; every routable "
-                          f"expert must map to a real slot or the null slot")
+        # Only ROUTABLE experts have to be mapped. A pruned expert is never gathered -- the router
+        # masks it to -inf (Model.moe) -- so its -1 is correct and expected, and demanding a slot
+        # for it broke the single-box pruned path: at keep 0.31 that is 264 of 384 experts per
+        # layer, 10,560 entries, and the assert fired at startup. It never showed under EP2, where
+        # the fill value is the null slot and every entry is mapped either way.
+        pm = getattr(self.m, "prune_mask", None)
+        if pm:
+            routable = torch.zeros_like(lut, dtype=torch.bool)
+            for L, msk in pm.items():
+                routable[L] = msk.to(lut.device)
+        else:
+            routable = torch.ones_like(lut, dtype=torch.bool)
+        bad = int(((lut < 0) & routable).sum())
+        assert bad == 0, (f"slot table leaves {bad} ROUTABLE (layer, expert) entries unmapped; "
+                          f"every expert the router can pick needs a real slot or the null slot")
         self.lut = lut.to(self.dev)
         self.lut_version = st.stats.get("misses", 0)
 

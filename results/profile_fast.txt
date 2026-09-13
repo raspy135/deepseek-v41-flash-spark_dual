@@ -1,0 +1,34 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                         _moe_up_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     186.999ms        37.31%     186.999ms       1.558ms           120  
+                                     _fp8_linear_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      93.700ms        18.70%      93.700ms     106.236us           882  
+                                       _moe_down_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      83.260ms        16.61%      83.260ms     693.830us           120  
+                                    _fp8_grouped_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      30.284ms         6.04%      30.284ms     252.365us           120  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      17.645ms         3.52%      17.645ms       5.882ms             3  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      15.714ms         3.14%      15.714ms       5.161us          3045  
+void gemmSN_TN_kernel<float, 128, 16, 2, 4, 6, 7, fa...         0.00%       0.000us         0.00%       0.000us       0.000us       8.025ms         1.60%       8.025ms      58.152us           138  
+                                         _skinny_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       7.461ms         1.49%       7.461ms      31.086us           240  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8...         0.00%       0.000us         0.00%       0.000us       0.000us       7.403ms         1.48%       7.403ms      61.694us           120  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       5.124ms         1.02%       5.124ms       2.851us          1797  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8...         0.00%       0.000us         0.00%       0.000us       0.000us       3.732ms         0.74%       3.732ms      31.103us           120  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.752ms         0.55%       2.752ms       1.431us          1923  
+void magma_sgemmEx_kernel<float, float, float, false...         0.00%       0.000us         0.00%       0.000us       0.000us       2.467ms         0.49%       2.467ms      10.279us           240  
+void at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us       2.446ms         0.49%       2.446ms       6.177us           396  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       2.429ms         0.48%       2.429ms       3.150us           771  
+                                          memcpy32_post         0.00%       0.000us         0.00%       0.000us       0.000us       2.236ms         0.45%       2.236ms       1.172us          1908  
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       1.691ms         0.34%       1.691ms       4.545us           372  
+void at::native::sbtopk::gatherTopK<float, unsigned ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.657ms         0.33%       1.657ms      11.269us           147  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.217ms         0.24%       1.217ms       2.838us           429  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.130ms         0.23%       1.130ms       7.383us           153  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us       1.059ms         0.21%       1.059ms       9.288us           114  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       1.053ms         0.21%       1.053ms       3.900us           270  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.011ms         0.20%       1.011ms       1.134us           891  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us     969.687us         0.19%     969.687us      26.936us            36  
+                                             _hc_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     951.383us         0.19%     951.383us       3.964us           240  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     922.349us         0.18%     922.349us       1.196us           771  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us     902.676us         0.18%     902.676us       3.419us           264  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     880.508us         0.18%     880.508us       1.142us           771  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 668.383ms
+Self CUDA time total: 501.152ms
