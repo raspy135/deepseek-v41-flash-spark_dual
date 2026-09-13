@@ -21,6 +21,10 @@
 # Env: BASE (default http://127.0.0.1:8000), MODEL (default from .env, else "deepseek"),
 #      FORCE=1 to probe even while the server is busy with a real request.
 # ---------------------------------------------------------------------------------------
+# Re-exec under bash when invoked as `sh stats.sh`: this script uses [[ ]] and pipefail, and
+# Ubuntu's /bin/sh is dash, which has neither. The shebang covers ./stats.sh; this covers the
+# rest, and costs one exec.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck disable=SC1091
