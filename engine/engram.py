@@ -54,6 +54,8 @@ class EngramTable:
                 except (AttributeError, OSError):
                     pass
         self.gather_threads = int(os.environ.get("DSV41_ENGRAM_GATHER_THREADS", "64"))
+        # Rows below which the gather stays on the calling thread (see _gather_rows).
+        self.gather_min_parallel = int(os.environ.get("DSV41_ENGRAM_GATHER_MIN", "32"))
         # EP2 row split: both ranks hash the same tokens, so both were reading the SAME rows off
         # their own NVMe -- the work was duplicated, and it is the prefill bottleneck. With the
         # split each rank reads only `uniq % world == rank` into a zero-filled full array and one
@@ -105,7 +107,20 @@ class EngramTable:
         """
         out = np.empty((len(ids), 264), np.uint8)
         nt = max(1, self.gather_threads)
-        step = max(1024, len(ids) // nt + 1)
+        # Task size has to follow the row count. This was `max(1024, len(ids) // nt + 1)`, and the
+        # 1024 floor silently turned off the parallelism at exactly the size decode uses: a verify
+        # block is T_VERIFY x 24 hashes ~ 144 unique rows, 144 <= 1024, so the whole gather ran
+        # SERIALLY in the calling thread -- one synchronous page fault at a time, with the GPU
+        # draining behind it. It cost 83 ms of a 196 ms decode step (42%). The floor also capped
+        # medium gathers at 4 tasks, since it takes 65k rows before len//64 reaches 1024.
+        # Measured on layer 1 (384M rows), random ids, cold:
+        #     n=  144   serial  93-105 ms   64 threads  4.5-6.0 ms
+        #     n= 1024   serial 459-675 ms   64 threads 10.1-13.2 ms
+        #     n=49152   48 tasks    345 ms  64 threads      223 ms   (prefill: still faster)
+        # MADV_WILLNEED on each row's page, then a serial gather, was also tried: fastest of all
+        # at 144 rows (1.8 ms) but it is one syscall per page, so it collapses where prefill lives
+        # -- 1367 ms at 49152 rows against 223. Not worth a size-dependent second path.
+        step = max(1, (len(ids) + nt - 1) // nt)
 
         def one(i):
             sl = slice(i, min(i + step, len(ids)))
@@ -114,7 +129,8 @@ class EngramTable:
             out[sl, 256:] = self.s_mm[rows]
 
         starts = range(0, len(ids), step)
-        if len(ids) <= step:
+        # Below this the pool costs more than the faults it overlaps (~15 us to hand off a task).
+        if len(ids) <= self.gather_min_parallel:
             for i in starts:
                 one(i)
         else:
