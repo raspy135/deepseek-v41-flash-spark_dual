@@ -42,7 +42,7 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
 - It uses custom engine, made by 0xBakeer. In this fork, it's heavily modified.
 - Concurrency is 1.
 - Expert weight quant is fp4. 
-- It can't load all expert weight to two machines, so some of weights are not loaded and not reffered.
+- It can't load all expert weight to two machines, so some of weights are not loaded.
   However, adaptive expert loading measures missed expert weight and the engine will load missed 
   expert eventually. It works well with continuous conversation with harness.
 
