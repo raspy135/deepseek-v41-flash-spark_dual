@@ -37,6 +37,24 @@ def log(*a):
 # any wait for GPU work queued earlier. That is the quantity that explains the gap between
 # engine/profile_fast.py's step+draft and the tok/s the generator actually reaches.
 STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
+# Adapt the resident experts once more, at the prefill -> decode boundary, instead of only after
+# the response. The demand blend weights observed evidence w = observed/(observed + PRIOR); at
+# PRIOR=2e4 per layer a 30k-token prompt is w=90% against 11% for a 400-token answer, so the
+# prompt carries most of the signal and waiting until the end applies it only once the answer is
+# already written. Boot-time and part of the cross-rank config guard: a rank that adapts mid-
+# request while its peer does not is exactly the silent divergence apply_swaps exists to prevent.
+PREFILL_SWAP = os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0") == "1"
+# Below this many NEWLY prefilled tokens the prompt has not earned an adaptation: at 400 tokens
+# the blend moves 11% and the swap costs ~0.18 s plus a routing change mid-request.
+PREFILL_SWAP_MIN = int(os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"))
+# ...and only when THIS prompt is actually being served badly. Without this the inline pass
+# re-fits the resident set to whatever the latest prompt wants -- at 4.5k tokens a prompt is 58%
+# of the blend weight -- and the next request pushes it back: measured 100-128 slots swapped on
+# every request at a 1.2% miss rate, ~1 GB of NVMe and 0.2 s each time, buying nothing. The
+# end-of-response pass had already converged to 3-7 slots over the same requests. This pass
+# exists for the out-of-distribution prompt (a new language, an unfamiliar domain); when the
+# prompt is already well served there is nothing for it to fix.
+PREFILL_SWAP_MIN_MISS = float(os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN_MISS", "0.10"))
 
 # Lean step: keep the per-step host work off the critical path -- the greedy accept/reject decision
 # is taken on the GPU and read back as ONE 7-element tensor instead of up to eleven separate
@@ -617,6 +635,11 @@ class V41Engine:
         self._prune_trace = None
         self._token_types = self._images = None   # set per request by the VL path
         self._swap_baseline = 0.0   # recorded demand at the last applied adaptation
+        # Bumped by every applied adaptation. Both ranks apply the same plan at the same point,
+        # so this counts identically on the pair and names the routing regime a piece of cached
+        # state was computed under. Reported on /health; see _save_prefix for why a cached prefix
+        # from an older generation is KEPT rather than invalidated.
+        self.expert_generation = 0
         # One exact prompt-prefix snapshot.  The large compressed KV prefix remains append-only in
         # ``self.caches``; this object only protects the small state decode overwrites.
         self._prefix_cache = None
@@ -743,6 +766,12 @@ class V41Engine:
                 # hangs the pair until the process-group timeout.
                 "engram_row_split": os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0"),
                 "engram_split_min": os.environ.get("DSV41_ENGRAM_SPLIT_MIN", "4096"),
+                # A rank that adapts at the prefill boundary while its peer does not ends up
+                # masking a different expert set, so the two replicated routers pick different
+                # top-k and the pair emits different tokens with nothing raising. The threshold
+                # matters as much as the switch: it decides WHETHER the collective happens.
+                "prune_swap_prefill": os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0"),
+                "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
             diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}
@@ -1244,7 +1273,9 @@ class V41Engine:
         if torch.cuda.is_available():
             torch.cuda.synchronize()   # the loads ran on a copy stream; land them before serving
         self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
-        log(f"adapted {len(swaps)} expert slots to observed demand")
+        self.expert_generation += 1
+        log(f"adapted {len(swaps)} expert slots to observed demand "
+            f"(expert generation {self.expert_generation})")
         return len(swaps)
 
     def maintain_demand(self) -> bool:
@@ -1272,6 +1303,66 @@ class V41Engine:
     def swaps_due(self, min_growth: float | None = None) -> bool:
         """Back-compat shim for callers that only want the predicate."""
         return self.maintain_demand()
+
+    def maintain_inline(self, new_tokens: int) -> int:
+        """Re-fit the resident experts mid-request, at the prefill -> decode boundary.
+
+        This is the one point inside a request where both ranks are known to be at the same place:
+        they run the same generate() over the same prompt, and the prefill chunks have just
+        finished. That makes it a legal collective site, which end-of-response is too -- but
+        anywhere else in the loop is not.
+
+        Rank 0 plans and broadcasts, exactly as the between-requests path does. The ranks do NOT
+        plan independently: plan_swaps reads rank-local LRU state, and two ranks choosing different
+        swaps leaves them masking different experts, which makes the replicated routers pick
+        different top-k and emit different tokens with no error anywhere. Only the plan crosses the
+        wire (~1.5 KB); each rank then loads its own half of the arena.
+
+        maintain_demand() runs on BOTH ranks, not just the planner: it ages the demand history, and
+        aging it on one rank only would drift the two copies apart for no benefit.
+        """
+        if not PREFILL_SWAP:
+            return 0
+        # From here every rank MUST reach the broadcast, so nothing below may return early on a
+        # rank-local quantity. `new_tokens` is derived from prefix_start, which comes from each
+        # rank's own prefix cache -- if that ever differed, an early return here would leave one
+        # rank in the collective and the other past it, and the pair would hang until the
+        # process-group timeout. It only gates rank 0's DECISION; the collective is
+        # unconditional, keyed on PREFILL_SWAP, which the boot-time config guard pins identical.
+        # maintain_demand() runs everywhere for the same reason: it ages the history, and aging
+        # it on one rank only drifts the two copies apart.
+        due = self.maintain_demand() and new_tokens >= PREFILL_SWAP_MIN
+        if due and PREFILL_SWAP_MIN_MISS > 0:
+            # This prefill's OWN miss rate, not the lifetime one: the accumulators are cumulative
+            # by design, so a lifetime rate stops moving after a few hundred requests and would
+            # gate on nothing.
+            m0 = getattr(self, "_miss_at_request_start", None)
+            m1 = self.model.miss_snapshot() if hasattr(self.model, "miss_snapshot") else None
+            if m0 is not None and m1 is not None and m1[1] > m0[1]:
+                rate = (m1[0] - m0[0]) / (m1[1] - m0[1])
+                due = rate >= PREFILL_SWAP_MIN_MISS
+        swaps = None
+        if self.ep.rank == 0 and due:
+            try:
+                swaps = self.plan_swaps(
+                    max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
+            except Exception as e:  # noqa: BLE001
+                # Planning is rank-local and nothing has been broadcast yet, so giving up is safe.
+                log(f"inline adaptation planning failed ({type(e).__name__}: {e}); skipping")
+                swaps = None
+        swaps = self.ep.broadcast_obj(swaps)
+        if not swaps:
+            return 0
+        try:
+            return self.apply_swaps(swaps)
+        except Exception:
+            # Past the broadcast the peer is applying this same plan. A rank that does not finish
+            # it keeps a different set of experts routable and the pair diverges silently, which is
+            # worse than stopping -- the same reasoning as the end-of-response path.
+            import traceback
+            traceback.print_exc()
+            log("inline adaptation failed after the plan was broadcast; the pair would desync")
+            os._exit(1)
 
     def prepare_vl(self, prompt: str, images: list):
         """prompt + image records -> (token ids, token_types, ImageInputs) via the checkpoint's own
@@ -1431,6 +1522,12 @@ class V41Engine:
                     logits, mh = _fwd(s, chunk, need_logits=last)
                     if self.spec:
                         m.dspark_seed(mh, s)
+        # The prompt's demand is now complete and no token has been generated yet: the whole
+        # prompt's evidence can be applied before it is used, rather than after the answer is
+        # written. Outside the read-ahead context so the swap's NVMe loads do not contend with
+        # engram reads still in flight. `P - prefix_start` is what this request actually prefilled
+        # -- a prefix-cache hit recomputes nothing and so contributes no new demand.
+        self.maintain_inline(P - prefix_start)
         # Vision inputs belong to the prompt only. Leaving them set would apply this request's
         # image mask to the next one's prefill, and the engine is single-sequence, so "the next
         # one" is any later request.
@@ -1697,6 +1794,10 @@ class V41Engine:
             # really go back?" -- the flag lives in the launcher's environment, not in .env, and
             # there was otherwise no way to tell the two modes apart from outside the container.
             "tp_dense": "on" if R.tp_dense()[1] > 1 else "off",
+            "prefill_swap": "on" if PREFILL_SWAP else "off",
+            # How many adaptations have been applied since boot. Identical on both ranks by
+            # construction, so a difference between them is a desync that nothing else reports.
+            "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
             "routed_topk": self.args.n_activated_experts,
             "sim_cb2_frac": self.sim_cb2_frac,
