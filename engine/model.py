@@ -38,6 +38,8 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 # experts and quadrupling the chunk quarters it. The ceiling is activation memory: at T=2048 the
 # gathered window+compressed KV of one layer is ~2.7 GB.
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
+# Record which experts the router wanted but pruning removed (Model._record_prune_miss).
+PRUNE_MISS = os.environ.get("DSV41_PRUNE_MISS", "0") == "1"
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -348,6 +350,7 @@ class Model:
                                               a.beta_fast, a.beta_slow, self.dev)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
+        self._miss_counts = self._miss_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
             R.act_qdq_fp8 = lambda x, block=32: x.to(torch.bfloat16)
@@ -612,6 +615,53 @@ class Model:
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
     # ------------------------------------------------------------------ blocks
+    def _record_prune_miss(self, logits, scores, keep_mask, L: int, k: int):
+        """Count (layer, expert) pairs the router preferred but pruning made unreachable.
+
+        `logits` here is still UNMASKED. Everything stays on the GPU and is only read out at the
+        end of a request, so no step pays a synchronise for being measured.
+        """
+        want = logits.topk(k, dim=-1)[1]                      # [T, k] what an unpruned router picks
+        miss = (~keep_mask[want]).double()                    # [T, k] 1.0 where that pick is gone
+        self.alloc_prune_miss(logits.size(-1), logits.device)
+        flat = want.reshape(-1)
+        self._miss_counts[L].scatter_add_(0, flat, miss.reshape(-1))
+        # the score the router would have given it: a miss on a high-scoring expert costs more
+        # than one on a marginal pick
+        self._miss_mass[L].scatter_add_(0, flat, (scores.gather(1, want).double() * miss).reshape(-1))
+        self._miss_tot[L, 0] += miss.sum()
+        self._miss_tot[L, 1] += miss.numel()
+
+    def alloc_prune_miss(self, n_experts: int, device):
+        """Allocate the accumulators eagerly. The decode path records inside a captured CUDA
+        graph, so the tensors must already exist (and keep their addresses) before capture --
+        every op in here is fixed-shape for the same reason."""
+        if self._miss_counts is None:
+            z = lambda *sh: torch.zeros(*sh, dtype=torch.float64, device=device)  # noqa: E731
+            self._miss_counts = z(self.args.n_layers, n_experts)
+            self._miss_mass = z(self.args.n_layers, n_experts)
+            self._miss_tot = z(self.args.n_layers, 2)
+
+    def prune_miss_report(self):
+        """(summary dict, per-(layer,expert) miss counts [40, 384]) or None if nothing recorded."""
+        if self._miss_counts is None:
+            return None
+        tot = self._miss_tot.cpu()
+        counts = self._miss_counts.cpu()
+        mass = self._miss_mass.cpu()
+        missed, slots = float(tot[:, 0].sum()), float(tot[:, 1].sum())
+        per_layer = (tot[:, 0] / tot[:, 1].clamp_min(1)).tolist()
+        worst = sorted(range(len(per_layer)), key=lambda L: -per_layer[L])[:5]
+        return {
+            "miss_rate": round(missed / max(slots, 1.0), 4),
+            "missed_slots": int(missed), "total_slots": int(slots),
+            "distinct_experts_wanted": int((counts > 0).sum()),
+            "worst_layers": [{"layer": L, "miss_rate": round(per_layer[L], 4)} for L in worst],
+        }, counts, mass
+
+    def reset_prune_miss(self):
+        self._miss_counts = self._miss_mass = self._miss_tot = None
+
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
         self._tap("moe_in", L, y)
@@ -620,6 +670,16 @@ class Model:
         logits = scores + w.gate_bias
         pm = getattr(self, "prune_mask", None)
         if pm is not None and n_experts != 128 and L in pm:
+            # What the router WANTED before pruning masked it. The prune set is ranked from a
+            # traced corpus (coding + general), so on traffic unlike that corpus the router keeps
+            # asking for experts that are not there -- and nothing downstream can see it, because
+            # masking happens before topk and the second-choice expert looks like a normal pick.
+            # DSV41_PRUNE_MISS=1 records, per (layer, expert), how often a pruned expert was the
+            # router's actual preference, plus the score mass that preference carried. That is the
+            # same shape as the coverage histogram the prune set is built from, so a run over real
+            # traffic can re-rank it. Off by default: it costs a second topk per layer.
+            if PRUNE_MISS:
+                self._record_prune_miss(logits, scores, pm[L], L, k)
             # expert pruning experiment: the router may only pick surviving experts (REAP-style drop)
             logits = logits.masked_fill(~pm[L], float("-inf"))
         indices = logits.topk(k, dim=-1)[1]

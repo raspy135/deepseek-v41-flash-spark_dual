@@ -177,6 +177,9 @@ class FastDecoder:
         # Both ops have static shapes and no host round-trip, so they capture into the layer graphs
         # like everything else; with the flag off nothing is allocated and `_layer_a` runs one
         # `if self.rs_hits is not None` per layer.
+        if M.PRUNE_MISS:
+            # must exist, and keep their addresses, before any graph capture records into them
+            self.m.alloc_prune_miss(a.n_routed_experts, dev)
         self.rs_hits = self.rs_uniq = None
         if os.environ.get("DSV41_ROUTE_STATS", "0") == "1":
             self.rs_hits = torch.zeros(a.n_routed_experts, dtype=torch.int32, device=dev)
@@ -340,6 +343,11 @@ class FastDecoder:
         logits = scores + w.gate_bias
         pm = getattr(self.m, "prune_mask", None)
         if pm is not None and L in pm:
+            # same accounting as Model.moe: what the router wanted before pruning masked it.
+            # Fixed-shape throughout, and the accumulators are allocated before capture, so this
+            # records correctly from inside the graph.
+            if M.PRUNE_MISS:
+                self.m._record_prune_miss(logits, scores, pm[L], L, a.n_activated_experts)
             logits = logits.masked_fill(~pm[L], float("-inf"))
         idx = logits.topk(a.n_activated_experts, dim=-1)[1]
         wts = scores.gather(1, idx)

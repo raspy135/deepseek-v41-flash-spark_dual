@@ -828,6 +828,19 @@ class V41Engine:
                         "draft_share": (round(gt.get("draft", 0) /
                                               max(1e-9, gt.get("draft", 0) + gt.get("layers", 0)), 3)),
                     }
+            pmr = self.model.prune_miss_report() if hasattr(self.model, "prune_miss_report") else None
+            if pmr is not None:
+                summary, counts, mass = pmr
+                self.last_stats["prune_miss"] = summary
+                # same shape as the coverage histogram the prune set is ranked from, so a run over
+                # real traffic can re-rank it directly (tools/prune_miss_report.py)
+                try:
+                    import numpy as _np
+                    _out = os.environ.get("DSV41_PRUNE_MISS_OUT", "results/prune_miss.npz")
+                    os.makedirs(os.path.dirname(_out) or ".", exist_ok=True)
+                    _np.savez(_out, counts=counts.numpy(), mass=mass.numpy())
+                except Exception as _e:  # noqa: BLE001
+                    log(f"prune-miss dump failed: {_e}")
                 rep = self.fast.route_stats_report()
                 if rep:
                     per_layer_mean = rep["mean"]
