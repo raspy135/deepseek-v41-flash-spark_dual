@@ -712,8 +712,14 @@ def attention(x: torch.Tensor, w: LayerWeights, st: SeqState, args: Args) -> tor
 
 
 # ----------------------------------------------------------------------------- engram
-def engram_forward(h: torch.Tensor, rows: torch.Tensor, ew: EngramWeights, args: Args) -> torch.Tensor:
-    """h: [T, hc, d]; rows: [T, 24, 256] float32 dequantized table rows (already scaled)."""
+def engram_forward(h: torch.Tensor, rows: torch.Tensor, ew: EngramWeights, args: Args,
+                   token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """h: [T, hc, d]; rows: [T, 24, 256] float32 dequantized table rows (already scaled).
+
+    `token_mask`: [T] bool, False for positions that take no part in an n-gram (image spans).
+    Those get their gate zeroed, so the engram contributes nothing there -- the same thing the
+    reference does at inference/model.py:364. The hashes for those positions are DEAD anyway;
+    zeroing the gate is what stops a dead row from being written into the stream."""
     T = h.size(0)
     kv = qlinear(rows.reshape(T, -1).to(torch.bfloat16), ew.wkv)
     key, value = kv.split([args.hc_mult * args.dim, args.dim], dim=-1)
@@ -727,6 +733,8 @@ def engram_forward(h: torch.Tensor, rows: torch.Tensor, ew: EngramWeights, args:
         return torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
 
     gate = tiled_rows(_gate, hf, key)  # [T, hc, 1]
+    if token_mask is not None:
+        gate = gate.masked_fill(~token_mask.view(-1, 1, 1), 0)
     return (hf + gate * value.float().unsqueeze(1)).to(h.dtype)
 
 

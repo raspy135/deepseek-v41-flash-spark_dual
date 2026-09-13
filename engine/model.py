@@ -266,6 +266,12 @@ class MTPWeights:
         self.hc_attn_base = f32("hc_attn_base"); self.hc_ffn_base = f32("hc_ffn_base")
         self.hc_attn_scale = f32("hc_attn_scale"); self.hc_ffn_scale = f32("hc_ffn_scale")
         self.gate_w = f32("ffn.gate.weight"); self.gate_bias = f32("ffn.gate.bias")
+        # Image tokens route through a SEPARATE router bias (inference/model.py:819). Absent on a
+        # text-only checkpoint, so this stays None and the vision branch never runs.
+        try:
+            self.gate_bias_vl = f32("ffn.gate.bias_vl")
+        except Exception:  # noqa: BLE001
+            self.gate_bias_vl = None
         self.sh_w1 = fp8lin("ffn.shared_experts.w1"); self.sh_w2 = fp8lin("ffn.shared_experts.w2"); self.sh_w3 = fp8lin("ffn.shared_experts.w3")
         self.ratio = 0
         self.is_kv_source = False
@@ -350,6 +356,8 @@ class Model:
                                               a.beta_fast, a.beta_slow, self.dev)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
+        self.vision = None       # engine.vision.VisionTower, set by the engine when enabled
+        self.image_mask = self.engram_mask = None
         self._want_counts = self._want_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
         self._want_phase = self._miss_phase = None   # same, split prefill vs decode
         self.hash_state = None  # reference NgramHashState
@@ -719,7 +727,13 @@ class Model:
         self._tap("moe_in", L, y)
         scores = F.softplus(R.mm(y.float(), w.gate_w)).sqrt()
         k = 3 if n_experts == 128 else a.n_activated_experts
-        logits = scores + w.gate_bias
+        # The VL bias picks different experts for image tokens; it does not scale them (weights
+        # still come from the raw scores below), so only the topk sees it.
+        img = getattr(self, "image_mask", None)
+        if img is not None and w.gate_bias_vl is not None and img.shape[0] == y.shape[0]:
+            logits = scores + torch.where(img.unsqueeze(-1), w.gate_bias_vl, w.gate_bias)
+        else:
+            logits = scores + w.gate_bias
         pm = getattr(self, "prune_mask", None)
         if pm is not None and n_experts != 128 and L in pm:
             # What the router WANTED before pruning masked it. The prune set is ranked from a
@@ -889,6 +903,10 @@ class Model:
         are run over the last `window_size` prompt tokens only, with SWA truncated to that segment,
         instead of over the whole prompt. The prompt's final logits come from this pass.
         """
+        # Replay runs the decoder half over the window tail, which is text by construction and a
+        # different length from the chunk that set these. A stale image_mask here would apply the
+        # VL routing bias to ordinary tokens whenever the lengths happened to agree.
+        self.image_mask = self.engram_mask = None
         a = self.args
         h, pre_mix, topk, cand, S = self._rep_tail()
         T = h.size(0)
@@ -916,7 +934,8 @@ class Model:
 
     @torch.inference_mode()
     def forward(self, ids: torch.Tensor, S: int, prefill: bool, need_logits: bool = True,
-                encoder_only: bool = False, hashes: torch.Tensor | None = None, get_rows=None):
+                encoder_only: bool = False, hashes: torch.Tensor | None = None, get_rows=None,
+                token_types: torch.Tensor | None = None, images=None):
         """ids: [T] token ids at positions S..S+T-1. Returns (logits [T, V] fp32 or None, main_hidden [T, 15360]).
         Caches must be valid for positions < S (self.c.len == S).
 
@@ -934,11 +953,25 @@ class Model:
         assert self.c.len == S, (self.c.len, S)
         T = ids.size(0)
         assert T <= MAX_CHUNK, (T, MAX_CHUNK)
+        # Vision masks for this chunk. TEXT is -1, so `types >= 0` is the whole image span --
+        # delimiters included. image_mask selects the router's VL bias (Model.moe); its complement
+        # shuts the engram off, both in the hasher (an n-gram must not span an image) and in the
+        # engram forward itself (a dead row must not be written into the stream).
+        self.image_mask = None if token_types is None else (token_types >= 0)
+        self.engram_mask = None if self.image_mask is None else ~self.image_mask
         if hashes is None:
             t0 = time.perf_counter()
-            hashes = self.hash_state(ids[None], S)[0] if self.hash_state is not None else None  # [T, 2, 24]
+            hashes = (self.hash_state(ids[None], S, None if self.engram_mask is None
+                                      else self.engram_mask[None])[0]
+                      if self.hash_state is not None else None)  # [T, 2, 24]
             self.stats["engram_s"] += time.perf_counter() - t0
-        h = self.W.embed[ids].unsqueeze(1).repeat(1, a.hc_mult, 1)
+        e = self.W.embed[ids]
+        if images:
+            # before the hc_mult expand: the splice writes plain [T, dim] embedding rows
+            assert self.vision is not None, "prompt has images but no vision tower is loaded"
+            e = e.clone()          # W.embed is the shared table; never scribble on it
+            self.vision.splice(e, images)
+        h = e.unsqueeze(1).repeat(1, a.hc_mult, 1)
         pre_mix = torch.zeros(T, a.hc_mult, device=self.dev)
         pre_mix[:, 0] = 1.0
         sh = Shared()
@@ -960,7 +993,9 @@ class Model:
                     li = list(a.engram_layer_ids).index(L)
                     rows = get_rows(L, hashes[:, li, :])
                     self._tap("engram_rows", L, rows)
-                    h = R.engram_forward(h, rows, self.W.engram[L], a)
+                    # image spans take no part in an n-gram and get no engram contribution
+                    h = R.engram_forward(h, rows, self.W.engram[L], a,
+                                         token_mask=getattr(self, "engram_mask", None))
                     self._tap("engram_out", L, h)
                     self.stats["engram_s"] += time.perf_counter() - t0
                     _mark("engram")

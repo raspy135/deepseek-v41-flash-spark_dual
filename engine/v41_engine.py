@@ -575,6 +575,7 @@ class V41Engine:
             self.tables, self.eg_pool, hashes, self.args.engram_layer_ids)
         self.prune_keep = prune_keep
         self._prune_trace = None
+        self._token_types = self._images = None   # set per request by the VL path
         self._swap_baseline = 0.0   # recorded demand at the last applied adaptation
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
@@ -1107,7 +1108,7 @@ class V41Engine:
         """Back-compat shim for callers that only want the predicate."""
         return self.maintain_demand()
 
-    def _engram_readahead(self, ids, P):
+    def _engram_readahead(self, ids, P, engram_mask=None):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
 
         Returns None for prompts of a single chunk (nothing to overlap with), when there are no
@@ -1118,7 +1119,10 @@ class V41Engine:
                 or P <= MAX_CHUNK or os.environ.get("DSV41_ENGRAM_READAHEAD", "1") != "1"):
             return None
         t0 = time.perf_counter()
-        hashes_t = self.model.hash_state(ids[None], 0)[0]          # [P, n_engram_layers, 24]
+        # the whole-prompt hash needs the same token mask the per-chunk path would apply, or the
+        # n-grams inside an image span would be live here and dead there
+        hashes_t = self.model.hash_state(
+            ids[None], 0, None if engram_mask is None else engram_mask[None])[0]   # [P, n_eg, 24]
         self.model.stats["engram_s"] += time.perf_counter() - t0
         ra = EngramReadAhead(self.tables, self.eg_pool, self.args.engram_layer_ids,
                              hashes_t.cpu().numpy(), MAX_CHUNK,
@@ -1138,9 +1142,20 @@ class V41Engine:
         # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
         # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
         # whose n-grams are not already in the row cache.
-        ra = self._engram_readahead(ids, P)
+        # Vision: token_types comes from image_processor.prepare_vl_inputs alongside the ids, and
+        # is sliced per chunk exactly like them. TEXT is -1, so `>= 0` marks a whole image span.
+        tt = getattr(self, "_token_types", None)
+        eg_mask = None if tt is None else ~(tt >= 0)
+        ra = self._engram_readahead(ids, P, eg_mask)
         with ra if ra is not None else nullcontext():
             def _fwd(s, chunk, **kw):
+                if tt is not None:
+                    kw["token_types"] = tt[s:s + len(chunk)]
+                    # an image span must lie inside ONE chunk (inference/model.py:1254); the splice
+                    # asserts it, and images are only handed to the chunk that contains their start
+                    import dataclasses as _dc
+                    kw["images"] = [_dc.replace(im, start=im.start - s)
+                                    for im in (self._images or ()) if s <= im.start < s + len(chunk)]
                 if ra is None:
                     return m.forward(chunk, s, prefill=True, **kw)
                 out = m.forward(chunk, s, prefill=True, hashes=ra.hashes_t[s:s + len(chunk)],
