@@ -256,6 +256,24 @@ def _reject_images(messages: List[dict]) -> None:
                                             "(no vision tower loaded)", param=f"messages[{i}].content")
 
 
+# DSV41_LOG_PROMPT=1 logs the RENDERED prompt of every request -- what the model actually sees
+# after chat templating, thinking tags and tool rendering, which is usually not what the caller
+# thinks it sent. Off by default because it writes user content to the log.
+LOG_PROMPT = os.environ.get("DSV41_LOG_PROMPT", "0") == "1"
+LOG_PROMPT_CHARS = int(os.environ.get("DSV41_LOG_PROMPT_CHARS", "2000"))
+
+
+def _log_prompt(prompt, ids, thinking, effort):
+    if not LOG_PROMPT:
+        return
+    body = prompt if len(prompt) <= LOG_PROMPT_CHARS else (
+        prompt[:LOG_PROMPT_CHARS // 2] + f"\n...[{len(prompt) - LOG_PROMPT_CHARS} chars elided]...\n"
+        + prompt[-LOG_PROMPT_CHARS // 2:])
+    log.info("prompt: %d tokens, thinking=%s effort=%s\n--- BEGIN PROMPT ---\n%s\n--- END PROMPT ---",
+             len(ids), thinking, effort, body)
+    log.info("prompt head ids: %s ... tail ids: %s", ids[:12], ids[-12:])
+
+
 def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
                       effort: int, engine=None) -> Tuple[str, List[int], Optional[List[dict]], Optional[tuple]]:
     """Render a chat request. The third element is the tool list as the *model* sees it
@@ -995,7 +1013,8 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         sampling = parse_sampling(body)
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
-        _, prompt_ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine)
+        _prompt, prompt_ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine)
+        _log_prompt(_prompt, prompt_ids, thinking, effort)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -1073,6 +1092,8 @@ class Handler(BaseHTTPRequestHandler):
                            param="prompt")
         if body.get("echo"):
             raise APIError(400, "`echo` is not supported", param="echo")
+        _log_prompt(prompt if isinstance(prompt, str) else f"<{len(prompt_ids)} raw token ids>",
+                    prompt_ids, None, None)
         stream = bool(body.get("stream", False))
         rid = "cmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
