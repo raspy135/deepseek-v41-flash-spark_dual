@@ -737,6 +737,12 @@ class V41Engine:
                 "spec": bool(self.spec),
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
+                # Both halves of the engram split decision. row_split says whether the ranks
+                # split rows at all; split_min_rows says at which gather size they start -- and a
+                # rank that splits a gather its peer read whole reaches an all-reduce alone and
+                # hangs the pair until the process-group timeout.
+                "engram_row_split": os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0"),
+                "engram_split_min": os.environ.get("DSV41_ENGRAM_SPLIT_MIN", "4096"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
             diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}

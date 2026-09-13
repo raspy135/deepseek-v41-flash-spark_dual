@@ -57,4 +57,31 @@ for n in (1, 5, 144, 700):
     assert np.array_equal(got, want), f"n={n}: gather disagrees with pread"
 print("gather == pread for n in (1, 5, 144, 700)")
 
+# --- the EP row split is size-gated, and both ranks decide identically ------------------------
+# The split trades half the rows for a stream-synchronising H2D and an all-reduce per layer --
+# worth it for a 49k-row prefill chunk, not for a 144-row decode block. The danger is a threshold
+# that could differ between ranks: one rank reaching a collective alone hangs the pair until the
+# process-group timeout. So the decision may only look at `n`, which both ranks derive from
+# identical hashes.
+class FakeEP:
+    def __init__(self, rank): self.rank, self.world, self.active = rank, 2, True
+
+t.row_split = True
+DECODE_N, PREFILL_N = T_VERIFY * N_HASH, 2048 * N_HASH
+for rank in (0, 1):
+    t.ep = FakeEP(rank)
+    assert not t._split_call(DECODE_N), f"rank {rank}: decode block ({DECODE_N} rows) still splits"
+    assert t._split_call(PREFILL_N), f"rank {rank}: prefill chunk ({PREFILL_N} rows) stopped splitting"
+    # the two ranks must agree at every size, including right at the boundary
+    for n in (0, 1, DECODE_N, t.split_min_rows - 1, t.split_min_rows, PREFILL_N):
+        assert t._split_call(n) == (n >= t.split_min_rows), (rank, n)
+t.ep = FakeEP(0)
+a0 = [t._split_call(n) for n in range(0, 8192, 97)]
+t.ep = FakeEP(1)
+a1 = [t._split_call(n) for n in range(0, 8192, 97)]
+assert a0 == a1, "the two ranks disagree about which gathers to split -- this wedges the pair"
+t.ep, t.row_split = None, False
+print(f"split gate: decode {DECODE_N} rows -> local, prefill {PREFILL_N} rows -> split, "
+      f"both ranks agree at every size")
+
 print("\nENGRAM GATHER IS PARALLEL AT DECODE SIZE AND BYTE-IDENTICAL")

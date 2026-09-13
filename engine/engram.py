@@ -65,6 +65,13 @@ class EngramTable:
         # Set by the engine after construction; None means single-box.
         self.ep = None
         self.row_split = os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0") == "1"
+        # ...but only for gathers big enough to pay for it. The split buys HALF THE ROWS at the
+        # price of a stream-synchronising H2D and a cross-rank all-reduce, per layer. A prefill
+        # chunk is 2048 x 24 ~ 49k rows, where halving is worth ~100 ms and the collective is
+        # noise. A decode verify block is 6 x 24 = 144 rows, where it saves about a millisecond of
+        # reading and pays a collective plus a sync that blocks the host until every graph queued
+        # so far has finished -- the exact overlap this pipeline exists to preserve.
+        self.split_min_rows = int(os.environ.get("DSV41_ENGRAM_SPLIT_MIN", "4096"))
         self.pool = ThreadPoolExecutor(max(threads, self.gather_threads if self.mmap_rows else 0))
         self.device = device
         self.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
@@ -141,6 +148,16 @@ class EngramTable:
         """Both ranks must agree, so this reads only constants -- never per-call state."""
         return bool(self.row_split and self.ep is not None and self.ep.active)
 
+    def _split_call(self, n: int) -> bool:
+        """Whether THIS gather of `n` unique rows is split across the ranks.
+
+        Per-call, but still safe for the collective: `n` comes from np.unique over hashes both
+        ranks compute identically, so both ranks always take the same branch. That is the whole
+        invariant -- a collective one rank reaches and the other does not wedges the pair -- and
+        it is why the threshold may only ever look at `n`, never at timing, load, or rank.
+        """
+        return self._splitting() and n >= self.split_min_rows
+
     def read_raw(self, hashes_np: np.ndarray):
         """Host-only part (safe in a background thread: no CUDA calls): NVMe reads of the unique rows.
         hashes_np: int64 [T, 24]. Returns (raw uint8 [n, 264], inv, shape).
@@ -151,7 +168,7 @@ class EngramTable:
         flat = hashes_np.reshape(-1)
         uniq, inv = np.unique(flat, return_inverse=True)
         n = len(uniq)
-        if self._splitting():
+        if self._split_call(n):
             # np.unique sorts, so both ranks see identical `uniq` and pick disjoint halves.
             mine = (uniq % self.ep.world) == self.ep.rank
             raw = np.zeros((n, 264), np.uint8)
@@ -187,7 +204,7 @@ class EngramTable:
         if not self.pinned:
             rawt = torch.from_numpy(raw).to(self.device)
             invt = torch.from_numpy(inv.reshape(-1)).to(self.device)
-            if self._splitting() and n:
+            if self._split_call(n):
                 # Disjoint halves over a zero background: SUM is the union, bit-exact, no
                 # overflow. Must run on every rank for the same (chunk, layer) or the pair wedges
                 # -- `n` is derived from the hashes, which both ranks compute identically, so the
