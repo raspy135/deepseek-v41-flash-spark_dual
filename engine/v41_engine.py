@@ -1186,7 +1186,8 @@ class V41Engine:
         self.model.stats["engram_s"] += time.perf_counter() - t0
         ra = EngramReadAhead(self.tables, self.eg_pool, self.args.engram_layer_ids,
                              hashes_t.cpu().numpy(), MAX_CHUNK,
-                             depth=int(os.environ.get("DSV41_ENGRAM_DEPTH", "2")))
+                             depth=int(os.environ.get("DSV41_ENGRAM_DEPTH", "2")),
+                             read_delay=float(os.environ.get("DSV41_ENGRAM_READ_DELAY_S", "0")))
         ra.hashes_t = hashes_t
         return ra
 

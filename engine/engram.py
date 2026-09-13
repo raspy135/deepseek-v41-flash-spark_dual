@@ -254,10 +254,12 @@ class EngramReadAhead:
     32-thread pool.
     """
 
-    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2):
+    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2,
+                 read_delay: float = 0.0):
         self.tables, self.pool, self.layer_ids = tables, pool, list(layer_ids)
         self.hashes, self.chunk = hashes_np, chunk
         self.depth = max(1, depth)
+        self.read_delay = max(0.0, read_delay)
         self.total = hashes_np.shape[0]
         self.futures: dict[int, dict] = {}
 
@@ -265,7 +267,22 @@ class EngramReadAhead:
         if s in self.futures or s >= self.total:
             return
         hs = self.hashes[s:s + self.chunk]
-        self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
+        delay = self.read_delay
+        if delay <= 0:
+            self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
+                               for li, L in enumerate(self.layer_ids)}
+            return
+
+        # Deliberately hold the read back. On unified memory the gather and the GPU kernels pull
+        # on the same DRAM, so a read issued the instant it is known competes with the chunk that
+        # is running RIGHT NOW -- and the chunk that needs it is the one after. Starting late
+        # trades read-ahead slack (there is plenty: ~400 ms of reading against ~1000 ms of
+        # compute) for a quieter memory bus while the GPU is busiest.
+        def _later(layer, h, wait):
+            time.sleep(wait)
+            return self.tables[layer].read_raw(h)
+
+        self.futures[s] = {L: self.pool.submit(_later, L, hs[:, li, :], delay)
                            for li, L in enumerate(self.layer_ids)}
 
     def rows_for(self, s: int):
