@@ -347,7 +347,7 @@ class FastDecoder:
             # Fixed-shape throughout, and the accumulators are allocated before capture, so this
             # records correctly from inside the graph.
             if M.PRUNE_MISS:
-                self.m._record_prune_miss(logits, scores, pm[L], L, a.n_activated_experts)
+                self.m._record_prune_miss(logits, scores, pm[L], L, a.n_activated_experts, decode=True)
             logits = logits.masked_fill(~pm[L], float("-inf"))
         idx = logits.topk(a.n_activated_experts, dim=-1)[1]
         wts = scores.gather(1, idx)

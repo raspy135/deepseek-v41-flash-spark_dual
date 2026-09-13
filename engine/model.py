@@ -351,6 +351,7 @@ class Model:
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
         self._want_counts = self._want_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
+        self._want_phase = self._miss_phase = None   # same, split prefill vs decode
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
             R.act_qdq_fp8 = lambda x, block=32: x.to(torch.bfloat16)
@@ -615,7 +616,7 @@ class Model:
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
     # ------------------------------------------------------------------ blocks
-    def _record_prune_miss(self, logits, scores, keep_mask, L: int, k: int):
+    def _record_prune_miss(self, logits, scores, keep_mask, L: int, k: int, decode: bool = False):
         """Record what the router WANTED, per (layer, expert) -- reachable or not.
 
         Recording only misses would make the database self-erasing: promote an expert and it
@@ -629,12 +630,22 @@ class Model:
         want = logits.topk(k, dim=-1)[1]                       # [T, k] an unpruned router's picks
         self.alloc_prune_miss(logits.size(-1), logits.device)
         flat = want.reshape(-1)
-        self._want_counts[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.float64))
+        ones = torch.ones_like(flat, dtype=torch.float64)
+        sc = scores.gather(1, want).double().reshape(-1)
+        self._want_counts[L].scatter_add_(0, flat, ones)
         # score mass: being denied a high-scoring expert costs more than a marginal one
-        self._want_mass[L].scatter_add_(0, flat, scores.gather(1, want).double().reshape(-1))
+        self._want_mass[L].scatter_add_(0, flat, sc)
+        # Split by phase. The prompt shows the router ~18x more expert choices than the
+        # generation does, so a combined history is ~95% prefill -- yet output quality depends on
+        # DECODE routing. Whether one predicts the other decides both how to weight this database
+        # and whether a per-request preload between prefill and decode is worth anything.
+        d = 1 if decode else 0
+        self._want_phase[d][L].scatter_add_(0, flat, ones)
         miss = (~keep_mask[want]).double()
         self._miss_tot[L, 0] += miss.sum()
         self._miss_tot[L, 1] += miss.numel()
+        self._miss_phase[d, 0] += miss.sum()
+        self._miss_phase[d, 1] += miss.numel()
 
     def alloc_prune_miss(self, n_experts: int, device):
         """Allocate the accumulators eagerly. The decode path records inside a captured CUDA
@@ -645,6 +656,8 @@ class Model:
             self._want_counts = z(self.args.n_layers, n_experts)
             self._want_mass = z(self.args.n_layers, n_experts)
             self._miss_tot = z(self.args.n_layers, 2)
+            self._want_phase = [z(self.args.n_layers, n_experts), z(self.args.n_layers, n_experts)]
+            self._miss_phase = z(2, 2)
 
     def decay_demand(self, factor: float):
         """Scale recorded demand down, in place, so old evidence fades.
@@ -675,7 +688,23 @@ class Model:
         missed, slots = float(tot[:, 0].sum()), float(tot[:, 1].sum())
         per_layer = (tot[:, 0] / tot[:, 1].clamp_min(1)).tolist()
         worst = sorted(range(len(per_layer)), key=lambda L: -per_layer[L])[:5]
+        ph = {}
+        if self._miss_phase is not None:
+            mp = self._miss_phase.cpu()
+            wp = [x.cpu() for x in self._want_phase]
+            for i, name in ((0, "prefill"), (1, "decode")):
+                n_slots = float(mp[i, 1])
+                if n_slots:
+                    ph[name] = {"miss_rate": round(float(mp[i, 0]) / n_slots, 4),
+                                "slots": int(n_slots),
+                                "distinct_experts": int((wp[i] > 0).sum())}
+            if len(ph) == 2:
+                # do the two phases want the SAME experts? cosine over the per-layer demand
+                a, b = wp[0].flatten(), wp[1].flatten()
+                den = float(a.norm() * b.norm())
+                ph["prefill_decode_cosine"] = round(float((a * b).sum()) / den, 4) if den else None
         return {
+            "phase": ph,
             "miss_rate": round(missed / max(slots, 1.0), 4),
             "missed_slots": int(missed), "total_slots": int(slots),
             "distinct_experts_wanted": int((counts > 0).sum()),
