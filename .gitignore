@@ -37,3 +37,4 @@ results/*/state/
 *.swp
 *.swo
 *~
+results/captured_request.pt
