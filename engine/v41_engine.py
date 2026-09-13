@@ -357,8 +357,13 @@ def blend_demand(trace_counts: dict, db, prior_slots: float):
 
     The trace ranks experts by a corpus that is not this server's traffic; observed demand is
     this server's traffic but starts empty. Weight the observed half by how much of it there is:
-    w = observed / (observed + prior). With prior = DSV41_PRUNE_PRIOR slots, a cold database
-    changes nothing and a well-exercised one dominates, with no threshold to tune or trip over.
+    w = observed / (observed + prior), computed PER LAYER -- `prior_slots` is therefore in
+    routing slots per layer (tokens x n_activated_experts), NOT totalled across layers. Getting
+    that wrong is a silent n_layers-fold error in the wrong direction: the ranking still blends,
+    it just barely moves, and the only symptom is the weight in the startup line.
+
+    A cold database changes nothing and a well-exercised one dominates, with no threshold to
+    tune or trip over.
     """
     import numpy as np
     counts, _mass = db
