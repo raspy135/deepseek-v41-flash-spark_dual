@@ -149,6 +149,16 @@ except Exception:  # noqa: BLE001
     _hc_sinkhorn_fused = None
 HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1" and _hc_sinkhorn_fused is not None
 
+# Fused hyper-connection stream ops (engine/hc_ops.py). The torch versions materialise large fp32
+# temporaries over the hc-wide residual -- [T, 4, 5120] is 84 MB at a 2,048-token chunk -- and the
+# four HC sites of a layer measured 33 % of prefill on the GPU timeline, more than the MoE kernel,
+# while doing almost no arithmetic. Fused: hc_post 9.6x, hc_pre+rmsnorm 6.6x.
+try:
+    from engine.hc_ops import hc_post as _hc_post_fused, hc_pre_rmsnorm as _hc_pre_rn_fused  # noqa: E402
+except Exception:  # noqa: BLE001
+    _hc_post_fused = _hc_pre_rn_fused = None
+HC_OPS = os.environ.get("DSV41_HC_OPS", "1") == "1" and _hc_post_fused is not None
+
 
 # ----------------------------------------------------------------------------- weights
 class IndexerWeights:
@@ -691,23 +701,25 @@ class Model:
         a = self.args
         residual = h
         attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
-        y = R.hc_pre(h, pre_mix)
-        y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
+        y = (_hc_pre_rn_fused(h, pre_mix, w.attn_norm, a.norm_eps) if HC_OPS
+             else R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps))
         _mark("hc_attn_mix")
         t0 = time.perf_counter()
         y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
         self.stats["attn_s"] += time.perf_counter() - t0
-        h = R.hc_post(y, residual, attn_post, attn_comb)
+        h = (_hc_post_fused(y, residual, attn_post, attn_comb) if HC_OPS
+             else R.hc_post(y, residual, attn_post, attn_comb))
         _mark("hc_post_attn")
         residual = h
         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-        y = R.hc_pre(h, attn_pre)
-        y = R.rmsnorm(y, w.ffn_norm, a.norm_eps)
+        y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if HC_OPS
+             else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
         # Everything above since o_proj is hyper-connection bookkeeping on the 4x-wide residual
         # stream, not MoE -- it was being charged to the moe_kernel gap.
         _mark("hc_ffn_mix")
         y = self.moe(y, w, L, prefill, store, arena, n_experts)
-        h = R.hc_post(y, residual, ffn_post, ffn_comb)
+        h = (_hc_post_fused(y, residual, ffn_post, ffn_comb) if HC_OPS
+             else R.hc_post(y, residual, ffn_post, ffn_comb))
         _mark("hc_post_ffn")
         return h, ffn_pre
 
