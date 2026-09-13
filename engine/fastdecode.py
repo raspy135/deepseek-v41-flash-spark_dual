@@ -427,7 +427,10 @@ class FastDecoder:
         else:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
         # shared expert is replicated and added AFTER the combine, so it is counted once
-        out += R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        if M.TP_DENSE_WORLD > 1:      # partial: this rank holds half the intermediate dim
+            torch.distributed.all_reduce(_sh, op=torch.distributed.ReduceOp.SUM)
+        out += _sh
         h = R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb)
         self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)
 
@@ -467,6 +470,11 @@ class FastDecoder:
             wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
             slots = (idx.to(torch.int32) + k * 128)
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
+            # NOT all-reduced: MTPWeights loads its own shared experts (engine/model.py) and
+            # _tp_shard never touches them. The DSpark drafter is deliberately not EP-parallel --
+            # it has its own FixedStore arena -- and sharding it would put a collective on a path
+            # that runs five times per step to save 3 blocks' worth of weights. All-reducing an
+            # UNSHARDED output would simply double it.
             out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
             h = R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb)
             pre_mix = ffn_pre

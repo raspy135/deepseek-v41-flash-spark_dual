@@ -44,6 +44,10 @@ PRUNE_MISS = os.environ.get("DSV41_PRUNE_MISS", "0") == "1"
 # restores fp32 for an A/B.
 SCORE_DTYPE = (torch.bfloat16 if os.environ.get("DSV41_INDEX_SCORE_BF16", "1") == "1"
                else torch.float32)
+# Dense tensor parallelism (DSV41_TP_DENSE): world size, or 1 when off. Read once -- both ranks
+# must agree, and a rank that shards while its peer does not desyncs on the first all-reduce.
+TP_DENSE_WORLD = (int(os.environ.get("WORLD_SIZE", 1))
+                  if os.environ.get("DSV41_TP_DENSE", "0") == "1" else 1)
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -866,7 +870,14 @@ class Model:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-        _mark("shared_expert")   # the dense FFN every token passes through, replicated on both ranks
+        if TP_DENSE_WORLD > 1:
+            # Each rank holds half the intermediate dim, so this is a PARTIAL sum. It gets its own
+            # all-reduce rather than riding the routed combine: `shared` is added AFTER that
+            # combine precisely so its numerics match the single-box path (see the comment there),
+            # and folding it in would move where the rounding happens.
+            import torch.distributed as _dist
+            _dist.all_reduce(shared, op=_dist.ReduceOp.SUM)
+        _mark("shared_expert")   # the dense FFN every token passes through
         if getattr(store, "null_slot", None) is not None:
             if ep_overlap:
                 # Queue, rather than host-synchronise, the dependency.  The shared expert already

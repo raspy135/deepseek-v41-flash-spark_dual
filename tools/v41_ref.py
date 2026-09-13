@@ -286,6 +286,26 @@ class Args:
         return args
 
 
+def tp_dense() -> tuple[int, int]:
+    """(rank, world) for dense tensor parallelism, or (0, 1) when it is off.
+
+    DSV41_TP_DENSE splits the weights that EP2 leaves REPLICATED -- shared experts, and later
+    attention and the head. Those are read in full on both ranks every decode step (8.06 GB against
+    7-13 GB for the EP-split routed experts), so halving them is 19-27% fewer bytes on a decode
+    that sits near the bandwidth roofline.
+    """
+    if os.environ.get("DSV41_TP_DENSE", "0") != "1":
+        return 0, 1
+    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+
+
+def _tp_shard(w, dim: int):
+    rank, world = tp_dense()
+    if world <= 1 or not hasattr(w, "shard"):
+        return w
+    return w.shard(dim, rank, world)
+
+
 # ----------------------------------------------------------------------------- weights
 class LayerWeights:
     """Everything of one backbone layer except the routed experts, dequantized to bf16 on `device`."""
@@ -335,9 +355,13 @@ class LayerWeights:
             self.gate_bias_vl = f32("ffn.gate.bias_vl")
         except Exception:  # noqa: BLE001
             self.gate_bias_vl = None
-        self.sh_w1 = fp8lin("ffn.shared_experts.w1")
-        self.sh_w2 = fp8lin("ffn.shared_experts.w2")
-        self.sh_w3 = fp8lin("ffn.shared_experts.w3")
+        # Tensor-parallel shared expert: w1/w3 are column-parallel (split the intermediate dim,
+        # i.e. their OUTPUT rows), w2 is row-parallel (split its INPUT columns to match). Each rank
+        # then computes a PARTIAL [T, dim] that the caller must all-reduce -- see Model.moe.
+        # Off by default; the dense path is replicated under EP2 and read in full on both ranks.
+        self.sh_w1 = _tp_shard(fp8lin("ffn.shared_experts.w1"), 0)
+        self.sh_w2 = _tp_shard(fp8lin("ffn.shared_experts.w2"), 1)
+        self.sh_w3 = _tp_shard(fp8lin("ffn.shared_experts.w3"), 0)
         self.ratio = args.compress_ratios[layer]
         self.is_kv_source = layer in args.kv_source_layers
         if self.is_kv_source:
