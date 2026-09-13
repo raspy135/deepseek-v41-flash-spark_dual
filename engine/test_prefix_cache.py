@@ -35,7 +35,7 @@ def _fixture():
 def test_prefix_snapshot_restores_overwritten_state():
     e = _fixture()
     ids = torch.tensor([10, 11, 12, 13, 14, 15])
-    e._save_prefix(ids, len(ids))
+    e._save_prefix(ids.tolist(), len(ids))
     saved = {L: value.clone() for L, value in e._prefix_cache["win"].items()}
 
     for ring in e.caches.win:
@@ -53,6 +53,6 @@ def test_prefix_snapshot_restores_overwritten_state():
 
 def test_prefix_mismatch_invalidates_snapshot():
     e = _fixture()
-    e._save_prefix(torch.tensor([1, 2, 3]), 3)
+    e._save_prefix([1, 2, 3], 3)
     assert e._restore_prefix([1, 9, 3, 4]) == 0
     assert e._prefix_cache is None

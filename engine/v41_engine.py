@@ -850,7 +850,7 @@ class V41Engine:
         c.len = n
         return n
 
-    def _save_prefix(self, ids: torch.Tensor, P: int) -> None:
+    def _save_prefix(self, prompt_ids, P: int) -> None:
         """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
         if os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or P <= 0:
             self._prefix_cache = None
@@ -862,7 +862,10 @@ class V41Engine:
         pending = {L: (None if value is None else (value[0].clone(), value[1].clone()))
                    for L, value in c.pending.items()}
         self._prefix_cache = {
-            "ids": tuple(ids.detach().cpu().tolist()),
+            # The serving path already owns these ids as a host list.  Copying the CUDA ``ids``
+            # tensor back here forced a full-stream synchronisation at every cache miss and made
+            # queued encoder work appear as a prefix-cache cost.
+            "ids": tuple(prompt_ids),
             "slots": slots,
             "win": {L: c.win[L][slots].clone()
                     for L in range(self.args.candidate_source_layer + 1)},
@@ -916,7 +919,8 @@ class V41Engine:
         t_decode0 = t_start
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
-                                         _st := {}, grammar, penalties, prefix_start=prefix_start)
+                                         _st := {}, grammar, penalties, prefix_start=prefix_start,
+                                         host_ids=prompt)
         except BaseException:
             # GeneratorExit (stop string / disconnect / server error) or a real exception. The
             # normal exit already told rank 1 to stop via the loop's own control(); only the
@@ -1292,7 +1296,7 @@ class V41Engine:
         return ra
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None,
-                     penalties=None, prefix_start: int = 0):
+                     penalties=None, prefix_start: int = 0, host_ids=None):
 
         m = self.model
         t_start = time.perf_counter()
@@ -1343,7 +1347,7 @@ class V41Engine:
                     _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
                 # Save at the prompt boundary, before decoder replay and generation overwrite the
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
-                self._save_prefix(ids, P)
+                self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
                     m.dspark_seed(mh, s_rep)
