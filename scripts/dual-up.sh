@@ -44,6 +44,12 @@ for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT BIND_HOST MIN_FREE_GIB NAME0 NA
          DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S STOP_TIMEOUT; do
     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
 done
+# ...and every DSV41_* the caller set. The named list above cannot keep up with the engine's
+# experiment switches, and a knob that .env happens to pin silently beat the command line -- the
+# exact failure this capture exists to prevent, just for the vars nobody remembered to list.
+while IFS='=' read -r _k _; do
+    [[ -n "$_k" ]] && _CLI[$_k]="${!_k}"
+done < <(env | grep -E '^DSV41_[A-Z0-9_]+=' | sort)
 # shellcheck disable=SC1091
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
 for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
