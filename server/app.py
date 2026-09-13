@@ -257,9 +257,14 @@ def _reject_images(messages: List[dict]) -> None:
 
 
 def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
-                      effort: int) -> Tuple[str, List[int], Optional[List[dict]]]:
+                      effort: int, engine=None) -> Tuple[str, List[int], Optional[List[dict]], Optional[tuple]]:
     """Render a chat request. The third element is the tool list as the *model* sees it
-    (namespaces folded into the names), which is what a tool grammar has to be built from."""
+    (namespaces folded into the names), which is what a tool grammar has to be built from; the
+    fourth is (token_types, image_inputs) when the request carries images, else None.
+
+    The VL inputs are RETURNED rather than attached to the engine here: this runs before the
+    request lock, so attaching would let two requests overwrite each other's images and the
+    engine is single-sequence. State.generate applies them under the lock."""
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty list", param="messages")
@@ -306,7 +311,14 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
             rendered = enc.tools_from_openai_format(copy.deepcopy(tools))
         except Exception as e:  # noqa: BLE001 - the encoder already accepted these
             log.warning("cannot normalise the tool list for the grammar: %s", e)
-    return prompt, tok.encode(prompt), rendered
+    images = media.get("images")
+    if images and engine is not None and getattr(engine, "vision", None) is not None:
+        try:
+            ids, types, imgs = engine.prepare_vl(prompt, images)
+        except Exception as e:  # noqa: BLE001
+            raise APIError(400, f"cannot process image inputs: {e}", param="messages")
+        return prompt, ids, rendered, (types, imgs)
+    return prompt, tok.encode(prompt), rendered, None
 
 
 # ---------------------------------------------------------------------------
@@ -532,11 +544,15 @@ class State:
 
     def generate(self, prompt_ids: List[int], sampling: dict, *, thinking: bool,
                  detect_tool_calls: bool, result: GenerationResult,
-                 tools: Optional[List[dict]] = None) -> Iterator[Tuple[str, str]]:
+                 tools: Optional[List[dict]] = None, vl: Optional[tuple] = None) -> Iterator[Tuple[str, str]]:
         """Drive the engine; yield (kind, text) events; fill ``result`` at the end.
 
         The caller must hold ``self.lock``.
         """
+        # Attach this request's image inputs under the lock, so two requests cannot overwrite
+        # each other's; the engine clears them once prefill has consumed them.
+        if vl is not None and hasattr(self.engine, "set_vl_inputs"):
+            self.engine.set_vl_inputs(*vl)
         max_ctx = self.engine.max_context
         # Headroom the engine needs beyond prompt + max_tokens (DSpark verifies a
         # 6-token block, the V4.1 engine asserts an 8-token margin).
@@ -939,7 +955,7 @@ class Handler(BaseHTTPRequestHandler):
     def _debug_prompt(self, body: dict) -> None:
         st = self.state
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
-        prompt, ids, tools = build_chat_prompt(body, st.enc, st.tok, thinking, effort)
+        prompt, ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine)
         body_out = {"thinking": thinking, "reasoning_effort": effort, "prompt": prompt,
                     "prompt_ids": ids, "prompt_tokens": len(ids)}
         if tools and st.grammars is not None:
@@ -951,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         sampling = parse_sampling(body)
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
-        _, prompt_ids, tools = build_chat_prompt(body, st.enc, st.tok, thinking, effort)
+        _, prompt_ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -967,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
 
         with st.lock:
             if not stream:
-                for _ in st.generate(prompt_ids, sampling, thinking=thinking, detect_tool_calls=True,
+                for _ in st.generate(prompt_ids, sampling, thinking=thinking, detect_tool_calls=True, vl=vl,
                                      result=result, tools=tools):
                     pass
                 router = result.router
@@ -990,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
             self._start_sse()
             try:
                 self._sse(chunk({"role": "assistant", "content": ""}))
-                for kind, text in st.generate(prompt_ids, sampling, thinking=thinking,
+                for kind, text in st.generate(prompt_ids, sampling, thinking=thinking, vl=vl,
                                               detect_tool_calls=True, result=result, tools=tools):
                     self._sse(chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text}))
                 if result.tool_calls:
