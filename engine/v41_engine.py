@@ -605,6 +605,14 @@ class V41Engine:
                 log(f"prune ranking adapted from {PRUNE_DB}: observed weight {w:.1%} "
                     f"({db[0].sum():,.0f} recorded routing slots)")
             self.prune_select = prune_select
+            # ONE authority for the keep set. results/ is bind-mounted per box and sync-peer.sh
+            # copies only the trace, so a demand DB that exists on rank 0 and not on rank 1 gave
+            # the two ranks DIFFERENT routable experts -- their routers masked different logits,
+            # and the MoE all-reduce summed partials from two different expert selections. It
+            # surfaced only because the swap validator refused to evict an expert rank 1 had
+            # never made resident. Broadcasting the ranking (not the masks) keeps one code path:
+            # build_keep_masks is deterministic, so identical input gives identical masks.
+            counts = self.ep.broadcast_obj(counts)
             masks, keep = build_keep_masks(counts, prune_keep, prune_select, device)
             n_keep = max(len(v) for v in keep.values())
             ranked = [(float(counts[L][e]), L, int(e)) for L, ks in keep.items() for e in ks]
@@ -655,6 +663,20 @@ class V41Engine:
             ranked = (EX.rank_from_trace(trace_stats, profile=self.hot_profile) if trace_stats
                       else [(L, e) for e in range(384) for L in range(40)])
         self.model.prune_mask = self.model_prune_mask
+        if self.ep.active:
+            # Defence in depth for the failure above: the routable set drives the router on BOTH
+            # ranks, so a difference is not a slow answer, it is two models pretending to be one.
+            # Cheap to verify once at boot, and impossible to notice later without a validator.
+            mine = 0
+            if self.model_prune_mask:
+                for L in sorted(self.model_prune_mask):
+                    mine = (mine * 1000003 + int(self.model_prune_mask[L].sum())) % (2 ** 61 - 1)
+            theirs = self.ep.broadcast_obj(mine)
+            if mine != theirs:
+                raise RuntimeError(
+                    f"EP2 rank {self.ep.rank}: prune mask differs from rank 0 "
+                    f"({mine} vs {theirs}); the two routers would mask different experts")
+            log(f"EP2 prune mask agrees across ranks (checksum {mine})")
         self.store.warm_start(ranked, log=log)
         if PRUNE_MISS:
             # Seed the accumulators from the persisted DB so what they hold is always the whole

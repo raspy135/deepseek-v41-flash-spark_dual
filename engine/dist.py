@@ -125,6 +125,15 @@ class EPDistributed:
         dist.all_reduce(partial, op=dist.ReduceOp.SUM)
         return partial
 
+    def broadcast_obj(self, payload):
+        """rank 0 -> all, for any picklable object. Used for state that MUST be identical on both
+        ranks and is derived from something only rank 0 can see."""
+        if not self.active:
+            return payload
+        obj = [payload if self.rank == 0 else None]
+        dist.broadcast_object_list(obj, src=0)
+        return obj[0]
+
     # ------------------------------------------------------- request control
     def broadcast_request(self, payload):
         """rank 0 -> all: the request metadata that starts a replicated generate().
