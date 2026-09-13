@@ -723,6 +723,30 @@ class V41Engine:
                     f"EP2 rank {self.ep.rank}: prune mask differs from rank 0 "
                     f"({mine} vs {theirs}); the two routers would mask different experts")
             log(f"EP2 prune mask agrees across ranks (checksum {mine})")
+
+            # Everything else that must be identical on both ranks. Each of these has its own way
+            # of going wrong quietly: a format or TP split that differs makes one rank compute a
+            # partial where its peer computes a whole, and the first all-reduce then sums
+            # mismatched tensors -- no error, just wrong numbers. Checked here because a boot-time
+            # refusal is the only cheap moment; at runtime it is invisible without a validator.
+            cfg = {
+                "expert_format": self.expert_format,
+                "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
+                "prune_keep": float(prune_keep or 0.0),
+                "arena_slots": int(getattr(self.store.arena, "slots", 0)),
+                "spec": bool(self.spec),
+                "max_seq": int(self.max_context),
+                "topk": int(self.args.n_activated_experts),
+            }
+            peer_cfg = self.ep.broadcast_obj(cfg)
+            diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}
+            if diff:
+                raise RuntimeError(
+                    f"EP2 rank {self.ep.rank}: configuration differs from rank 0 in {diff} "
+                    f"(mine vs rank 0); the ranks would compute different things and their "
+                    f"collectives would sum mismatched tensors")
+            log(f"EP2 config agrees across ranks ({len(cfg)} fields: "
+                f"{', '.join(sorted(cfg))})")
         self.store.warm_start(ranked, log=log)
         if PRUNE_MISS:
             # Seed the accumulators from the persisted DB so what they hold is always the whole
