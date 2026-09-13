@@ -281,3 +281,32 @@ After that change only about 7 ms/step is outside the GPU timeline. The next sin
 must reduce executed bytes/work or improve DSpark acceptance. Dense TP and a wider verify block
 have both been measured in the wrong direction; top-k 5 is faster but exceeds the prose loss gate,
 and the BF16 LM head remains intentionally unquantized.
+
+## The demand half-life has to be read against your traffic, not as a constant
+
+`DSV41_PRUNE_HALFLIFE` is the EWMA half-life of the expert-demand history, in *routing slots*, and
+the decay applied is `0.5 ** (grown / half)`. The number only means something next to how many
+slots a request actually produces: a 4.5k-token prompt here generates **~588,000**.
+
+`.env` carried `2e6` against a code default of `2e7`, i.e. a factor of ten more aggressive. At
+`2e6` each request decays the history to `0.5 ** (588000/2e6) = 0.815` — the whole history
+half-lives every ~3.4 requests. The ranking genuinely moved that much, the planner dutifully
+swapped it, and the result was ~100 experts moved per request (near the `DSV41_PRUNE_SWAP_MAX=128`
+cap) at a **0.9% miss rate**, costing ~1 GB of NVMe and ~0.2 s every request to fix nothing.
+
+Restoring `2e7` (0.98 per request, stable over ~34) on the same workload:
+
+```
+                swaps/request                        routed-miss
+2e6    89, 116, 96, 92, 72, 71                       2.3 → 0.9%
+2e7    38, 50, 44, 43, 41, 41, 34 … 21, 18, 20, 16   0.9 → 0.4%
+```
+
+Churn fell ~5x **and** the miss rate halved. That direction is the useful part: a steadier history
+is not a staler one here, it is a more accurate one — the twitchy version was chasing each prompt
+in turn and never settling on the set that serves all of them.
+
+The symptom to watch for is the swap count sitting near `DSV41_PRUNE_SWAP_MAX` while the miss rate
+is already low. That combination always means the ranking is churning, never that there is real
+work to do; reach for the half-life before `DSV41_PRUNE_SWAP_MIN_GAIN`, because the gain threshold
+only suppresses the symptom.
