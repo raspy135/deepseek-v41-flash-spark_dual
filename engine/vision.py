@@ -71,6 +71,30 @@ def load_vision(model_dir: str, device: str = "cuda", dtype=torch.bfloat16):
         V._dsv41_device_rope = True
     V._dsv41_rope_device = torch.device(device)
 
+    # The reference hands scaled_dot_product_attention 3D tensors [heads, n, head_dim]. SDPA wants
+    # 4D [batch, heads, n, head_dim] and rejects EVERY fused kernel otherwise ("All fused kernels
+    # requires query, key and value to be 4 dimensional"), falling back to the math path -- which
+    # materialises the full n x n score matrix: 11 GB peak for a 1.2MP image's 8547 patches, and
+    # 9.1 s. That is survivable on an idle box and fatal inside the server, where the expert arena
+    # leaves only a few GB and the allocation thrashes instead of failing. One unsqueeze lets the
+    # fused kernels run.
+    if not getattr(V, "_dsv41_sdpa_4d", False):
+        import torch.nn.functional as _F
+
+        def _attn_forward(self, x, cos, sin):
+            n = x.size(0)
+            q, k, v = (t.view(n, self.n_heads, self.head_dim)
+                       for t in self.wqkv(x).chunk(3, dim=-1))
+            q = V.apply_rotary(q, cos, sin)
+            k = V.apply_rotary(k, cos, sin)
+            o = _F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0),
+                                                k.transpose(0, 1).unsqueeze(0),
+                                                v.transpose(0, 1).unsqueeze(0)).squeeze(0)
+            return self.wo(o.transpose(0, 1).reshape(n, -1))
+
+        V.Attention.forward = _attn_forward
+        V._dsv41_sdpa_4d = True
+
     vit, aligner = V.ViT(args), V.Aligner(args)
     index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
     want = {}
@@ -133,7 +157,9 @@ class VisionTower:
         of the image token id would put aligner rows in the delimiter slots and silently shift the
         rest of the grid by one.
         """
+        import time as _t
         for img in images or ():
+            _t0 = _t.perf_counter()
             types = img.types.to(h.device)
             span = h[img.start:img.start + types.numel()]
             assert span.shape[0] == types.numel(), (
@@ -148,4 +174,8 @@ class VisionTower:
             assert rows.shape[0] == n_slots, (
                 f"aligner produced {rows.shape[0]} rows for {n_slots} IMAGE slots")
             span[types == self.IMAGE] = rows.to(h.dtype)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[vision] span {types.numel()} tok, {img.patches.shape[0]} patches, "
+                  f"{rows.shape[0]} rows in {_t.perf_counter() - _t0:.2f}s", flush=True)
         return h

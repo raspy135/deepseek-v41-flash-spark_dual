@@ -1140,7 +1140,10 @@ class V41Engine:
         for k, v in self.vision.cfg.items():
             setattr(_A, k, v)
         _A.vision_enabled = True
+        _t0 = time.perf_counter()
         toks, types, imgs = IP.prepare_vl_inputs(prompt, images, self.tokenizer, _A)
+        log(f"vision: prepared {len(toks)} tokens, {len(imgs or [])} image(s) in "
+            f"{time.perf_counter() - _t0:.2f}s")
         return toks, torch.tensor(types, dtype=torch.int64, device=self.device), imgs
 
     def set_vl_inputs(self, token_types=None, images=None):
