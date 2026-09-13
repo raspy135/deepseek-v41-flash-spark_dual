@@ -486,7 +486,15 @@ def _pick_bm(P: int) -> int:
 
 
 # (BN, num_warps, num_stages) per kernel and BM, from the sweep on GB10 (tools/test_fp4_moe.py)
+# (BN, num_warps, num_stages) per BM. Re-swept with dot_scaled on (DSV41_FP4_DOT_SCALED=1):
+# letting the tensor core eat the FP4 codes removes most of the decode ALU, which moves the kernel
+# from ALU-bound toward memory-bound -- and a memory-bound loop wants software pipelining, which
+# num_stages=1 does not give it. The original tuples were swept against the software-decode kernel
+# and are kept as the fallback for it; measured with dot_scaled at D=5120/INTER=2304:
+#   decode  T=6     BM=16 (32, 4, 4)  1.22x over the shipped tuple
+#   prefill T=2048  BM=64 (64, 4, 3)  1.09x
 _UP_CFG = {16: (256, 4, 1), 32: (128, 4, 1), 64: (64, 4, 1)}
+_UP_CFG_SCALED = {16: (32, 4, 4), 32: (128, 4, 3), 64: (64, 4, 3)}
 _DOWN_CFG = {16: (128, 8, 3), 32: (128, 4, 3), 64: (128, 8, 3)}
 
 
@@ -526,7 +534,7 @@ def moe_forward(
     P = T * K
     dev = x.device
     BM = block_m or (64 if (slots_repeat and P <= 64) else _pick_bm(P))
-    bn1, nw1, ns1 = up_cfg or _UP_CFG[BM]
+    bn1, nw1, ns1 = up_cfg or (_UP_CFG_SCALED if DOT_SCALED else _UP_CFG)[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
     if routing_ids is not None and P > 64:
         assert routing_slot_map is not None and routing_ids.shape == slots.shape

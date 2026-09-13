@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from engine import model as M
+from engine.model import HC_OPS as _HC_OPS, _hc_post_fused, _hc_pre_rn_fused
 from engine.hc_sinkhorn import hc_split_sinkhorn
 import v41_ref as R
 
@@ -316,11 +317,16 @@ class FastDecoder:
             self.main_hidden[:, i * a.dim:(i + 1) * a.dim] = h.float().mean(dim=1)
         residual = h
         attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
-        y = R.rmsnorm(R.hc_pre(h, self.pre_mix), w.attn_norm, a.norm_eps)
+        # Same fused stream ops the prefill path uses (engine/hc_ops.py). At T=6 the tensors are
+        # small, so the win here is launch count rather than bandwidth: these replace ~10 tiny
+        # elementwise kernels per site with one, and a graphed step issues ~1,015 such launches.
+        y = (_hc_pre_rn_fused(h, self.pre_mix, w.attn_norm, a.norm_eps) if _HC_OPS
+             else R.rmsnorm(R.hc_pre(h, self.pre_mix), w.attn_norm, a.norm_eps))
         self._tap('attn_x', L, y)
         y = self._attention(y, w, L, self.c.win[L], self.m.freqs_c if w.ratio else self.m.freqs_w, self.pos, sh_state)
         self._tap('attn_out', L, y)
-        h = R.hc_post(y, residual, attn_post, attn_comb)
+        h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
+             else R.hc_post(y, residual, attn_post, attn_comb))
         self.h.copy_(h)
         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
         self.ffn_pre.copy_(ffn_pre); self.ffn_post.copy_(ffn_post); self.ffn_comb.copy_(ffn_comb)
@@ -402,7 +408,8 @@ class FastDecoder:
             attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
             y = R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps)
             y = self._attention(y, w, 40 + k, self.c.mtp_win[k], self.m.freqs_w, pos, None, mtp_last=self.d_last[0])
-            h = R.hc_post(y, residual, attn_post, attn_comb)
+            h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
+             else R.hc_post(y, residual, attn_post, attn_comb))
             residual = h
             ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
             y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
