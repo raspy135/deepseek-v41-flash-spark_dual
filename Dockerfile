@@ -82,7 +82,8 @@ RUN pip install \
         "safetensors>=0.5" \
         "numpy>=1.26" \
         "sympy>=1.13" \
-        "huggingface_hub>=0.35"
+        "huggingface_hub>=0.35" \
+        "Pillow>=10.0"
 
 WORKDIR /app
 COPY . /app
