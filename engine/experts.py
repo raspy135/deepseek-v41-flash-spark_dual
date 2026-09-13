@@ -194,6 +194,15 @@ class ExpertStore:
                             z(*W13_SHAPE, dtype=torch.uint8), z(*S13_SHAPE, dtype=torch.uint8),
                             z(*W2_SHAPE, dtype=torch.uint8), z(*S2_SHAPE, dtype=torch.uint8),
                             z(*W13_SHAPE, dtype=torch.uint8), z(*S13_SHAPE, dtype=torch.uint8))
+            # PROVE it is zero rather than assume it. For FP4 the reasoning above is solid, but
+            # the CB3 arena RE-QUANTIZES on the way in, and a null slot that decodes to anything
+            # but zero fails silently: it just adds garbage to every token routed at a non-owned
+            # expert, which looks like a quality problem, not a bug. One dequantize at startup.
+            if hasattr(arena, "dequant_slot"):
+                bad = [float(t.abs().max()) for t in arena.dequant_slot(self.null_slot)]
+                assert max(bad) == 0.0, (
+                    f"null slot does not decode to zero (max |w| = {max(bad)}) for "
+                    f"{type(arena).__name__}: every non-owned expert would contribute garbage")
 
     # ------------------------------------------------------------------ io
     def _shard(self, name: str) -> ShardFile:
