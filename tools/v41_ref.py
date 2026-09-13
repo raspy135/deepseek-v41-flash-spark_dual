@@ -291,8 +291,28 @@ def tp_dense() -> tuple[int, int]:
 
     DSV41_TP_DENSE splits the weights that EP2 leaves REPLICATED -- shared experts, and later
     attention and the head. Those are read in full on both ranks every decode step (8.06 GB against
-    7-13 GB for the EP-split routed experts), so halving them is 19-27% fewer bytes on a decode
-    that sits near the bandwidth roofline.
+    7-13 GB for the EP-split routed experts), so the roofline argument was 19-27% fewer bytes.
+
+    MEASURED: it does not pay off. Shared experts alone (0.71 GB/step), 8k/512, three runs:
+
+        TP off   ttft 14919 ms   tpot 51.13 ms   19.56 tok/s   accept 3.56   (step ~182 ms)
+        TP on    ttft 19808 ms   tpot 69.48 ms   14.39 tok/s   accept 2.87   (step ~199 ms)
+
+    The roofline argument assumes decode is bandwidth-bound. It is not: GPU utilization during
+    decode fluctuates 70-90% on the live server rather than pinning at the ceiling, so the step is
+    losing time to gaps, not to reads. With speculation the shared-expert GEMM is
+    [6,5120]x[5120,2304], skinny enough to be launch- and latency-bound, so halving N does not
+    halve the time -- while the 40 added all-reduces per step lengthen exactly the serial chain
+    that is already leaving the GPU idle. Shaving bytes cannot help until the gaps are closed. Attention would be the same shape
+    with another 40 collectives, so the bigger 5.41 GB prize is unlikely to behave differently.
+
+    Caveats on the numbers: the two runs are an hour apart and the demand DB decays between them,
+    and the per-run decode spread is wide (16-22 tok/s baseline), so "slightly slower" is the
+    honest reading rather than "26% slower". The accept_len drop 3.56 -> 2.87 is the one part that
+    is not explained by noise; summing partials changes the numerics the drafter sees.
+
+    Kept behind the flag, default off, because it is correct (verified against EP2 output) and it
+    is where attention/head sharding would build from if the collective cost ever drops.
     """
     if os.environ.get("DSV41_TP_DENSE", "0") != "1":
         return 0, 1

@@ -39,3 +39,21 @@ for r, p in enumerate(parts):
 assert all(p.norm().item() > 0 for p in parts), "a rank contributed nothing"
 assert rel < 5e-3, f"sharded result differs: {rel}"
 print("\nTP SHARED EXPERT MATCHES THE UNSHARDED ONE")
+
+# --------------------------------------------------------------------------- the way back
+# TP measured slower than plain EP2 (see tools/v41_ref.py:tp_dense), so EP2 is what ships and
+# the flag has to stay genuinely inert when unset -- including on a box where WORLD_SIZE=2 is
+# exported for EP, which is every box this runs on. A default that leaked would shard the
+# weights while the all-reduce sites stayed off (or the reverse) and quietly halve the answer.
+for env in ({}, {"DSV41_TP_DENSE": "0"}, {"DSV41_TP_DENSE": "false"}):
+    saved = os.environ.pop("DSV41_TP_DENSE", None)
+    os.environ["WORLD_SIZE"] = "2"
+    os.environ.update(env)
+    try:
+        assert R.tp_dense() == (0, 1), f"tp_dense() not off for {env or 'unset'}: {R.tp_dense()}"
+        assert R._tp_shard(w1, 0) is w1, f"_tp_shard sharded anyway for {env or 'unset'}"
+    finally:
+        os.environ.pop("DSV41_TP_DENSE", None)
+        if saved is not None:
+            os.environ["DSV41_TP_DENSE"] = saved
+print("DSV41_TP_DENSE OFF BY DEFAULT: tp_dense() == (0, 1), _tp_shard is identity")

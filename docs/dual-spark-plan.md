@@ -121,6 +121,34 @@ over a 25 GB/s link — latency-bound, not bandwidth-bound. Budget **~2–4 ms p
 token** for the ~40 small cross-node collectives (measure in Phase 0; if each round trip is
 >100 µs the estimate needs revisiting).
 
+### Partial TP2 — RESULT: **no gain** (measured 2026-09-13, `DSV41_TP_DENSE=1`)
+
+The "~22–28 vs ~19–21" row above is an estimate from halved dense bytes, and the cheapest
+piece of it was built and measured first: `DSV41_TP_DENSE=1` shards only the **shared
+experts** (column-parallel w1/w3, row-parallel w2, one extra all-reduce per layer), 0.71 GB
+of the 8.06 GB replicated per step. 8k/512, three runs each:
+
+| | ttft | tpot | decode | accept_len | step |
+|---|---|---|---|---|---|
+| EP2 (TP off) | 14919 ms | 51.13 ms | **19.56 tok/s** | 3.56 | ~182 ms |
+| + dense TP | 19808 ms | 69.48 ms | **14.39 tok/s** | 2.87 | ~199 ms |
+
+Slower, not faster — and the premise was wrong, not just the size of the effect. **Decode is
+not bandwidth-bound on this engine**: GPU utilization during decode fluctuates 70–90% instead of
+pinning at the ceiling, so the step is losing time to gaps in the serial chain, not to reads.
+Under speculation the shared-expert GEMM is `[6,5120]×[5120,2304]`, skinny enough to be launch-
+and latency-bound, so halving N does not halve its time, while 40 more collectives per step
+lengthen the very chain that is already leaving the GPU idle. Halving bytes cannot buy anything
+until the gaps are closed. (Caveat: the runs are an hour apart with a
+decaying demand DB and the per-run spread is wide, so read this as "slightly slower", not
+"26% slower". The `accept_len` drop is the part noise does not explain — summing partials moves
+the numerics the drafter sees.)
+
+This does not disprove full TP2, but it removes its cheapest evidence: attention is the same
+skinny shape and would add another 40 collectives for its 5.41 GB. Revisit only if the
+per-collective cost drops. The flag stays, default off — correct, and the place attention
+sharding would build from.
+
 ---
 
 ## 1. Prerequisites & Phase 0 gates (no engine code)
