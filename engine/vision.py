@@ -64,18 +64,66 @@ def load_vision(model_dir: str, device: str = "cuda", dtype=torch.bfloat16):
                     als[name[len("aligner."):]] = t
                 else:
                     vs[name] = t
-    # RMSNorm weights are declared fp32 in the reference; everything else follows `dtype`
-    sd = vit.state_dict()
-    vit.load_state_dict({k: v.to(torch.float32 if sd[k].dtype == torch.float32 else dtype)
-                         for k, v in vs.items()})
-    sda = aligner.state_dict()
-    aligner.load_state_dict({k: v.to(torch.float32 if sda[k].dtype == torch.float32 else dtype)
-                             for k, v in als.items()})
-    return vit.to(device).eval(), aligner.to(device).eval(), cfg
+    # Follow the CHECKPOINT's dtype, not the freshly-built module's. Every vision tensor ships
+    # BF16 (including the RMSNorm weights the reference declares fp32), and a module built from
+    # nn.Linear defaults is fp32 everywhere -- so testing the module's dtype keeps the whole tower
+    # in fp32 and the first matmul dies on bf16 patches against fp32 weights.
+    vit.load_state_dict({k: v.to(dtype) for k, v in vs.items()})
+    aligner.load_state_dict({k: v.to(dtype) for k, v in als.items()})
+    # load_state_dict copies INTO the existing parameters and keeps their dtype, so the module
+    # itself has to be cast -- loading bf16 tensors into an fp32 module leaves it fp32.
+    return (vit.to(device=device, dtype=dtype).eval(),
+            aligner.to(device=device, dtype=dtype).eval(), cfg)
 
 
 @torch.inference_mode()
 def embed_image(vit, aligner, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-    """patches [n_patches, 3, P, P] -> [n_image_tokens, dim], ready to splice over the
-    image-token positions in the embedding stream."""
+    """patches [n_patches, 3, P, P] -> [n_IMAGE_slots, dim].
+
+    These rows fill only the IMAGE positions of the span. The delimiters carry learned embeddings
+    instead (see splice_images)."""
     return aligner(vit(patches, n_h, n_w), n_h, n_w)
+
+
+class VisionTower:
+    """ViT + Aligner + the three learned span delimiters, and the splice that uses them."""
+
+    # image_processor's token types; TEXT is -1 so `types >= 0` selects a whole image span.
+    IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
+
+    def __init__(self, model_dir: str, device: str = "cuda", dtype=torch.bfloat16):
+        from safetensors import safe_open
+        self.vit, self.aligner, self.cfg = load_vision(model_dir, device, dtype)
+        index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+        self.delim = {}
+        for name in ("image_start", "image_end", "image_newline"):
+            with safe_open(os.path.join(model_dir, index[name]), framework="pt") as f:
+                self.delim[name] = f.get_tensor(name).to(device).to(dtype)
+        self.device, self.dtype = device, dtype
+
+    @torch.inference_mode()
+    def splice(self, h: torch.Tensor, images) -> torch.Tensor:
+        """Overwrite each image's span in `h` [T, dim] with its features, in place.
+
+        The IMAGE slots take the aligner rows in row-major order; the three delimiters take their
+        learned embeddings. Every position in the span carries `image_token_id` in the token ids,
+        so the types tensor is the ONLY thing that tells them apart -- replacing every occurrence
+        of the image token id would put aligner rows in the delimiter slots and silently shift the
+        rest of the grid by one.
+        """
+        for img in images or ():
+            types = img.types.to(h.device)
+            span = h[img.start:img.start + types.numel()]
+            assert span.shape[0] == types.numel(), (
+                f"image span at {img.start} runs past the chunk ({span.shape[0]} of "
+                f"{types.numel()} positions); image spans must lie inside one prefill chunk")
+            span[types == self.IMAGE_START] = self.delim["image_start"].to(h.dtype)
+            span[types == self.IMAGE_END] = self.delim["image_end"].to(h.dtype)
+            span[types == self.IMAGE_NEW_LINE] = self.delim["image_newline"].to(h.dtype)
+            rows = embed_image(self.vit, self.aligner,
+                               img.patches.to(h.device).to(self.dtype), img.n_vit_h, img.n_vit_w)
+            n_slots = int((types == self.IMAGE).sum())
+            assert rows.shape[0] == n_slots, (
+                f"aligner produced {rows.shape[0]} rows for {n_slots} IMAGE slots")
+            span[types == self.IMAGE] = rows.to(h.dtype)
+        return h
