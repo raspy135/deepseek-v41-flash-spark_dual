@@ -6,7 +6,9 @@
 > — attention, Engram, router, the DSpark drafter, KV, sampling — stays bit-identically replicated.
 > The original README follows unchanged below, and still describes the engine this is built on.
 
-## Quick start (two boxes)
+## Quick start
+
+Head spark should be able to SSH to worker spark.
 
 ```bash
 cp env.example .env          # set PEER, MASTER_ADDR, MODEL_DIR, NCCL_SOCKET_IFNAME
@@ -29,19 +31,29 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
 
 | | |
 |---|---|
-| prefill | **~1047 tok/s** on a 4,513-token prompt |
+| prefill | **~1047 tok/s** on a 4,513-token prompt, when cache hits it can go 10k+ token/sec |
 | decode | **13–24 tok/s**, set by draft acceptance (2.1 on prose, 4.5 on code) at a ~163 ms step |
 | context | 256k (`MAX_SEQ=262144`) |
-| residency | 4,361 of 15,360 experts (28.4 %), 82 GB arena per box |
+| residency | 4,361 of 15,360 experts (28.4 %), 82 GB arena per box, total about 60% of expert is loaded |
 
-**What this fork adds on top of the upstream engine**
+
+## About this recipe
+
+- It uses custom engine, made by 0xBakeer. In this fork, it's heavily modified.
+- Concurrency is 1.
+- Expert weight quant is fp4. 
+- It can't load all expert weight to two machines, so some of weights are not loaded and not reffered.
+  However, adaptive expert loading measures missed expert weight and the engine will load missed 
+  expert mode eventually. It works well with continuous conversation, normally with harness.
+
+## What this fork adds on top of the upstream engine
 
 - **Docker image** - Docker image created for portability
 - **EP2 expert parallelism** — routed experts split `expert % 2 == rank`, one fp32 all-reduce per
   MoE layer, captured inside the decode CUDA graphs. A boot-time guard refuses to start when the
   two ranks disagree about how to compute, because a skewed pair does not fail — it quietly
   computes different things.
-- **Adaptive expert residency** — the engine records what the router *wanted* (not what it got),
+- **Adaptive expert loading** — the engine records what the router *wanted* (not what it got),
   blends it with the shipped trace, and swaps the arena toward observed demand. It adapts twice
   per request: once at the prefill→decode boundary, so a long prompt's demand is applied before
   the answer is written, and once after. The database survives restarts.
