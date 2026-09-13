@@ -32,6 +32,8 @@ results/*/state/
 
 # persistent Triton JIT cache for the container path (scripts/dual-up.sh mounts it)
 .triton-cache/
+# ad-hoc container tests without the persistent-cache mount create this sibling
+.triton/
 
 # editor swap files
 *.swp
