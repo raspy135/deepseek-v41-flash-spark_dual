@@ -586,6 +586,21 @@ class State:
             gate = self.grammars.for_tools(tools)
         if gate is not None:
             gen_kwargs["grammar"] = gate
+        # One-shot capture of the model-ready load for reproducing shape/data-dependent CUDA
+        # failures.  This intentionally stores token ids rather than rendered prompt text and is
+        # disarmed in-process before writing, so later user traffic is never accumulated.
+        if os.environ.pop("DSV41_CAPTURE_NEXT", "0") == "1":
+            import torch
+            captured = {"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs,
+                        "sampling": dict(sampling), "thinking": thinking}
+            if vl is not None:
+                types, imgs = vl
+                captured["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
+            path = os.path.join(REPO_ROOT, "results", "captured_request.pt")
+            tmp = path + ".tmp"
+            torch.save(captured, tmp)
+            os.replace(tmp, path)
+            log.warning("captured one model-ready request at %s; capture is now disarmed", path)
         if self.ep_active:
             # Lockstep contract (engine/dist.py): rank 0 decides, the peer obeys. Three rules:
             #  * seed must be concrete and SHARED -- seed=None would leave each rank drawing its
