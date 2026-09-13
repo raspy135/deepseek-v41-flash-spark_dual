@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from engram import EngramTable, prefetch_rows
+from engram import EngramReadAhead, EngramTable, prefetch_rows
 
 
 class Table:
@@ -56,6 +56,45 @@ class Prefetch(unittest.TestCase):
     def test_read_failure_propagates_and_joins_peer(self):
         with self.assertRaisesRegex(OSError, 'read failure'):
             self.run_case(fail=True)
+
+
+class ReadAhead(unittest.TestCase):
+    class Table:
+        def read_raw(self, hashes):
+            return hashes.copy(), None, None
+
+        def to_device(self, raw, _inv, _shape):
+            return raw
+
+    def test_irregular_image_spans_use_exact_boundaries(self):
+        # The 140-token middle span is the shape from the small-image failure. The old scheduler
+        # sliced 2048 rows at start=2048 and handed them to a 140-token forward.
+        spans = [(0, 2048), (2048, 2188), (2188, 4236), (4236, 5000)]
+        hashes = np.arange(5000 * 2 * 24).reshape(5000, 2, 24)
+        tables = {1: self.Table(), 14: self.Table()}
+        with ThreadPoolExecutor(4) as pool:
+            ra = EngramReadAhead(tables, pool, [1, 14], hashes, spans, depth=2)
+            try:
+                for s, e in spans:
+                    rows = ra.rows_for(s)
+                    for li, layer in enumerate((1, 14)):
+                        got = rows(layer, torch.from_numpy(hashes[s:e, li]))
+                        np.testing.assert_array_equal(got, hashes[s:e, li])
+                    ra.done(s)
+            finally:
+                ra.close()
+
+    def test_forward_length_mismatch_is_loud(self):
+        hashes = np.zeros((20, 1, 24), dtype=np.int64)
+        with ThreadPoolExecutor(1) as pool:
+            ra = EngramReadAhead({1: self.Table()}, pool, [1], hashes,
+                                  [(0, 7), (7, 20)], depth=1)
+            try:
+                rows = ra.rows_for(0)
+                with self.assertRaisesRegex(RuntimeError, 'has 7 rows, forward requested 8'):
+                    rows(1, torch.from_numpy(hashes[:8, 0]))
+            finally:
+                ra.close()
 
 
 class RealRows(unittest.TestCase):

@@ -323,6 +323,34 @@ def build_keep_masks(counts: dict, frac: float, select: str, device, min_per_lay
     return masks, keep
 
 
+def pruned_owned_counts(ranked: list[tuple[int, int]], world: int) -> list[int]:
+    """Number of routable expert pairs assigned to each EP rank."""
+    world = max(1, int(world))
+    return [sum(1 for _layer, expert in ranked if expert % world == rank)
+            for rank in range(world)]
+
+
+def require_pruned_residency(ranked: list[tuple[int, int]], world: int, lru_slots: int,
+                             prune_keep: float, transient_slots: int) -> list[int]:
+    """Reject a pruned configuration unless every routable expert is resident.
+
+    The pruned path is explicitly the all-resident serving mode.  Letting a small tail stream is
+    not merely a performance degradation: a broad prefill can route to more missing experts in
+    one layer than the transient ring can hold.  One EP rank then raises while its peer is already
+    inside an NCCL combine, making the surviving GPU look as if it is looping indefinitely.
+    """
+    owned = pruned_owned_counts(ranked, world)
+    overflow = [(rank, count) for rank, count in enumerate(owned) if count > lru_slots]
+    if overflow:
+        detail = ", ".join(f"rank {rank} needs {count}" for rank, count in overflow)
+        raise RuntimeError(
+            f"pruned all-resident capacity exceeded at keep={prune_keep:.3f}: {detail}, but each "
+            f"rank has {lru_slots} LRU slots ({transient_slots} transient slots reserved). "
+            "Reduce --prune-keep or increase --arena-gb; allowing the tail to stream can exhaust "
+            "the transient ring during prefill and strand the peer in a collective.")
+    return owned
+
+
 PRUNE_DB = os.environ.get("DSV41_PRUNE_DB", "results/prune_demand.npz")
 
 
@@ -664,13 +692,13 @@ class V41Engine:
                 self.store.cb_bits = pol2
                 log(f"simulated 2-bit codebook on {len(pol2)} of {len(ranked)} kept experts "
                     f"(coldest {self.sim_cb2_frac:.0%} per layer); slot size unchanged")
-            n_here = len(ranked)
+            owned_counts = require_pruned_residency(
+                ranked, self.ep.world, self.store.lru_slots, prune_keep,
+                self.store.transient_slots)
+            n_here = owned_counts[self.ep.rank]
             if self.ep.active:
-                n_here = sum(1 for k in ranked if self.ep.owns(*k))
                 log(f"EP2 rank {self.ep.rank}: {n_here} of the {len(ranked)} kept experts are owned here")
             self._kept_here = n_here   # the resident test below needs the real count, see there
-            if n_here > self.store.lru_slots:
-                log(f"WARNING: {n_here} kept experts here > {self.store.lru_slots} LRU slots; the tail will stream")
             log(f"pruned mode ({prune_select}): keep {prune_keep:.2f}, {len(ranked)} experts total "
                 f"({min(per_layer)}-{max(per_layer)} per layer), {len(ranked) * self.expert_bytes / 1e9:.1f} GB")
         else:
@@ -1013,25 +1041,16 @@ class V41Engine:
             min_gain = float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05"))
         ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
         world = max(1, self.ep.world)
-        # Residency is only knowable for THIS rank's half; the peer's is symmetric because both
-        # ranks run the same keep set against the same arena size.
-        resident = set(self.store.lru) if getattr(self.store, "lru", None) is not None else None
         out = []
         for L, msk in self.model_prune_mask.items():
             keep = msk.detach().cpu().numpy().astype(bool)
             score = ranked[L]
             for r in range(world):
                 own = (np.arange(len(keep)) % world) == r
-                # "kept" is ROUTABLE, which is not the same as resident: if the keep set is
-                # larger than the arena's LRU slots the tail streams, and proposing to evict an
-                # expert that was never loaded fails the apply validator and takes the pair down.
-                # Only offer residents as eviction candidates.
+                # Pruned-mode startup guarantees that every kept expert is resident on its owner.
+                # The planner runs only on rank 0 and must still plan BOTH ownership classes; its
+                # local LRU cannot be used to filter rank 1's candidates.
                 kept_own = np.flatnonzero(keep & own)
-                if resident is not None:
-                    kept_own = np.array([e for e in kept_own if (L, int(e)) in resident],
-                                        dtype=kept_own.dtype)
-                    if not len(kept_own):
-                        continue
                 gone_own = np.flatnonzero(~keep & own)
                 if not len(kept_own) or not len(gone_own):
                     continue
@@ -1188,7 +1207,7 @@ class V41Engine:
             s = min(e, P)
         return out
 
-    def _engram_readahead(self, ids, P, engram_mask=None):
+    def _engram_readahead(self, ids, P, engram_mask=None, spans=None):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
 
         Returns None for prompts of a single chunk (nothing to overlap with), when there are no
@@ -1204,8 +1223,12 @@ class V41Engine:
         hashes_t = self.model.hash_state(
             ids[None], 0, None if engram_mask is None else engram_mask[None])[0]   # [P, n_eg, 24]
         self.model.stats["engram_s"] += time.perf_counter() - t0
+        # Use the SAME boundaries as the forward loop. Images deliberately move boundaries so a
+        # span is never split; fixed MAX_CHUNK read-ahead would then hand a short image chunk the
+        # rows for a 2048-token chunk (and engram_forward's reshape would fail).
+        spans = self._prefill_spans(P) if spans is None else spans
         ra = EngramReadAhead(self.tables, self.eg_pool, self.args.engram_layer_ids,
-                             hashes_t.cpu().numpy(), MAX_CHUNK,
+                             hashes_t.cpu().numpy(), spans,
                              depth=int(os.environ.get("DSV41_ENGRAM_DEPTH", "2")))
         ra.hashes_t = hashes_t
         return ra
@@ -1226,7 +1249,8 @@ class V41Engine:
         # is sliced per chunk exactly like them. TEXT is -1, so `>= 0` marks a whole image span.
         tt = getattr(self, "_token_types", None)
         eg_mask = None if tt is None else ~(tt >= 0)
-        ra = self._engram_readahead(ids, P, eg_mask)
+        spans = self._prefill_spans(P)
+        ra = self._engram_readahead(ids, P, eg_mask, spans)
         with ra if ra is not None else nullcontext():
             def _fwd(s, chunk, **kw):
                 if tt is not None:
@@ -1246,13 +1270,13 @@ class V41Engine:
                 # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
                 # (layers 0..20, which is everything that writes global KV), and the decoder half is
                 # replayed once over the last `window_size` prompt tokens.
-                for s, e in self._prefill_spans(P):
+                for s, e in spans:
                     _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
                     m.dspark_seed(mh, s_rep)
             else:
-                for s, e in self._prefill_spans(P):
+                for s, e in spans:
                     chunk = ids[s:e]
                     last = e >= P
                     logits, mh = _fwd(s, chunk, need_logits=last)

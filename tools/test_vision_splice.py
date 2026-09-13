@@ -32,7 +32,7 @@ assert types.numel() == IP.num_image_tokens(n_llm_h, n_llm_w)
 
 # an embedding stream with the image span starting at position 5
 T, DIM = types.numel() + 12, A.dim
-h = torch.zeros(T, DIM, dtype=torch.bfloat16)
+h = torch.zeros(T, DIM, dtype=torch.bfloat16, device=DEV)
 img_in = IP.ImageInput(5, patches, n_vit_h, n_vit_w, types)
 before = h.clone()
 tower.splice(h, [img_in])

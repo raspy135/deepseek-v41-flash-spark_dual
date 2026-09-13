@@ -262,29 +262,55 @@ class EngramReadAhead:
     32-thread pool.
     """
 
-    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2):
+    def __init__(self, tables, pool, layer_ids, hashes_np, spans, depth: int = 2):
         self.tables, self.pool, self.layer_ids = tables, pool, list(layer_ids)
-        self.hashes, self.chunk = hashes_np, chunk
+        self.hashes = hashes_np
         self.depth = max(1, depth)
         self.total = hashes_np.shape[0]
+        self.spans = [(int(s), int(e)) for s, e in spans]
+        if (not self.spans or self.spans[0][0] != 0 or self.spans[-1][1] != self.total
+                or any(s >= e for s, e in self.spans)
+                or any(e != ns for (_s, e), (ns, _ne) in zip(self.spans, self.spans[1:]))):
+            raise ValueError(f"read-ahead spans must tile [0, {self.total}): {self.spans}")
+        self.span_index = {s: i for i, (s, _e) in enumerate(self.spans)}
         self.futures: dict[int, dict] = {}
 
-    def _submit(self, s: int):
-        if s in self.futures or s >= self.total:
+    def _submit(self, span_i: int):
+        if span_i >= len(self.spans):
             return
-        hs = self.hashes[s:s + self.chunk]
+        s, e = self.spans[span_i]
+        if s in self.futures:
+            return
+        hs = self.hashes[s:e]
         self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
                            for li, L in enumerate(self.layer_ids)}
 
     def rows_for(self, s: int):
-        """Ensure chunk `s` and the next `depth-1` chunks are in flight, and return the
-        `get_rows(layer, hashes)` callable `Model.forward` expects for chunk `s`."""
-        for k in range(self.depth):
-            self._submit(s + k * self.chunk)
-        futs = self.futures[s]
+        """Ensure span `s` and the next `depth-1` spans are in flight.
 
-        def get_rows(layer, _hashes):
-            return self.tables[layer].to_device(*futs[layer].result())
+        Image spans move prefill boundaries away from fixed multiples of MAX_CHUNK. Scheduling by
+        those real spans is essential: otherwise a short image-bearing chunk can receive the rows
+        for a full ordinary chunk and fail when engram_forward reshapes them.
+        """
+        try:
+            span_i = self.span_index[s]
+        except KeyError as exc:
+            raise ValueError(f"{s} is not a configured read-ahead span start") from exc
+        for k in range(self.depth):
+            self._submit(span_i + k)
+        futs = self.futures[s]
+        expected = self.spans[span_i][1] - s
+
+        def get_rows(layer, hashes):
+            if hashes.shape[0] != expected:
+                raise RuntimeError(
+                    f"engram read-ahead span {s} has {expected} rows, forward requested "
+                    f"{hashes.shape[0]}")
+            rows = self.tables[layer].to_device(*futs[layer].result())
+            if rows.shape[0] != expected:
+                raise RuntimeError(
+                    f"engram read-ahead span {s} produced {rows.shape[0]} rows, expected {expected}")
+            return rows
 
         return get_rows
 

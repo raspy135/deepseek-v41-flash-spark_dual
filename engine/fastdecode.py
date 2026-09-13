@@ -62,6 +62,9 @@ GRAPH_SEGMENTS = os.environ.get("DSV41_GRAPH_SEGMENTS", "1") == "1"
 # and the self-copy of the block ids. DSV41_LEAN_STEP=0 restores the original sequence exactly; the
 # math is identical either way (the buffers get the same values).
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
+# Context-bucketed sparse-index scoring.  The fallback is intentionally retained for controlled
+# A/Bs and emergency rollback; it restores the old full-max-seq graph shapes exactly.
+INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
 
 
 def _fp32_lin(x, w):
@@ -92,6 +95,27 @@ def _draft_block() -> int:
 
 T_DRAFT = _draft_block()
 T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts
+
+# The graphed indexer needs a fixed key-axis shape, but that shape does not need to be the
+# configured maximum context.  A small floor avoids capturing a new graph every few hundred
+# tokens while powers of two keep the number of resident graph variants logarithmic.
+INDEX_BUCKET_MIN = 4096
+
+
+def _index_bucket(used_tokens: int, max_seq: int) -> int:
+    """Smallest power-of-two token bucket covering ``used_tokens``, capped at ``max_seq``."""
+    if not 0 < used_tokens <= max_seq:
+        raise ValueError(f"index bucket needs 0 < used_tokens <= max_seq ({used_tokens}, {max_seq})")
+    target = max(used_tokens, min(INDEX_BUCKET_MIN, max_seq))
+    bucket = 1 << (target - 1).bit_length()
+    return min(bucket, max_seq)
+
+
+def _index_cache_rows(token_bucket: int, ratio: int, max_rows: int) -> int:
+    """Cache-key rows needed by an uncompressed-token bucket at compression ``ratio``."""
+    if token_bucket <= 0 or ratio <= 0 or max_rows <= 0:
+        raise ValueError((token_bucket, ratio, max_rows))
+    return min(max_rows, (token_bucket + ratio - 1) // ratio)
 
 
 def _lin(x, w):  # bf16 tensor -> cuBLAS; FP8Weight/FP4Weight -> the Triton kernel for that stored format
@@ -138,6 +162,12 @@ class FastDecoder:
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
         self.d_probs = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)
+        # Mode-independent draft constants.  They used to be rebuilt by captured fill/arange
+        # kernels every replay; only element zero of the ids changes with the accepted token.
+        self._d_ids = torch.full((T_DRAFT,), a.dspark_noise_token_id, dtype=torch.long, device=dev)
+        self._d_ar = torch.arange(T_DRAFT, device=dev)
+        self._d_premix0 = torch.zeros(T_DRAFT, a.hc_mult, dtype=torch.float32, device=dev)
+        self._d_premix0[:, 0] = 1.0
         # weights in decode-friendly dtypes (views/copies; small)
         # bf16 tensor, or the FP8Weight / FP4Weight `make_head` produced; `_lin` (= R.dense)
         # dispatches on the object, so the graphs capture the matching kernel either way.
@@ -149,9 +179,11 @@ class FastDecoder:
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
         # constants the lean step reuses instead of rebuilding them per step
         self._ar_t = torch.arange(T, device=dev)
+        self._index_cpos = torch.arange(self._n_cache(1), device=dev)
         self._premix0 = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
         self._premix0[:, 0] = 1.0
         self.graphs = {}
+        self.draft_graphs = None
         self.pool = None
         # resident mode: (layer, expert) -> arena slot as a device table, so the router's expert ids can be
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
@@ -267,7 +299,7 @@ class FastDecoder:
                 latent = R.rmsnorm(_lin(x, w.comp_wkv), w.comp_norm, a.norm_eps)
                 j0 = pos[0]
             nj = latent.size(0)
-            jidx = j0 + torch.arange(nj, device=self.dev)
+            jidx = j0 + self._ar_t[:nj]
             fj = self.m.freqs_c[jidx * r]
             if L in self.W.indexers:
                 iw = self.W.indexers[L]
@@ -288,14 +320,23 @@ class FastDecoder:
         T = x.size(0)
         q = self._rope(_lin(qr, iw.wq_b).view(T, a.index_n_heads, a.index_head_dim), self.m.freqs_c[pos])
         wts = _lin(x, iw.weights_proj).float() * (a.index_head_dim ** -0.5 * a.index_n_heads ** -0.5)
-        k = st["ik"]  # full cache [N, 128]; positions >= compress_lens are masked below
+        # CUDA graphs require a fixed N, but scoring all max_seq rows makes every request pay for
+        # the configured context capacity.  ``index_bucket`` is fixed for one graph variant and
+        # expressed in uncompressed token positions; convert it to this layer's cache rows.  The
+        # exact per-query visibility mask below is still authoritative, so bucket padding cannot
+        # affect which rows are selected.
+        token_bucket = st.get("index_bucket", self.c.max_seq)
+        ratio = st["ratio"]
+        cache_rows = _index_cache_rows(token_bucket, ratio, st["ik"].size(0))
+        k = st["ik"][:cache_rows]
         sc = torch.einsum("thd,nd->thn", q, k)
         score = (sc.float().relu_() * wts[:, :, None]).sum(dim=1)  # [T, N]
-        cpos = torch.arange(score.size(1), device=self.dev)
+        cpos = self._index_cpos[:score.size(1)]
         score.masked_fill_(cpos[None, :] >= compress_lens[:, None], float("-inf"))
         if L == a.candidate_source_layer:
-            self.candidates.copy_(M.Model._select_candidates(score, compress_lens, a.candidate_topk_blocks,
-                                                             a.candidate_block_size)[:, :self.candidates.size(1)])
+            selected = M.Model._select_candidates(score, compress_lens, a.candidate_topk_blocks,
+                                                   a.candidate_block_size)
+            self.candidates[:, :score.size(1)].copy_(selected)
         elif 0 <= a.candidate_source_layer < L:
             score = score.masked_fill(~self.candidates[:, :score.size(1)], float("-inf"))
         idx = score.topk(a.index_topk, dim=-1, sorted=False).indices.sort(dim=-1).values
@@ -402,15 +443,15 @@ class FastDecoder:
             kv = self._rope(R.rmsnorm(_lin(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
             self.c.mtp_win[k][self.pos % M.RING] = kv
 
-    def _draft(self):
+    def _draft(self, greedy: bool):
         """DSpark draft: 5 positions after d_last; gumbel-max sampling with self.d_noise (temperature in d_temp,
-        0 => argmax)."""
+        or argmax in the separately captured greedy graph)."""
         a = self.a
-        ids = torch.full((T_DRAFT,), a.dspark_noise_token_id, dtype=torch.long, device=self.dev)
+        ids = self._d_ids
         ids[0] = self.d_tok[0]
         h = self.W.embed[ids].unsqueeze(1).repeat(1, a.hc_mult, 1)
-        pre_mix = torch.zeros(T_DRAFT, a.hc_mult, device=self.dev); pre_mix[:, 0] = 1.0
-        pos = self.d_last[0] + 1 + torch.arange(T_DRAFT, device=self.dev)
+        pre_mix = self._d_premix0
+        pos = self.d_last[0] + 1 + self._d_ar
         for k, w in enumerate(self.W.mtp):
             residual = h
             attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
@@ -433,18 +474,33 @@ class FastDecoder:
         x = R.rmsnorm(R.hc_pre(h, pre_mix), w.norm, a.norm_eps)
         logits = _lin(x, self.head_bf16).float()  # [T_DRAFT, V]
         prev = self.d_tok[0]
-        temp = self.d_temp[0]
         for i in range(T_DRAFT):
             bias = _lin(self.markov_embed_bf16[prev.view(1)], self.markov_head_bf16).float()[0]  # 1-d index: a 0-d tensor index syncs
             lg = logits[i] + bias
-            greedy = lg.argmax()
-            p = torch.softmax(lg / temp.clamp_min(1e-5), dim=-1)
-            sampled = (torch.log(p.clamp_min(1e-30)) + self.d_noise[i]).argmax()
-            nxt = torch.where(temp > 0, sampled, greedy)
-            onehot = torch.zeros_like(p).scatter_(0, greedy.view(1), 1.0)
-            self.d_probs[i].copy_(torch.where(temp > 0, p, onehot))
+            if greedy:
+                # Greedy verification never reads q=d_probs.  Avoid five vocabulary-wide
+                # softmax/log/Gumbel passes that the old dynamic torch.where computed anyway.
+                nxt = lg.argmax()
+            else:
+                temp = self.d_temp[0]
+                p = torch.softmax(lg / temp.clamp_min(1e-5), dim=-1)
+                nxt = (torch.log(p.clamp_min(1e-30)) + self.d_noise[i]).argmax()
+                self.d_probs[i].copy_(p)
             self.d_out[i] = nxt
             prev = nxt
+
+    def _capture_draft_graphs(self):
+        """Capture one graph per sampling mode; neither mode pays for the other's dead branch."""
+        if self.draft_graphs is not None:
+            return self.draft_graphs
+        out = []
+        for greedy in (True, False):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.pool):
+                self._draft(greedy)
+            out.append(graph)
+        self.draft_graphs = tuple(out)
+        return self.draft_graphs
 
     def build_lut(self):
         """Device slot table from the store's LRU. Only valid while no expert is evicted/loaded; the
@@ -536,17 +592,17 @@ class FastDecoder:
                 "mean": sum(per) / len(per), "total": sum(per)}
 
     # ------------------------------------------------------------------ capture
-    def capture(self, S_parity: int):
-        """Capture the per-layer graphs for a step whose start position has the given parity (the
-        ratio-2 compressor grouping depends on it). Two captures per process at most."""
+    def capture(self, S_parity: int, index_bucket: int):
+        """Capture graphs for one start parity and fixed indexer context bucket."""
         if not self.use_graphs:
             return
-        key = S_parity
+        key = (S_parity, index_bucket)
         if key in self.graphs:
             return
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
-        st = {"parity": S_parity, "ckv": None, "ik": None, "ratio": 0}
+        st = {"parity": S_parity, "index_bucket": index_bucket,
+              "ckv": None, "ik": None, "ratio": 0}
         gA, gB = [], []
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -555,11 +611,12 @@ class FastDecoder:
             saved = [self.h.clone(), self.pre_mix.clone()]
             for L in range(self.a.n_layers):
                 self._layer_a(L, st); self._layer_b(L)
-            self._final(); self._draft()
+            self._final(); self._draft(True); self._draft(False)
             self.h.copy_(saved[0]); self.pre_mix.copy_(saved[1])
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        st = {"parity": S_parity, "ckv": None, "ik": None, "ratio": 0}
+        st = {"parity": S_parity, "index_bucket": index_bucket,
+              "ckv": None, "ik": None, "ratio": 0}
         if self.lut is not None and GRAPH_SEGMENTS:
             # Resident mode: routing is a device LUT lookup, so the ONLY host dependency inside a
             # step is the Engram rows of layers 1 and 14. Capture the layers between those
@@ -577,9 +634,7 @@ class FastDecoder:
                     if hi == self.a.n_layers:
                         self._final()  # the head + drafter seeding ride in the last segment
                 segs.append((lo, g))
-            gD = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(gD, pool=self.pool):
-                self._draft()
+            gD = self._capture_draft_graphs()
             self.graphs[key] = (None, None, None, gD, segs)
             torch.cuda.synchronize()
             return
@@ -601,9 +656,7 @@ class FastDecoder:
         gF = torch.cuda.CUDAGraph()
         with torch.cuda.graph(gF, pool=self.pool):
             self._final()
-        gD = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(gD, pool=self.pool):
-            self._draft()
+        gD = self._capture_draft_graphs()
         self.graphs[key] = (gA, gB, gF, gD, None)
         torch.cuda.synchronize()
 
@@ -639,15 +692,18 @@ class FastDecoder:
             self.h.copy_(self.W.embed[self.ids].unsqueeze(1).repeat(1, a.hc_mult, 1))
             self.pre_mix.zero_(); self.pre_mix[:, 0] = 1.0
         parity = S % 2
+        index_bucket = (_index_bucket(S + T_VERIFY, self.c.max_seq)
+                        if INDEX_BUCKETS else self.c.max_seq)
+        graph_key = (parity, index_bucket)
         self.prepare_pending_buffers()
-        if not LEAN_STEP or parity not in self.graphs:
-            self.capture(parity)
+        if not LEAN_STEP or graph_key not in self.graphs:
+            self.capture(parity, index_bucket)
             self.prepare_pending_buffers()  # capture's warm-up/capture runs overwrite the buffers
         t0 = time.perf_counter()
         futs = rows_fn() if rows_fn is not None else None  # {layer: Future} -- reads already in flight
         _ev_layers = self._ev_begin("layers")
         if self.use_graphs:
-            gA, gB, gF, gD, segs = self.graphs[parity]
+            gA, gB, gF, gD, segs = self.graphs[graph_key]
             if segs is not None:
                 for lo, g in segs:
                     if futs is not None and lo in futs:
@@ -677,7 +733,8 @@ class FastDecoder:
             if futs is not None:
                 for LL, (f, finish) in futs.items():
                     self.eg_rows[LL].copy_(finish(*f.result()))
-            st = {"parity": parity, "ckv": None, "ik": None, "ratio": 0}
+            st = {"parity": parity, "index_bucket": index_bucket,
+                  "ckv": None, "ik": None, "ratio": 0}
             for L in range(a.n_layers):
                 self._layer_a(L, st); self._resolve(L); self._layer_b(L)
             self._final()
@@ -701,15 +758,16 @@ class FastDecoder:
 
     def draft(self, tok: int, last_main_pos: int, temperature: float):
         self.d_tok.fill_(tok); self.d_last.fill_(last_main_pos); self.d_temp.fill_(temperature)
-        if temperature > 0:
+        greedy = temperature <= 0
+        if not greedy:
             u = torch.rand_like(self.d_noise).clamp_min(1e-30)
             self.d_noise.copy_(-torch.log(-torch.log(u)))
         t0 = time.perf_counter()
         _ev_draft = self._ev_begin("draft")
         if self.use_graphs and self.graphs:
-            self.graphs[next(iter(self.graphs))][3].replay()
+            self.graphs[next(iter(self.graphs))][3][0 if greedy else 1].replay()
         else:
-            self._draft()
+            self._draft(greedy)
         if _ev_draft is not None:
             _ev_draft.record()
         self.stats["draft_s"] += time.perf_counter() - t0

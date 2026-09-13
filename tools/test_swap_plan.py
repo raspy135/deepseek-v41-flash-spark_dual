@@ -28,6 +28,10 @@ stub = types.SimpleNamespace(
     _prune_trace=trace,
     model_prune_mask=mask,
     ep=types.SimpleNamespace(world=WORLD, rank=0),
+    # A real rank-0 arena contains only even experts.  Planning still has to cover odd experts:
+    # rank 0 sends one global plan to rank 1, which applies its own half.
+    store=types.SimpleNamespace(lru={(L, int(e)): 1 for L, m in mask.items()
+                                     for e in torch.where(m)[0].tolist() if e % WORLD == 0}),
     model=types.SimpleNamespace(
         prune_miss_report=lambda: ({}, torch.tensor(demand), torch.tensor(demand))),
 )
@@ -40,6 +44,11 @@ assert swaps, "planner produced nothing on a DB that clearly disagrees with the 
 bad = [(L, o, i) for L, o, i, _ in swaps if (o % WORLD) != (i % WORLD)]
 print(f"1. swaps crossing ownership classes: {len(bad)}  (must be 0)")
 assert not bad
+
+# 1b. rank 0 is the sole planner, so the plan must cover both ranks despite its local-only LRU.
+owners = {o % WORLD for _L, o, _i, _g in swaps}
+print(f"1b. ownership classes represented: {sorted(owners)}  (must be [0, 1])")
+assert owners == set(range(WORLD))
 
 # 2. every swap is a strict improvement, and they are ordered best-first
 gains = [g for *_x, g in swaps]
