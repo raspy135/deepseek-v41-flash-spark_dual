@@ -362,7 +362,7 @@ class Model:
         ep = getattr(store, "ep", None)
         self._ep_comm_stream = (torch.cuda.Stream(device=self.dev)
                                 if (torch.cuda.is_available() and getattr(ep, "active", False)
-                                    and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "1") == "1")
+                                    and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
                                 else None)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
@@ -822,7 +822,7 @@ class Model:
             _mark("moe_kernel")
             tc = time.perf_counter()
             ep_overlap = (prefill and y.size(0) > 16 and self._ep_comm_stream is not None
-                          and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "1") == "1")
+                          and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
             if ep_overlap:
                 ep_work = store.ep.combine_async(routed, self._ep_comm_stream)
             else:
