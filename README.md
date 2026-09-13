@@ -117,7 +117,6 @@ in `env.example` differs where noted, and `/health` reports what is actually liv
 | `WORLD_SIZE` | `1` | `2` splits routed experts `expert % 2 == rank`; everything else is replicated |
 | `DSV41_ENGRAM_ROW_SPLIT` | `0` (profile `1`) | each rank reads half the Engram rows; one all-reduce rebuilds the union |
 | `DSV41_ENGRAM_SPLIT_MIN` | `4096` | rows below which a gather stays local — a 144-row decode gather is not worth a collective |
-| `DSV41_TP_DENSE` | `0` | tensor-parallel shared experts. **Measured slower** (19.6 → 14.4 tok/s); kept as the base for attention sharding |
 | `DSV41_DIST_TIMEOUT_S` | `600` | process-group timeout; `DSV41_EP_PING_S` keeps an idle pair inside it |
 
 > **These must match on both ranks.** A rank that computes differently from its peer does not
@@ -153,17 +152,10 @@ in `env.example` differs where noted, and `/health` reports what is actually liv
 
 | knob | default | what it does |
 |---|---|---|
-| `DSV41_BLOCK` | `5` | drafted tokens per verify block (odd). **Raising it measures worse** — more tokens reach more *distinct* experts, and the DSpark head is trained at 5. The graph-capturable routing path caps it at 9 |
+| `DSV41_BLOCK` | `5` | drafted tokens per verify block (odd). The DSpark head is trained at 5; raising it reaches more *distinct* experts per step and measured slower here |
 | `DSV41_VISION` | `1` | load the ViT + aligner |
 
-**Measured and rejected**, left in so nobody re-derives them — numbers in `docs/gotchas.md`.
-
-| knob | verdict |
-|---|---|
-| `DSV41_TP_DENSE=1` | 27 % slower decode; the step is not bandwidth-bound where it was assumed to be |
-| `DSV41_PREFILL_EP_OVERLAP=1` | crashes rank 1 with a device-side assert |
-| `DSV41_ENGRAM_PINNED=1` | works, cuts the Engram wait 58 → 11 ms/step, and the decode rate does not move |
-| `DSV41_BLOCK=9` | GPU utilization improves, throughput falls 27 % |
+The engine carries other switches that are experimental, half-finished or measured harmful, and they are deliberately not listed here — they are default-off, and the ones worth knowing about are written up with their numbers in [`docs/gotchas.md`](docs/gotchas.md).
 
 **Instrumentation**, all default `0` and cheap: `DSV41_STEP_TIMING` (per-phase decode table),
 `DSV41_GPU_TIMING` (GPU-timeline ms per step), `DSV41_ATTN_TIMING` (prefill attention phases),
@@ -275,18 +267,12 @@ only 0.18–0.31) and the whole design log are in [NOTES.md](NOTES.md) §0.6–0
 
 ## Two ways to run it
 
-> **In this fork there is one way: the containers, on both boxes** (`scripts/dual-up.sh`). The
-> section below is upstream's, kept because the prerequisites and the venv are still what the
-> tests and the profiling tools need — but `start.sh`/`stop.sh` are gone, so the "native" path
-> now means "a venv to run `engine/profile_fast.py` and the test scripts in", not a way to serve.
+Both are the same server and both read the same `./.env` (copy [`env.example`](env.example)).
+[`docs/install.md`](docs/install.md) compares them and lists the host prerequisites — GB10 /
+`sm_121a`, a CUDA 13 driver, ≥ 600 GB free on **local NVMe**, and the box essentially to
+itself.
 
-Both read the same `./.env` (copy [`env.example`](env.example)).
-[`docs/install.md`](docs/install.md) lists the host prerequisites — GB10 / `sm_121a`, a CUDA 13
-driver, ≥ 600 GB free on **local NVMe**, and the box essentially to itself. For the pair, that is
-every prerequisite **twice**: each box needs its own local copy of the 510 GB checkpoint, because
-the engine reads experts with `O_DIRECT` and that does not cross a network filesystem.
-
-### Native — a venv on the box (upstream's serving path; this fork uses it only for tests/tools)
+### Native — a venv on the box (this is the path every number above came from)
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
@@ -295,19 +281,16 @@ pip install "transformers>=4.57" "tokenizers>=0.21" "safetensors>=0.5" numpy sym
 
 cp env.example .env                  # set MODEL_DIR and PYTHON
 MODEL_DIR=./models/DeepSeek-V4.1-Flash ./scripts/download-model.sh    # 510 GB, resumable
+./start.sh                           # nohup server/app.py --engine v41; waits for /health
+./start.sh --no-wait                 # start and return; tail logs/server.log yourself
+./stop.sh                            # SIGTERM -> SIGKILL -> wait for the memory to come back
 ```
-
-> **This fork removed `start.sh`/`stop.sh`.** The venv above is still what the tests and the
-> profiling tools (`engine/profile_fast.py`, `engine/profile_batch2.py`) run in, but the server
-> itself is started with `scripts/dual-up.sh` / `scripts/dual-down.sh`. The paragraphs below
-> describe upstream's native launcher and are kept for context.
 
 `triton` arrives as a dependency of `torch` from the cu130 index and must not be replaced with
 a PyPI build — the FP4 MoE kernel is JIT-compiled against whichever Triton is installed.
 
-Upstream's `start.sh` refused to start if the port was taken or if less than `MIN_FREE_GIB`
-(90) was available, and named the processes and containers holding the pool; `scripts/dual-up.sh`
-runs the same checks on *both* boxes before either container starts. The health wait is 20
+`start.sh` refuses to start if the port is taken or if less than `MIN_FREE_GIB` (90) is
+available, and names the processes and containers holding the pool. The health wait is 20
 minutes on purpose: the warm start fills the resident FP4 expert arena from NVMe *before* the
 socket is bound, ranked by the newest `results/trace-*/stats/coverage.json` it can find. A
 server that is not answering at minute 5 is normal.
@@ -431,11 +414,11 @@ HTTP range requests. Serving needs all of it.
 ## Layout
 
 ```
-scripts/dual-*.sh     build / up / down for the EP2 pair: preflight on both boxes, one image
+start.sh / stop.sh    native launcher: memory and port guards, nohup + pidfile, health wait
 run.sh                container dispatcher: setup | serve | logs | stop | shell | bench | config
 compose.yaml          loopback-only service, /models bind mount, unified-memory ulimits
 Dockerfile            arm64 CUDA-13 devel base, torch cu130 + triton; weights mounted, never baked
-scripts/              entrypoint.sh (the container's launcher) · download-model.sh (510 GB, resumable)
+scripts/              entrypoint.sh (the container's start.sh) · download-model.sh (510 GB, resumable)
 env.example           every knob, for both paths
 engine/               the serving engine: v41_engine.py (generation loop, DSpark, arena + NVMe
                       store) · model.py · experts.py · engram.py
