@@ -98,11 +98,20 @@ if torch.cuda.is_available():
         tt.pinned = False
         want = tt.to_device(raw, inv, shape).clone()
         tt.pinned = True
+        # Allocate the staging buffers the way the engine does -- inside inference_mode. Buffers
+        # created there are inference tensors and cannot be written from outside it, which took the
+        # server down the first time this path ran for real.
+        with torch.inference_mode():
+            tt.to_device(raw, inv, shape)
         for k in range(4):      # >2 calls, so both stage buffers are reused at least once
             got = tt.to_device(raw, inv, shape).clone()
             torch.cuda.synchronize()
             assert torch.equal(got, want), f"pinned call {k} differs from pageable"
-        print(f"pinned == pageable over 4 calls, {tuple(want.shape)} {want.dtype}")
+        with torch.inference_mode():
+            got = tt.to_device(raw, inv, shape).clone()
+        assert torch.equal(got, want), "pinned differs when called under inference_mode"
+        print(f"pinned == pageable over 6 calls, in and out of inference_mode, "
+              f"{tuple(want.shape)} {want.dtype}")
     except torch.OutOfMemoryError:
         print("pinned check SKIPPED: no free GPU memory (is the server up?)")
 else:

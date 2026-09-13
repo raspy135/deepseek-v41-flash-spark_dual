@@ -223,8 +223,16 @@ class EngramTable:
             self._cur ^= 1  # two buffers: the wait is on the copy from two calls ago
             if self._stage[i] is None or self._stage[i].shape[0] < n:
                 cap = max(n, 4096)
-                self._stage[i] = torch.empty(cap, 264, dtype=torch.uint8, pin_memory=True)
-                self._inv_stage[i] = torch.empty(cap * 64, dtype=torch.int64, pin_memory=True)
+                # inference_mode(False) around the ALLOCATION, not the copy. A tensor created
+                # inside inference mode is an "inference tensor" and can never be mutated outside
+                # it -- and this runs inside generate()'s inference_mode while the copy below can
+                # reach it from elsewhere, so allocating here raised
+                #   RuntimeError: Inplace update to inference tensor outside InferenceMode
+                # on the first real use. A normal tensor can be written from either context, which
+                # is what a buffer reused across calls has to be.
+                with torch.inference_mode(False):
+                    self._stage[i] = torch.empty(cap, 264, dtype=torch.uint8, pin_memory=True)
+                    self._inv_stage[i] = torch.empty(cap * 64, dtype=torch.int64, pin_memory=True)
                 self._ev[i] = torch.cuda.Event()
                 self._ev[i].record()
             self._ev[i].synchronize()  # the last H2D out of these buffers is done
