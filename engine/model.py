@@ -856,8 +856,8 @@ class Model:
             # staying fluent enough to look like a sampling quirk. tools/fp4_moe.py.
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
                                  slots_repeat=True,
-                                 null_slot=(store.null_slot if prefill and
-                                            os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1" else -1),
+                                 null_slot=(store.null_slot if (not prefill or
+                                            os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1") else -1),
                                  **route_args)
             # Split the combine off on the GPU timeline. The host timer below (ep_s) measures the
             # LAUNCH -- dist.all_reduce is async on CUDA -- which is why it reports ~0.25 ms for a

@@ -426,7 +426,8 @@ class FastDecoder:
             # The all-reduce is captured into this graph -- Gate G1 (scripts/gate_g1_graph_nccl.py)
             # verified NCCL collectives capture and replay correctly on these two boxes.
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit,
-                                out_dtype=torch.float32, slots_repeat=True)
+                                out_dtype=torch.float32, slots_repeat=True,
+                                null_slot=store.null_slot)
             store.ep.combine(out)
             out = out.to(torch.bfloat16).float()
         else:

@@ -522,29 +522,40 @@ def moe_forward(
     same point the single-node path does. Default unchanged: every existing caller gets bf16.
 
     `slots_repeat=True` says many (token, k) pairs may land on ONE slot -- true under expert
-    parallel, where every non-owned expert shares the null slot. It only affects the decode-sized
-    path, where it raises BM to 64. That is provably safe rather than merely bigger: this path runs
-    only when P <= 64, and a slot cannot hold more pairs than there are pairs, so BM = 64 >= P > rank
-    always. See build_routing_small's HARD INVARIANT. Default False keeps the single-box BM (and the
-    sweep-tuned configs) exactly as they were."""
+    parallel, where every non-owned expert shares the null slot. When `null_slot` is known, the
+    decode router gives those zero-contribution pairs distinct temporary keys and maps them back to
+    the null slot after grouping. Real experts can then use the sweep-tuned BM=16 without the null
+    run overflowing its one block. Without `null_slot`, the conservative BM=64 fallback remains.
+    See build_routing_small's HARD INVARIANT. Default False keeps the single-box path unchanged."""
     # null_slot must denote a known zero expert, never an ordinary arena slot.
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     assert weights.shape == (T, K)
     P = T * K
     dev = x.device
-    BM = block_m or (64 if (slots_repeat and P <= 64) else _pick_bm(P))
+    split_decode_null = slots_repeat and null_slot >= 0 and P <= 64
+    BM = block_m or (64 if (slots_repeat and P <= 64 and not split_decode_null) else _pick_bm(P))
     bn1, nw1, ns1 = up_cfg or (_UP_CFG_SCALED if DOT_SCALED else _UP_CFG)[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
     if routing_ids is not None and P > 64:
         assert routing_slot_map is not None and routing_ids.shape == slots.shape
         block_slot, block_pair, NB = build_routing(routing_ids, routing_slot_map.numel(), BM, precount=True)
         block_slot = torch.where(block_slot >= 0, routing_slot_map[block_slot.clamp_min(0)], block_slot)
-    elif P <= 64:  # decode-sized call. build_routing_small needs BM >= the longest per-slot run:
-        # distinct top-k picks give <= T <= 6 on one box, but EP2's shared null slot does not --
-        # hence slots_repeat, which lifts BM to 64 >= P. build_routing (below) pads long runs
-        # across multiple blocks itself, so the prefill path was never exposed to this.
-        block_slot, block_pair, NB = build_routing_small(slots, BM)
+    elif P <= 64:  # decode-sized call. build_routing_small needs BM >= the longest per-slot run.
+        route_slots = slots
+        if split_decode_null:
+            # Every real expert appears at most T times because a token's top-k is distinct, hence
+            # BM=16 is safe for it. The shared EP null slot can appear ~P/world times. Give each
+            # null pair a unique, out-of-arena routing key so no run can overflow its block, then
+            # map those block ids back to NULL_SLOT for the kernels: up returns immediately and
+            # down writes the corresponding `parts` row as exact zero. Shapes stay static and all
+            # operations are CUDA-graph capturable.
+            pair = torch.arange(P, dtype=torch.int32, device=dev).view_as(slots)
+            route_slots = torch.where(slots == null_slot, null_slot + 1 + pair, slots)
+        block_slot, block_pair, NB = build_routing_small(route_slots, BM)
+        if split_decode_null:
+            block_slot = torch.where(block_slot > null_slot,
+                                     torch.full_like(block_slot, null_slot), block_slot)
     else:
         # Compact the call's slot ids before routing. build_routing's cost tracks `n_slots` -- it
         # reserves and scans block space per ARENA slot -- not the number of experts this call

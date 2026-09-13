@@ -75,15 +75,20 @@ def main() -> int:
     ref = K.moe_forward_reference(x, slots, w, arena, 10.0).float()
 
     bad = K.moe_forward(x, slots, w, arena, 10.0).float()                      # old behaviour
-    good = K.moe_forward(x, slots, w, arena, 10.0, slots_repeat=True).float()  # fixed
-    e_bad, e_good = rel_err(bad, ref), rel_err(good, ref)
+    good = K.moe_forward(x, slots, w, arena, 10.0, slots_repeat=True).float()  # safe BM=64 fallback
+    fast = K.moe_forward(x, slots, w, arena, 10.0, slots_repeat=True,
+                         null_slot=null_slot).float()                          # skip null, tuned BM=16
+    e_bad, e_good, e_fast = rel_err(bad, ref), rel_err(good, ref), rel_err(fast, ref)
     print(f"  slots_repeat=False : rel err vs reference = {e_bad:.4f}")
     print(f"  slots_repeat=True  : rel err vs reference = {e_good:.4f}")
+    print(f"  null-slot split    : rel err vs reference = {e_fast:.4f}")
 
     ok = True
     # The fixed path should differ from the reference only by FP4-kernel-vs-bf16-GEMM noise.
     if e_good > 0.05:
         print(f"FAIL: slots_repeat=True still disagrees with the reference ({e_good:.4f})"); ok = False
+    if e_fast > 0.05:
+        print(f"FAIL: null-slot split disagrees with the reference ({e_fast:.4f})"); ok = False
     # And the invariant must actually have been violated, or this test proves nothing.
     if n_remote <= K._pick_bm(P):
         print(f"FAIL: only {n_remote} pairs on the null slot; not an overflow, test is not exercising the bug")
@@ -103,6 +108,16 @@ def main() -> int:
         K.moe_forward(x, slots, w, arena, 10.0, slots_repeat=True)
     except AssertionError as e:
         print(f"FAIL: the fixed path tripped its own check: {e}"); ok = False
+    finally:
+        os.environ.pop("DSV41_CHECK_ROUTING", None)
+
+    # The optimized route must also be safe under the expensive diagnostic assertion: its
+    # temporary null keys are unique, while every real slot has at most T pairs.
+    os.environ["DSV41_CHECK_ROUTING"] = "1"
+    try:
+        K.moe_forward(x, slots, w, arena, 10.0, slots_repeat=True, null_slot=null_slot)
+    except AssertionError as e:
+        print(f"FAIL: null-slot split tripped the collision check: {e}"); ok = False
     finally:
         os.environ.pop("DSV41_CHECK_ROUTING", None)
 
