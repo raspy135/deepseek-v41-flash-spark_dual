@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import mmap
 import struct
 import sys
 import time
@@ -35,7 +36,25 @@ class EngramTable:
         self.n_rows = w["shape"][0]
         self.fd = os.open(self.path, os.O_RDONLY)
         os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
-        self.pool = ThreadPoolExecutor(threads)
+        # Row gather over a memmap instead of a Python loop of preads. The loop cost ~12 us/row
+        # even fully warm in page cache (two syscalls plus ~10 bytecode ops per row, and the GIL
+        # kept the thread pool from helping): 83k rows/s warm, 47k cold. Fancy-indexing a memmap
+        # does the whole gather in C and lets page faults do the I/O -- 8.9M rows/s warm, 891k
+        # cold, byte-identical output. DSV41_ENGRAM_MMAP=0 restores the pread path.
+        self.mmap_rows = os.environ.get("DSV41_ENGRAM_MMAP", "1") == "1"
+        self.w_mm = self.s_mm = None
+        if self.mmap_rows:
+            self.w_mm = np.memmap(self.path, dtype=np.uint8, mode="r",
+                                  offset=self.w_off, shape=(self.n_rows, 256))
+            self.s_mm = np.memmap(self.path, dtype=np.uint8, mode="r",
+                                  offset=self.s_off, shape=(self.n_rows, 8))
+            for mm in (self.w_mm, self.s_mm):   # no readahead: every row lands on its own page
+                try:
+                    mm._mmap.madvise(mmap.MADV_RANDOM)
+                except (AttributeError, OSError):
+                    pass
+        self.gather_threads = int(os.environ.get("DSV41_ENGRAM_GATHER_THREADS", "64"))
+        self.pool = ThreadPoolExecutor(max(threads, self.gather_threads if self.mmap_rows else 0))
         self.device = device
         self.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         # small process-local row cache (exact n-gram repeats inside a conversation hit here)
@@ -64,6 +83,27 @@ class EngramTable:
             out[i] = np.frombuffer(b, np.uint8)
         return out
 
+    def _gather_rows(self, ids: np.ndarray) -> np.ndarray:
+        """Parallel memmap gather of the unique rows. Page faults do the I/O, so the threads are
+        blocked in the kernel rather than fighting over the GIL."""
+        out = np.empty((len(ids), 264), np.uint8)
+        nt = max(1, self.gather_threads)
+        step = max(1024, len(ids) // nt + 1)
+
+        def one(i):
+            sl = slice(i, min(i + step, len(ids)))
+            rows = ids[sl]
+            out[sl, :256] = self.w_mm[rows]
+            out[sl, 256:] = self.s_mm[rows]
+
+        starts = range(0, len(ids), step)
+        if len(ids) <= step:
+            for i in starts:
+                one(i)
+        else:
+            list(self.pool.map(one, starts))
+        return out
+
     def read_raw(self, hashes_np: np.ndarray):
         """Host-only part (safe in a background thread: no CUDA calls): NVMe reads of the unique rows.
         hashes_np: int64 [T, 24]. Returns (raw uint8 [n, 264], inv, shape)."""
@@ -71,9 +111,12 @@ class EngramTable:
         flat = hashes_np.reshape(-1)
         uniq, inv = np.unique(flat, return_inverse=True)
         n = len(uniq)
-        chunk = max(8, n // (self.pool._max_workers * 2) + 1)
-        parts = list(self.pool.map(self._read_rows, [uniq[i:i + chunk] for i in range(0, n, chunk)]))
-        raw = np.concatenate(parts) if parts else np.empty((0, 264), np.uint8)
+        if self.mmap_rows:
+            raw = self._gather_rows(uniq)
+        else:
+            chunk = max(8, n // (self.pool._max_workers * 2) + 1)
+            parts = list(self.pool.map(self._read_rows, [uniq[i:i + chunk] for i in range(0, n, chunk)]))
+            raw = np.concatenate(parts) if parts else np.empty((0, 264), np.uint8)
         self.stats["read_s"] = self.stats.get("read_s", 0.0) + time.perf_counter() - t1
         self.stats["rows"] += int(n); self.stats["calls"] += 1
         return raw, inv, hashes_np.shape
@@ -123,11 +166,14 @@ class EngramTable:
         flat = hashes.reshape(-1).cpu().numpy()
         uniq, inv = np.unique(flat, return_inverse=True)
         n = len(uniq)
-        chunk = max(8, n // (self.pool._max_workers * 2) + 1)
         t1 = time.perf_counter()
-        parts = list(self.pool.map(self._read_rows, [uniq[i:i + chunk] for i in range(0, n, chunk)]))
+        if self.mmap_rows:
+            raw = self._gather_rows(uniq)
+        else:
+            chunk = max(8, n // (self.pool._max_workers * 2) + 1)
+            parts = list(self.pool.map(self._read_rows, [uniq[i:i + chunk] for i in range(0, n, chunk)]))
+            raw = np.concatenate(parts) if parts else np.empty((0, 264), np.uint8)
         self.stats["read_s"] = self.stats.get("read_s", 0.0) + time.perf_counter() - t1
-        raw = np.concatenate(parts) if parts else np.empty((0, 264), np.uint8)
         raw = torch.from_numpy(raw).to(self.device)
         vals = raw[:, :256].view(torch.float8_e4m3fn).float()
         scales = torch.exp2(raw[:, 256:].float() - 127.0)
@@ -154,6 +200,66 @@ def prefetch_rows(tables, pool, hashes, layer_ids):
         # Workers must finish before the next request resets counters/caches,
         # including when a forward fails before reaching the second table.
         wait(list(futures.values()))
+
+
+class EngramReadAhead:
+    """Cross-chunk read-ahead for the engram tables.
+
+    `prefetch_rows` submits a chunk's reads at the top of that chunk's OWN forward, and
+    `engram_layer_ids` starts at layer 1 -- so only layer 0's GPU work, ~25 ms of a ~1.5 s
+    chunk, is available to hide what can be ~1 s of random NVMe reads. Prefill over text
+    with novel n-grams therefore alternates roughly 1 s busy / 1 s idle, and the effect is
+    invisible to any benchmark whose prompt repeats (a repeated template collapses to a
+    handful of unique hashes, which the row cache serves for free).
+
+    The hashes depend on the token ids alone, so the whole prompt can be hashed up front and
+    chunk k+1's reads submitted while chunk k is still on the GPU. `depth` chunks are kept in
+    flight, which both hides the latency and keeps the NVMe queue deep enough to be worth the
+    32-thread pool.
+    """
+
+    def __init__(self, tables, pool, layer_ids, hashes_np, chunk: int, depth: int = 2):
+        self.tables, self.pool, self.layer_ids = tables, pool, list(layer_ids)
+        self.hashes, self.chunk = hashes_np, chunk
+        self.depth = max(1, depth)
+        self.total = hashes_np.shape[0]
+        self.futures: dict[int, dict] = {}
+
+    def _submit(self, s: int):
+        if s in self.futures or s >= self.total:
+            return
+        hs = self.hashes[s:s + self.chunk]
+        self.futures[s] = {L: self.pool.submit(self.tables[L].read_raw, hs[:, li, :])
+                           for li, L in enumerate(self.layer_ids)}
+
+    def rows_for(self, s: int):
+        """Ensure chunk `s` and the next `depth-1` chunks are in flight, and return the
+        `get_rows(layer, hashes)` callable `Model.forward` expects for chunk `s`."""
+        for k in range(self.depth):
+            self._submit(s + k * self.chunk)
+        futs = self.futures[s]
+
+        def get_rows(layer, _hashes):
+            return self.tables[layer].to_device(*futs[layer].result())
+
+        return get_rows
+
+    def done(self, s: int):
+        """Release chunk `s`'s futures once its forward has consumed them."""
+        self.futures.pop(s, None)
+
+    def close(self):
+        # Workers must finish before the next request resets counters/caches, including when a
+        # forward raises before reaching the second table.
+        for futs in self.futures.values():
+            wait(list(futs.values()))
+        self.futures.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def make_hash_state(model_dir: str, tokenizer, max_seq: int, device: str):

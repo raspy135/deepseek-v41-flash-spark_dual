@@ -804,9 +804,14 @@ class Model:
 
     @torch.inference_mode()
     def forward(self, ids: torch.Tensor, S: int, prefill: bool, need_logits: bool = True,
-                encoder_only: bool = False):
+                encoder_only: bool = False, hashes: torch.Tensor | None = None, get_rows=None):
         """ids: [T] token ids at positions S..S+T-1. Returns (logits [T, V] fp32 or None, main_hidden [T, 15360]).
         Caches must be valid for positions < S (self.c.len == S).
+
+        ``hashes`` / ``get_rows`` let the caller drive the engram reads across chunk boundaries
+        (see EngramReadAhead): the hashes depend on the token ids alone, so a prefill loop can hash
+        the whole prompt once and have chunk k+1's rows already in flight while chunk k runs. When
+        they are None this falls back to hashing here and prefetching within the chunk.
 
         ``encoder_only`` stops after the candidate-source layer (the last layer that writes global
         KV, layer 20 here): everything above it is replayed once over the prompt tail by
@@ -817,9 +822,10 @@ class Model:
         assert self.c.len == S, (self.c.len, S)
         T = ids.size(0)
         assert T <= MAX_CHUNK, (T, MAX_CHUNK)
-        t0 = time.perf_counter()
-        hashes = self.hash_state(ids[None], S)[0] if self.hash_state is not None else None  # [T, 2, 24]
-        self.stats["engram_s"] += time.perf_counter() - t0
+        if hashes is None:
+            t0 = time.perf_counter()
+            hashes = self.hash_state(ids[None], S)[0] if self.hash_state is not None else None  # [T, 2, 24]
+            self.stats["engram_s"] += time.perf_counter() - t0
         h = self.W.embed[ids].unsqueeze(1).repeat(1, a.hc_mult, 1)
         pre_mix = torch.zeros(T, a.hc_mult, device=self.dev)
         pre_mix[:, 0] = 1.0
@@ -828,9 +834,12 @@ class Model:
         n_layers = len(self.W.layers)
         last = a.candidate_source_layer if encoder_only else n_layers - 1
         prefetch = getattr(self, "engram_prefetch", None)
-        context = (prefetch(hashes) if prefill and hashes is not None and prefetch is not None
-                   and os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1"
-                   else nullcontext(self.engram_rows))
+        if get_rows is not None:
+            context = nullcontext(get_rows)   # caller owns the reads (cross-chunk read-ahead)
+        else:
+            context = (prefetch(hashes) if prefill and hashes is not None and prefetch is not None
+                       and os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1"
+                       else nullcontext(self.engram_rows))
         with context as get_rows:
             for L in range(last + 1):
                 w = self.W.layers[L]

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
-from engine.engram import EngramTable, make_hash_state, prefetch_rows  # noqa: E402
+from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 import v41_ref as R  # noqa: E402
@@ -503,7 +504,10 @@ class V41Engine:
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
         self.tables = {L: EngramTable(model_dir, index, L, device) for L in self.args.engram_layer_ids}
         from concurrent.futures import ThreadPoolExecutor as _TPE
-        self.eg_pool = _TPE(len(self.args.engram_layer_ids))
+        # one worker per (engram layer x read-ahead depth) so chunk k+1's reads are not queued
+        # behind chunk k's; the NVMe parallelism itself comes from each table's own 32-thread pool
+        self.eg_pool = _TPE(len(self.args.engram_layer_ids)
+                            * max(1, int(os.environ.get("DSV41_ENGRAM_DEPTH", "2"))))
         self.model.engram_rows = lambda L, h: self.tables[L].rows(h)
         self.model.engram_prefetch = lambda hashes: prefetch_rows(
             self.tables, self.eg_pool, hashes, self.args.engram_layer_ids)
@@ -841,29 +845,62 @@ class V41Engine:
             }
             self.last_stats["accounting_covers"] = "prefill+decode"
 
+    def _engram_readahead(self, ids, P):
+        """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
+
+        Returns None for prompts of a single chunk (nothing to overlap with), when there are no
+        engram tables, or when DSV41_PREFILL_ENGRAM is off.
+        """
+        if (self.model.hash_state is None or not self.tables
+                or os.environ.get("DSV41_PREFILL_ENGRAM", "1") != "1"
+                or P <= MAX_CHUNK or os.environ.get("DSV41_ENGRAM_READAHEAD", "1") != "1"):
+            return None
+        t0 = time.perf_counter()
+        hashes_t = self.model.hash_state(ids[None], 0)[0]          # [P, n_engram_layers, 24]
+        self.model.stats["engram_s"] += time.perf_counter() - t0
+        ra = EngramReadAhead(self.tables, self.eg_pool, self.args.engram_layer_ids,
+                             hashes_t.cpu().numpy(), MAX_CHUNK,
+                             depth=int(os.environ.get("DSV41_ENGRAM_DEPTH", "2")))
+        ra.hashes_t = hashes_t
+        return ra
+
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
+
         m = self.model
         t_start = time.perf_counter()
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
         m.begin_prompt()
-        if self.swa_replay:
-            # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
-            # (layers 0..20, which is everything that writes global KV), and the decoder half is
-            # replayed once over the last `window_size` prompt tokens.
-            for s in range(0, P, MAX_CHUNK):
-                m.forward(ids[s:s + MAX_CHUNK], s, prefill=True, need_logits=False, encoder_only=True)
-            logits, mh, s_rep = m.decoder_replay(need_logits=True)
-            if self.spec:
-                m.dspark_seed(mh, s_rep)
-        else:
-            for s in range(0, P, MAX_CHUNK):
-                chunk = ids[s:s + MAX_CHUNK]
-                last = s + len(chunk) >= P
-                logits, mh = m.forward(chunk, s, prefill=True, need_logits=last)
+        # Hash the whole prompt once so chunk k+1's engram rows can be read off NVMe while chunk k
+        # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
+        # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
+        # whose n-grams are not already in the row cache.
+        ra = self._engram_readahead(ids, P)
+        with ra if ra is not None else nullcontext():
+            def _fwd(s, chunk, **kw):
+                if ra is None:
+                    return m.forward(chunk, s, prefill=True, **kw)
+                out = m.forward(chunk, s, prefill=True, hashes=ra.hashes_t[s:s + len(chunk)],
+                                get_rows=ra.rows_for(s), **kw)
+                ra.done(s)
+                return out
+            if self.swa_replay:
+                # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
+                # (layers 0..20, which is everything that writes global KV), and the decoder half is
+                # replayed once over the last `window_size` prompt tokens.
+                for s in range(0, P, MAX_CHUNK):
+                    _fwd(s, ids[s:s + MAX_CHUNK], need_logits=False, encoder_only=True)
+                logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
-                    m.dspark_seed(mh, s)
+                    m.dspark_seed(mh, s_rep)
+            else:
+                for s in range(0, P, MAX_CHUNK):
+                    chunk = ids[s:s + MAX_CHUNK]
+                    last = s + len(chunk) >= P
+                    logits, mh = _fwd(s, chunk, need_logits=last)
+                    if self.spec:
+                        m.dspark_seed(mh, s)
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
         pen = penalties if (penalties is not None and penalties.active) else None
