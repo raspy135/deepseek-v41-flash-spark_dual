@@ -1078,10 +1078,14 @@ class V41Engine:
                     # Real GPU-timeline milliseconds per phase, so the step can finally be split
                     # into "the model" and "the drafter" instead of inferred from host waits.
                     n_steps = max(1, gt.get("layers_n", 1))
+                    segment_ms = gt.get("segments", 0)
+                    envelope_ms = gt.get("layers", 0)
                     self.last_stats["gpu_timing"] = {
                         "hash_ms_per_step": round(gt.get("hash", 0) / max(1, gt.get("hash_n", 1)), 2),
-                        "layers_ms_total": gt.get("layers"), "draft_ms_total": gt.get("draft"),
-                        "layers_ms_per_step": round(gt.get("layers", 0) / n_steps, 2),
+                        "layers_ms_total": envelope_ms, "draft_ms_total": gt.get("draft"),
+                        "layers_ms_per_step": round(envelope_ms / n_steps, 2),
+                        "segment_busy_ms_per_step": round(segment_ms / n_steps, 2),
+                        "boundary_gap_ms_per_step": round(max(0.0, envelope_ms - segment_ms) / n_steps, 2),
                         "draft_ms_per_step": round(gt.get("draft", 0) / max(1, gt.get("draft_n", 1)), 2),
                         "draft_share": (round(gt.get("draft", 0) /
                                               max(1e-9, gt.get("draft", 0) + gt.get("layers", 0)), 3)),

@@ -207,7 +207,7 @@ class FastDecoder:
         # timeline and measure the work itself. Pairs are recorded per step and only read at the
         # end of the request, so no step pays a synchronise for being measured.
         self.gpu_timing = os.environ.get("DSV41_GPU_TIMING", "0") == "1"
-        self._ev_pairs: dict[str, list] = {"draft": [], "layers": [], "hash": []}
+        self._ev_pairs: dict[str, list] = {"draft": [], "layers": [], "segments": [], "hash": []}
         # DSV41_ROUTE_STATS=1 counts, per backbone layer, how many DISTINCT routed experts the
         # T_VERIFY tokens of a verify block ask for -- the quantity that sets the expert bytes a step
         # has to read, since one expert is read once however many of the block's tokens route to it.
@@ -739,7 +739,13 @@ class FastDecoder:
                         fut, finish = futs[lo]
                         self.eg_rows[lo].copy_(finish(*fut.result()))
                         self.stats["engram_s"] += time.perf_counter() - t0r
+                    # Unlike the outer `layers` pair, this pair surrounds only one graph replay.
+                    # Summing it excludes CPU waits before Engram boundaries; layers-segments is
+                    # therefore the exposed GPU-idle/H2D gap rather than assumed kernel work.
+                    _ev_segment = self._ev_begin("segments")
                     g.replay()
+                    if _ev_segment is not None:
+                        _ev_segment.record()
             else:
                 for L in range(a.n_layers):
                     if futs is not None and L in futs:
@@ -748,10 +754,13 @@ class FastDecoder:
                         fut, finish = futs[L]
                         self.eg_rows[L].copy_(finish(*fut.result()))
                         self.stats["engram_s"] += time.perf_counter() - t0r
+                    _ev_segment = self._ev_begin("segments")
                     gA[L].replay()
                     if gB[L] is not None:
                         self._resolve(L)
                         gB[L].replay()
+                    if _ev_segment is not None:
+                        _ev_segment.record()
                 gF.replay()
             if self.lut is not None:
                 # bookkeeping the host resolve would have done: LRU touch is irrelevant while resident
