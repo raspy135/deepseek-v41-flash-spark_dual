@@ -163,3 +163,35 @@ and any client timeout has to be set accordingly. Nothing is wrong at minute 6.
 
 Several accepted tokens arrive per SSE chunk. Use `usage.completion_tokens`; counting chunks
 under-reports decode speed by 3–5×. See [benchmarking](benchmarking.md).
+
+## "The GPU is idle" is usually the accounting, and then it is usually the engram
+
+Two separate traps, hit in that order while chasing a decode that showed 70–90% GPU utilization.
+
+**First, `decode_accounting` measured the wrong path.** Its `attn`/`moe` timers live in the eager
+forward; with CUDA graphs on, decode replays a captured graph and those lines never execute, so
+every number in that dict is the *prefill* figure and the whole decode step lands in
+`unaccounted` — which read 46–75% and looks exactly like an idle GPU. Fixed, but the lesson
+generalizes: a host wall-clock timer around a graph replay measures queueing, not work. The
+numbers that can be trusted are `gpu_timing` (`DSV41_GPU_TIMING=1`, CUDA events on the GPU
+timeline) and the `[step timing]` table (`DSV41_STEP_TIMING=1`).
+
+**Then the engram read really was the gap.** `_gather_rows` sized its thread tasks
+`max(1024, len(ids) // nt + 1)`. A decode verify block asks for `T_VERIFY × 24 ≈ 144` unique
+rows, and 144 ≤ 1024, so every decode gather ran as ONE task — serially, one synchronous page
+fault at a time, 83 ms of a 196 ms step. The rows were always correct, so nothing ever pointed at
+it. Sizing tasks from the row count took the same gather from 93–105 ms to 4.5–6.0 ms.
+
+What did NOT help, both measured rather than reasoned about:
+
+* **Dropping the EP row split at decode.** Halving 144 rows is worth about a millisecond and
+  costs a collective; removing it moved the step time not at all. (Kept anyway — it is size-gated
+  now, and at prefill volumes the split is worth ~100 ms.)
+* **Pinned staging for the H2D.** It works and it cuts the engram wait 58 → 11 ms/step, and the
+  decode rate does not move: the host stops blocking in `step` and starts blocking in `verify`
+  instead. Its original note said exactly this, and it is still true for a new reason — once the
+  gather is fixed, the GPU is genuinely the bottleneck (`layers_ms_per_step` ≈ 150 of a ~167 ms
+  step). Leave `DSV41_ENGRAM_PINNED` off unless something changes upstream of it.
+
+The residual utilization dip is therefore real but small. Anything further has to come from the
+GPU side: fewer bytes per step, or more accepted tokens per step (`accept_len` is ~2.5 of 6).
