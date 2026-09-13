@@ -112,6 +112,14 @@ check_box() {   # $1 = label, $2 = "" for local or the ssh target
     run "test -f '$HOST_MODELS/$MODEL_NAME/model.safetensors.index.json'" \
         || err "$label: no checkpoint at $HOST_MODELS/$MODEL_NAME (each box needs its OWN local copy -- O_DIRECT does not cross a network filesystem)"
     run "test -e /dev/infiniband/rdma_cm" || err "$label: /dev/infiniband missing -- is the RoCE driver loaded?"
+    # The peer is reached as `ssh peer "cd $ROOT && ./scripts/roce_gid.sh"`, so this checkout has
+    # to exist at the SAME ABSOLUTE PATH there. Without this check the failure surfaces further
+    # down as "peer RoCE GID unresolved", which points at the fabric instead of at a missing
+    # directory -- the shell's own "cd: No such file or directory" goes to the ssh stderr and is
+    # easy to miss.
+    run "test -x '$ROOT/scripts/roce_gid.sh'" \
+        || err "$label: no checkout at $ROOT. Both boxes need this repo at the SAME path: \
+clone it there too (git clone <url> $ROOT), or set a path that exists on both."
     avail=$(run "awk '/^MemAvailable:/ {printf \"%d\", \$2/1048576}' /proc/meminfo")
     (( ${avail:-0} >= MIN_FREE_GIB )) \
         || err "$label: only ${avail:-?} GiB available (need >= $MIN_FREE_GIB)"

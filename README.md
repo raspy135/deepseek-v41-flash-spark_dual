@@ -11,6 +11,8 @@
 Head spark should be able to SSH to worker spark.
 
 ```bash
+# Clone this repo to the SAME absolute path on BOTH boxes -- dual-up.sh reaches the peer
+# as `ssh peer "cd <that path> && ..."` to resolve its RoCE GID per node.
 cp env.example .env          # set PEER, MASTER_ADDR, MODEL_DIR, NCCL_SOCKET_IFNAME
 scripts/download-model.sh    # 510 GB, on BOTH boxes -- each needs its own local copy,
                              # because the engine reads experts with O_DIRECT
