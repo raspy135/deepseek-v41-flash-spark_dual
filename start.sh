@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# start.sh -- serve DeepSeek-V4.1-Flash on one DGX Spark.
+# start.sh -- serve DeepSeek-V4.1-Flash on ONE DGX Spark (the upstream launcher).
+#
+# THIS FORK RUNS TWO BOXES. If you cloned it to serve the pair, you want
+#   scripts/dual-up.sh      (start both ranks)   /   scripts/dual-down.sh (stop them)
+# and not this script, which starts a single-box server on this machine only and knows
+# nothing about the peer. It is kept because the single-box path still works and every
+# number in RESULTS.md came from it; it is guarded below so nobody runs it by accident.
 #
 #   ./start.sh                 # start, wait for /health, print the endpoint
 #   ./start.sh --no-wait       # start and return immediately (tail logs yourself)
@@ -30,6 +36,28 @@ for arg in "$@"; do
         *) err "unknown argument '$arg' (only --no-wait)" ;;
     esac
 done
+
+# --- guard: this fork's default is the two-box container path ----------------
+# The confusing case is a fresh clone: start.sh sits in the repo root, looks like the way
+# in, and silently gives you a single-box server with none of the pair's residency. Say so
+# and require an explicit opt-in rather than leaving it to the README.
+if [[ "${DSV41_SINGLE_BOX:-0}" != "1" ]]; then
+    cat >&2 <<'GUARD'
+ERROR: this is the UPSTREAM single-box launcher, and this fork serves two DGX Sparks.
+
+  Two boxes (what this fork is for):
+      scripts/dual-up.sh            start both ranks in containers
+      scripts/dual-down.sh          stop them
+      scripts/dual-build.sh         build the image and ship it to the peer
+
+  One box, on purpose (upstream behaviour, ~25% of experts resident instead of 28.4%,
+  no EP2, no cross-rank guard):
+      DSV41_SINGLE_BOX=1 ./start.sh
+
+See the top of README.md for the two-box quick start.
+GUARD
+    exit 2
+fi
 
 # Environment wins over .env, so `PORT=8001 ./start.sh` works.
 declare -A _CLI=()
