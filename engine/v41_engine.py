@@ -1816,7 +1816,7 @@ class V41Engine:
             "prefill_ep_overlap": (self.ep.active and
                                    os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
             "prefix_cache": (self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
-            "prefill_fused_attn": os.environ.get("DSV41_PREFILL_FUSED_ATTN", "0") == "1",
+            "prefill_fused_attn": M_.PREFILL_FUSED_ATTN,   # not a second os.environ.get: see model.py
             "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
             "prune_select": getattr(self, "prune_select", None),

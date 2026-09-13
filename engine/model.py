@@ -71,6 +71,10 @@ ATTN_TILE = 64
 # whole queued backlog and reported q_proj at 72 % of attention. Several prefill rewrites were
 # proposed off that bad number and measured at 1.0x or worse before being written.
 ATTN_TIMING = os.environ.get("DSV41_ATTN_TIMING", "0") == "1"
+# Single source of truth for the fused prefill attention switch (see _use_fused). It was read in
+# two places with DIFFERENT defaults -- "1" here and "0" in v41_engine's /health reporter -- so
+# with the variable unset the engine used the fused path and /health said it did not.
+PREFILL_FUSED_ATTN = os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1"
 ATTN_PHASES: dict = {}
 _PHASE_MARKS: list = []   # [(name, cuda_event)] in stream order; read once, at report time
 
@@ -97,8 +101,7 @@ def _use_fused(mtp_extra, T: int) -> bool:
     (2259 tokens reused, byte-identical output). Prefill 544 -> 1047 tok/s on a 4513-token prompt,
     and tools/generation_gate.py is 6/6.
     """
-    return (mtp_extra is None and T > 16 and _prefill_attn is not None
-            and os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1")
+    return mtp_extra is None and T > 16 and _prefill_attn is not None and PREFILL_FUSED_ATTN
 
 
 def _mark(name):
@@ -146,10 +149,12 @@ KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_top
 R.MM_TILE = MM_TILE
 
 # Fused sinked-softmax attention for prefill-sized calls (T > 16). Same kernel the decode path
-# uses (tools/decode_attn.py). Microbench at fixed keys=640 looks ~6x faster than the torch tile
-# path, but on the live EP2 prefill (variable topk/compressed width, 40 layers) it measured
-# attn_s 3.16 -> 13.3 s and sank overall tok/s. Default OFF until that is fixed; set
-# DSV41_PREFILL_FUSED_ATTN=1 to re-enable. Independent of DSV41_FUSED_ATTN (decode graphs).
+# uses (tools/decode_attn.py). It once measured attn_s 3.16 -> 13.3 s on the live EP2 prefill and
+# was defaulted off for it; both causes were in how it was CALLED, not in the kernel -- a constant
+# SPLIT tuned for a 6-token verify block, and a caller that built the [T, 640, d] concatenation the
+# kernel exists to avoid. Fixed, and default ON: prefill 544 -> 1047 tok/s on a 4,513-token prompt.
+# Set DSV41_PREFILL_FUSED_ATTN=0 to fall back to the torch tile path.
+# Independent of DSV41_FUSED_ATTN (decode graphs).
 try:
     from decode_attn import decode_attention as _prefill_attn  # noqa: E402
 except Exception:  # noqa: BLE001

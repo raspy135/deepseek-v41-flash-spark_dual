@@ -104,6 +104,72 @@ does not shrink anything. What runs:
 - **Open WebUI-ready** — reasoning streams as `reasoning_content` and renders in the
   collapsible pane with no configuration.
 
+## Knobs this fork adds
+
+All are environment variables read at process start, and `scripts/dual-up.sh` forwards every
+`DSV41_*` it sees to **both** ranks. The table gives the *code* default; the shipped pair profile
+in `env.example` differs where noted, and `/health` reports what is actually live.
+
+**Expert parallelism (the pair)**
+
+| knob | default | what it does |
+|---|---|---|
+| `WORLD_SIZE` | `1` | `2` splits routed experts `expert % 2 == rank`; everything else is replicated |
+| `DSV41_ENGRAM_ROW_SPLIT` | `0` (profile `1`) | each rank reads half the Engram rows; one all-reduce rebuilds the union |
+| `DSV41_ENGRAM_SPLIT_MIN` | `4096` | rows below which a gather stays local — a 144-row decode gather is not worth a collective |
+| `DSV41_TP_DENSE` | `0` | tensor-parallel shared experts. **Measured slower** (19.6 → 14.4 tok/s); kept as the base for attention sharding |
+| `DSV41_DIST_TIMEOUT_S` | `600` | process-group timeout; `DSV41_EP_PING_S` keeps an idle pair inside it |
+
+> **These must match on both ranks.** A rank that computes differently from its peer does not
+> fail — it emits different tokens, silently. The engine broadcasts 11 such fields at boot and
+> refuses to start if they disagree.
+
+**Adaptive expert residency** — record what the router *wanted*, then re-fit the arena to it.
+
+| knob | default | what it does |
+|---|---|---|
+| `DSV41_PRUNE_MISS` | `0` (profile `1`) | record demand (the unmasked top-k) — the input to everything below |
+| `DSV41_PRUNE_SWAP` | `0` (profile `1`) | actually move experts in the arena |
+| `DSV41_PRUNE_PRIOR` | `2e7` (profile `2e4`) | per layer; the blend is `w = observed/(observed + PRIOR)` |
+| `DSV41_PRUNE_HALFLIFE` | `2e7` | EWMA half-life **in routing slots**, and a 4.5k prompt makes ~588,000 of them. `2e6` half-lives the history every ~3.4 requests and churns ~100 experts per request at a 0.9 % miss rate |
+| `DSV41_PRUNE_SWAP_MAX` | `64` (profile `512`) | swaps per pass. Binds on a real deficit: a 26k out-of-distribution prompt can start near 31 % miss, where 128 (2.9 % of the arena) cannot catch up |
+| `DSV41_PRUNE_SWAP_MIN_GAIN` | `0.05` (profile `0.02`) | per-swap bar. Reach for the half-life first — this only suppresses the symptom |
+| `DSV41_PRUNE_SWAP_PREFILL` | `0` (profile `1`) | adapt at the prefill→decode boundary too, so a long prompt's demand is applied **before** the answer is written |
+| `DSV41_PRUNE_SWAP_PREFILL_MIN` | `1024` | newly prefilled tokens below which that pass declines |
+| `DSV41_PRUNE_SWAP_PREFILL_MIN_MISS` | `0.10` | …and the prefill's own miss rate below which it declines, so a well-served prompt is left alone |
+| `DSV41_PRUNE_DB` | `results/prune_demand.npz` | survives restarts; gitignored, rebuilt from the shipped trace if absent |
+
+**Prefill**
+
+| knob | default | what it does |
+|---|---|---|
+| `DSV41_PREFILL_FUSED_ATTN` | `1` | fused sinked-softmax attention. **544 → 1047 tok/s**, and chunk-invariant, so the prefix cache still reproduces a cold prefill byte for byte |
+| `DSV41_PREFIX_CACHE` | `1` | exact prompt-prefix reuse; a continuing conversation re-prefills only its new tokens |
+| `DSV41_INDEX_SCORE_BF16` | `1` | the indexer score buffer ranks, it does not compute — bf16 halves prefill's largest transient |
+| `DSV41_PREFILL_CHUNK` | `2048` | prefill chunk size; image spans are aligned so none straddles a boundary |
+| `DSV41_ENGRAM_GATHER_THREADS` | `64` | Engram row gather width. It ran single-threaded at decode and cost 83 ms of a 196 ms step |
+
+**Decode**
+
+| knob | default | what it does |
+|---|---|---|
+| `DSV41_BLOCK` | `5` | drafted tokens per verify block (odd). **Raising it measures worse** — more tokens reach more *distinct* experts, and the DSpark head is trained at 5. The graph-capturable routing path caps it at 9 |
+| `DSV41_VISION` | `1` | load the ViT + aligner |
+
+**Measured and rejected**, left in so nobody re-derives them — numbers in `docs/gotchas.md`.
+
+| knob | verdict |
+|---|---|
+| `DSV41_TP_DENSE=1` | 27 % slower decode; the step is not bandwidth-bound where it was assumed to be |
+| `DSV41_PREFILL_EP_OVERLAP=1` | crashes rank 1 with a device-side assert |
+| `DSV41_ENGRAM_PINNED=1` | works, cuts the Engram wait 58 → 11 ms/step, and the decode rate does not move |
+| `DSV41_BLOCK=9` | GPU utilization improves, throughput falls 27 % |
+
+**Instrumentation**, all default `0` and cheap: `DSV41_STEP_TIMING` (per-phase decode table),
+`DSV41_GPU_TIMING` (GPU-timeline ms per step), `DSV41_ATTN_TIMING` (prefill attention phases),
+`DSV41_ROUTE_STATS` (distinct experts per layer per verify block — adds two ops *inside* the
+decode graph, so measurement only).
+
 ## The numbers
 
 ### v0.4.0-wip (2026-09-12) — the shipped configuration today
@@ -209,12 +275,18 @@ only 0.18–0.31) and the whole design log are in [NOTES.md](NOTES.md) §0.6–0
 
 ## Two ways to run it
 
-Both are the same server and both read the same `./.env` (copy [`env.example`](env.example)).
-[`docs/install.md`](docs/install.md) compares them and lists the host prerequisites — GB10 /
-`sm_121a`, a CUDA 13 driver, ≥ 600 GB free on **local NVMe**, and the box essentially to
-itself.
+> **In this fork there is one way: the containers, on both boxes** (`scripts/dual-up.sh`). The
+> section below is upstream's, kept because the prerequisites and the venv are still what the
+> tests and the profiling tools need — but `start.sh`/`stop.sh` are gone, so the "native" path
+> now means "a venv to run `engine/profile_fast.py` and the test scripts in", not a way to serve.
 
-### Native — a venv on the box (this is the path every number above came from)
+Both read the same `./.env` (copy [`env.example`](env.example)).
+[`docs/install.md`](docs/install.md) lists the host prerequisites — GB10 / `sm_121a`, a CUDA 13
+driver, ≥ 600 GB free on **local NVMe**, and the box essentially to itself. For the pair, that is
+every prerequisite **twice**: each box needs its own local copy of the 510 GB checkpoint, because
+the engine reads experts with `O_DIRECT` and that does not cross a network filesystem.
+
+### Native — a venv on the box (upstream's serving path; this fork uses it only for tests/tools)
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
