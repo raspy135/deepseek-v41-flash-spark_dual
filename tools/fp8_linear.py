@@ -98,6 +98,26 @@ class FP8Weight:
     def shape(self):
         return (self.N, self.K)
 
+    def shard(self, dim: int, rank: int, world: int) -> "FP8Weight":
+        """One rank's slice of this weight, scales included.
+
+        `dim=0` splits the OUTPUT rows (a column-parallel weight: w1/w3 of an MLP), `dim=1` splits
+        the INPUT columns (row-parallel: w2). The 32x32 block scales have to be sliced on the same
+        boundary, which is why both halves must land on a multiple of 32 -- asserted rather than
+        rounded, because a scale block that straddles a shard boundary is silently wrong.
+        """
+        if world <= 1:
+            return self
+        if dim == 0:
+            n = self.N // world
+            assert self.N % world == 0 and n % 32 == 0, (self.N, world)
+            return FP8Weight(self.w[rank * n:(rank + 1) * n],
+                             self.s[rank * (n // 32):(rank + 1) * (n // 32)])
+        k = self.K // world
+        assert self.K % world == 0 and k % 32 == 0, (self.K, world)
+        return FP8Weight(self.w[:, rank * k:(rank + 1) * k],
+                         self.s[:, rank * (k // 32):(rank + 1) * (k // 32)])
+
     def dequant(self) -> torch.Tensor:
         """fp8 + UE8M0 32x32 block scales -> bf16 [N, K]. Bit-identical to the fp32 round-trip
         this replaced, and ~3.6x faster on the big attention projection.
