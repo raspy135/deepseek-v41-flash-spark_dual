@@ -646,6 +646,19 @@ class Model:
             self._want_mass = z(self.args.n_layers, n_experts)
             self._miss_tot = z(self.args.n_layers, 2)
 
+    def decay_demand(self, factor: float):
+        """Scale recorded demand down, in place, so old evidence fades.
+
+        A purely cumulative history is wrong for a server whose workload switches -- news, then
+        research, then coding all average into a compromise resident set that fits none of them.
+        Decaying turns the database into an exponential moving average: the current mode wins,
+        and a mode that stops being used fades rather than holding slots forever.
+        """
+        if self._want_counts is None or not (0.0 < factor < 1.0):
+            return
+        self._want_counts *= factor
+        self._want_mass *= factor
+
     def load_demand(self, counts, mass):
         """Seed the accumulators from a persisted database so it accumulates across restarts."""
         self.alloc_prune_miss(counts.shape[1], self.dev)

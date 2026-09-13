@@ -1170,7 +1170,7 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
                 # it is the one moment both ranks are known quiet and already synchronised.
                 swaps = []
                 try:
-                    if state.engine.swaps_due():
+                    if state.engine.maintain_demand():
                         swaps = state.engine.plan_swaps(
                             max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
                 except Exception as e:  # noqa: BLE001

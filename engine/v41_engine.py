@@ -947,7 +947,7 @@ class V41Engine:
             self.last_stats["accounting_covers"] = "prefill+decode"
 
     # ------------------------------------------------------------ online adaptation (stage 2)
-    def plan_swaps(self, max_swaps: int = 64):
+    def plan_swaps(self, max_swaps: int = 64, min_gain: float | None = None):
         """Which residents should be replaced, given everything the router has asked for since boot.
 
         Swaps are planned WITHIN each ownership class. Both ranks hold the same number of arena
@@ -972,6 +972,8 @@ class V41Engine:
         if total <= 0:
             return []
         prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
+        if min_gain is None:
+            min_gain = float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05"))
         ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
         world = max(1, self.ep.world)
         out = []
@@ -987,9 +989,14 @@ class V41Engine:
                 # worst resident vs best absentee, within this class
                 weakest = kept_own[np.argsort(score[kept_own])]
                 strongest = gone_own[np.argsort(-score[gone_own])]
+                # Hysteresis. Running this every idle tick means near-tied experts would
+                # otherwise trade places whenever the ranking jitters, paying a load each time to
+                # chase noise. Scores are per-layer normalised (they sum to ~1 across n_experts),
+                # so the floor is expressed against the mean share.
+                floor = min_gain * float(score.mean())
                 for e_out, e_in in zip(weakest, strongest):
                     gain = float(score[e_in] - score[e_out])
-                    if gain <= 0:
+                    if gain <= floor:
                         break          # sorted, so nothing after this pair wins either
                     out.append((int(L), int(e_out), int(e_in), gain))
         out.sort(key=lambda t: -t[3])
@@ -1044,19 +1051,37 @@ class V41Engine:
             # unconditional: identical on both ranks, whoever owns the slot
             self.model_prune_mask[L][e_out] = False
             self.model_prune_mask[L][e_in] = True
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()   # the loads ran on a copy stream; land them before serving
         self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
         log(f"adapted {len(swaps)} expert slots to observed demand")
         return len(swaps)
 
-    def swaps_due(self, min_growth: float = 5e6) -> bool:
-        """Only re-plan once the database has grown enough for the answer to have changed."""
+    def maintain_demand(self) -> bool:
+        """Age the demand history, then say whether a re-plan is worth doing.
+
+        Called on every idle tick. The decay is applied here rather than at record time because
+        recording happens inside a captured CUDA graph, where an extra scaling pass would have to
+        be captured too; once per idle tick is often enough for a half-life measured in millions
+        of slots, and it keeps the hot path untouched.
+        """
         if os.environ.get("DSV41_PRUNE_SWAP", "0") != "1":
             return False
         rep = self.model.prune_miss_report()
         if rep is None:
             return False
-        return float(rep[1].sum()) - self._swap_baseline >= min_growth
+        total = float(rep[1].sum())
+        grown = total - self._swap_baseline
+        half = float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7"))
+        if half > 0 and grown > 0:
+            # decay proportional to the evidence that arrived since the last tick, so the rate is
+            # set by traffic rather than by wall-clock or by how often this happens to run
+            self.model.decay_demand(0.5 ** (grown / half))
+        return grown >= float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH", "5e5"))
+
+    def swaps_due(self, min_growth: float | None = None) -> bool:
+        """Back-compat shim for callers that only want the predicate."""
+        return self.maintain_demand()
 
     def _engram_readahead(self, ids, P):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
