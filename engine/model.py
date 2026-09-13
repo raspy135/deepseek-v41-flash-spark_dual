@@ -624,13 +624,14 @@ class Model:
         pad = self.args.index_topk - idx.size(1)
         return idx if pad <= 0 else F.pad(idx, (0, pad), value=-1)
 
-    def _select_candidates(self, logits, compress_lens, topk_blocks, block_size):
+    @staticmethod
+    def _select_candidates(logits, compress_lens, topk_blocks, block_size):
         width = logits.size(-1)
         scores = F.pad(logits, (0, -width % block_size), value=float("-inf"))
         scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
         num_blocks = scores.size(-1)
         last = ((compress_lens - 1) // block_size)[:, None]
-        scores = scores.masked_fill(self._positions[:num_blocks][None, :] == last, float("inf"))
+        scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device)[None, :] == last, float("inf"))
         top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
         keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
