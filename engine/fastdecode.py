@@ -39,9 +39,9 @@ except Exception:  # noqa: BLE001
     decode_attention = None
 
 try:
-    from fp32_skinny import skinny_linear, wins as skinny_wins  # tools/fp32_skinny.py (Triton)
+    from fp32_skinny import skinny_linear, wins as skinny_wins, BLOCK_MP as SKINNY_MAX_M  # tools/fp32_skinny.py (Triton)
 except Exception:  # noqa: BLE001
-    skinny_linear, skinny_wins = None, None
+    skinny_linear, skinny_wins, SKINNY_MAX_M = None, None, 0
 
 # One fused Triton kernel for the sinked softmax attention instead of two fp32 SIMT batched GEMMs
 # and the elementwise passes around them. DSV41_FUSED_ATTN=0 restores the torch path.
@@ -70,7 +70,12 @@ INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
 def _fp32_lin(x, w):
     """fp32 y = x @ w^T with an fp32 weight. `x` may be bf16: the Triton kernel upcasts the loaded
     tile itself (same values, half the activation bytes); the cuBLAS fallback needs the fp32 copy."""
-    if HC_KERNEL and skinny_wins(w.size(0)):
+    # The row bound is part of the guard, not an assert inside the kernel: skinny_linear's partial
+    # buffer is BLOCK_MP rows and it asserts M <= BLOCK_MP. DSV41_BLOCK is documented as 1..15, and
+    # anything wide enough to push M past 8 used to reach that assert and take the pair out of step
+    # mid-request -- a supported knob with a crash behind it. cuBLAS handles the wider M fine; this
+    # kernel exists only for the shapes it handles badly (see fp32_skinny.wins).
+    if HC_KERNEL and skinny_wins(w.size(0)) and x.size(0) <= SKINNY_MAX_M:
         return skinny_linear(x, w)
     return F.linear(x.float(), w)
 
@@ -579,8 +584,21 @@ class FastDecoder:
         torch.cuda.synchronize()
         out = {}
         for phase, pairs in self._ev_pairs.items():
-            out[phase] = round(sum(a.elapsed_time(b) for a, b in pairs), 1)
-            out[phase + "_n"] = len(pairs)
+            # A step that raised between the begin and end events leaves the last pair half
+            # recorded, and elapsed_time() then throws from inside the error handler -- which is
+            # how a skinny-kernel assert reached the log as "Both events must be recorded",
+            # twice, with the real traceback buried under it. Measurement must never be the thing
+            # that reports the failure.
+            total = 0.0
+            done = 0
+            for a, b in pairs:
+                try:
+                    total += a.elapsed_time(b)
+                except (ValueError, RuntimeError):
+                    continue
+                done += 1
+            out[phase] = round(total, 1)
+            out[phase + "_n"] = done
         return out
 
     # ------------------------------------------------------------------ route stats
