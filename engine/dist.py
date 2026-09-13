@@ -125,6 +125,22 @@ class EPDistributed:
         dist.all_reduce(partial, op=dist.ReduceOp.SUM)
         return partial
 
+    def combine_async(self, partial: torch.Tensor, stream: torch.cuda.Stream):
+        """Queue the routed-partial reduction on ``stream`` and return its Work handle.
+
+        The communication stream first waits for the current compute stream, which produced
+        ``partial``.  The caller can then queue independent work (the replicated shared expert)
+        on the compute stream and finally make that stream wait for ``stream`` before consuming
+        the reduced tensor.  This is deliberately separate from :meth:`combine`: decode graphs
+        keep their existing collective and only eager prefill opts into the overlap.
+        """
+        assert partial.dtype == torch.float32, "combine in fp32 -- the single-node k-sum is fp32"
+        assert partial.is_cuda, "the asynchronous EP combine requires a CUDA tensor"
+        current = torch.cuda.current_stream(partial.device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            return dist.all_reduce(partial, op=dist.ReduceOp.SUM, async_op=True)
+
     def broadcast_obj(self, payload):
         """rank 0 -> all, for any picklable object. Used for state that MUST be identical on both
         ranks and is derived from something only rank 0 can see."""

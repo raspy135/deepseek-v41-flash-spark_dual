@@ -354,6 +354,16 @@ class Model:
                                               a.rope_factor, a.beta_fast, a.beta_slow, self.dev)
         self.freqs_w = R.precompute_freqs_cis(a.rope_head_dim, caches.max_seq + 8, 0, a.rope_theta, a.rope_factor,
                                               a.beta_fast, a.beta_slow, self.dev)
+        # Positions and fixed sliding-window offsets are used in every layer.  Keeping one device
+        # copy removes dozens of small allocations/launches per prefill chunk without changing a
+        # single value handed to the model.
+        self._positions = torch.arange(caches.max_seq + 8, device=self.dev)
+        self._window_offsets = torch.arange(a.window_size - 1, -1, -1, device=self.dev)
+        ep = getattr(store, "ep", None)
+        self._ep_comm_stream = (torch.cuda.Stream(device=self.dev)
+                                if (torch.cuda.is_available() and getattr(ep, "active", False)
+                                    and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "1") == "1")
+                                else None)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
         self.vision = None       # engine.vision.VisionTower, set by the engine when enabled
@@ -388,7 +398,7 @@ class Model:
     def _window_positions(self, pos: torch.Tensor):
         """[T, 128] absolute positions each query may see in its sliding window, -1 if none."""
         w = self.args.window_size
-        p = pos[:, None] - torch.arange(w - 1, -1, -1, device=self.dev)[None, :]
+        p = pos[:, None] - self._window_offsets[None, :]
         return torch.where(p >= 0, p, torch.full_like(p, -1))
 
     def attention(self, x: torch.Tensor, w, L: int, S: int, sh: Shared, ring: torch.Tensor,
@@ -402,7 +412,7 @@ class Model:
         """
         a = self.args
         T = x.size(0)
-        pos = torch.arange(S, S + T, device=self.dev)
+        pos = self._positions[S:S + T]
         rd = a.rope_head_dim
         fq = freqs[S:S + T]
 
@@ -438,7 +448,7 @@ class Model:
         else:
             # DSpark draft attention: window from the main stream's ring (positions <= S-1) + all draft kvs
             main_last = mtp_extra  # position of the last main token in the ring
-            wpos = main_last - torch.arange(a.window_size - 1, -1, -1, device=self.dev)
+            wpos = main_last - self._window_offsets
             wpos = torch.where(wpos >= 0, wpos, torch.full_like(wpos, -1))  # [128]
             wkv = ring[wpos.clamp_min(0) % RING][None].expand(T, -1, -1)
             kv_all = torch.cat([wkv, kv[None].expand(T, -1, -1)], dim=1)
@@ -536,7 +546,7 @@ class Model:
                 j0 = S
             if latent is not None:
                 nj = latent.size(0)
-                jpos = (j0 + torch.arange(nj, device=self.dev)) * r
+                jpos = self._positions[j0:j0 + nj] * r
                 fj = self.freqs_c[jpos]
                 if L in self.W.indexers:  # index key from the pre-RoPE latent
                     iw = self.W.indexers[L]
@@ -587,7 +597,7 @@ class Model:
                 sc = torch.einsum("thd,nd->thn", qt, k[jb:jb + NB])  # bf16
                 sc = sc.float().relu_() * wt[:, :, None]
                 score[i:j, jb:jb + NB] = sc.sum(dim=1)[:j - i]
-        cpos = torch.arange(n_pad, device=self.dev)
+        cpos = self._positions[:n_pad]
         score.masked_fill_(cpos[None, :] >= compress_lens[:, None], float("-inf"))
         is_cand_src = L == a.candidate_source_layer
         if is_cand_src:
@@ -611,14 +621,13 @@ class Model:
         pad = self.args.index_topk - idx.size(1)
         return idx if pad <= 0 else F.pad(idx, (0, pad), value=-1)
 
-    @staticmethod
-    def _select_candidates(logits, compress_lens, topk_blocks, block_size):
+    def _select_candidates(self, logits, compress_lens, topk_blocks, block_size):
         width = logits.size(-1)
         scores = F.pad(logits, (0, -width % block_size), value=float("-inf"))
         scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
         num_blocks = scores.size(-1)
         last = ((compress_lens - 1) // block_size)[:, None]
-        scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device)[None, :] == last, float("inf"))
+        scores = scores.masked_fill(self._positions[:num_blocks][None, :] == last, float("inf"))
         top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
         keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
@@ -784,6 +793,8 @@ class Model:
         # separately, and leave their fp32 total carrying both errors. So EP2 takes the half in
         # fp32, all-reduces, and rounds once, exactly where the single-box path rounds: what
         # remains is purely the REGROUPED fp32 addition engine/dist.py documents.
+        ep_work = None
+        ep_overlap = False
         if getattr(store, "null_slot", None) is not None:
             route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
             route_args = {}
@@ -807,16 +818,27 @@ class Model:
             # during prefill.
             _mark("moe_kernel")
             tc = time.perf_counter()
-            store.ep.combine(routed)
-            _mark("ep_combine")
+            ep_overlap = (prefill and y.size(0) > 16 and self._ep_comm_stream is not None
+                          and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "1") == "1")
+            if ep_overlap:
+                ep_work = store.ep.combine_async(routed, self._ep_comm_stream)
+            else:
+                store.ep.combine(routed)
+                _mark("ep_combine")
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
             self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
-            routed = routed.to(torch.bfloat16).float()
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
-        _mark("moe")         # router + slot resolve + the routed-expert kernel + the EP2 combine
+        _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         _mark("shared_expert")   # the dense FFN every token passes through, replicated on both ranks
+        if getattr(store, "null_slot", None) is not None:
+            if ep_overlap:
+                # Queue, rather than host-synchronise, the dependency.  The shared expert already
+                # sits ahead of this wait on the compute stream; conversion/add wait for both.
+                torch.cuda.current_stream(routed.device).wait_stream(self._ep_comm_stream)
+                _mark("ep_combine")
+            routed = routed.to(torch.bfloat16).float()
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
@@ -1029,7 +1051,7 @@ class Model:
         m0 = self.W.mtp[0]
         main_x = R.rmsnorm(R.qlinear(main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
         M = main_x.size(0)
-        pos = torch.arange(S, S + M, device=self.dev)
+        pos = self._positions[S:S + M]
         rd = a.rope_head_dim
         for k, w in enumerate(self.W.mtp):
             kv = R.rmsnorm(R.qlinear(main_x, w.wkv), w.kv_norm, a.norm_eps)
