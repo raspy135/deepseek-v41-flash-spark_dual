@@ -1108,6 +1108,32 @@ class V41Engine:
         """Back-compat shim for callers that only want the predicate."""
         return self.maintain_demand()
 
+    def _prefill_spans(self, P: int):
+        """Chunk boundaries for this prompt: MAX_CHUNK, except that no image span may straddle one.
+
+        A span must be spliced whole (inference/model.py:1254), and the obvious fix -- a bigger
+        MAX_CHUNK for everyone -- is the expensive one: the indexer's score buffer is
+        [chunk, context] fp32 (engine/model.py), so at 256k context a 2048 chunk is 2 GB and an
+        8192 chunk is 8.6 GB, plus a masked copy. Aligning the boundaries costs nothing and works
+        for any number of images; a span longer than MAX_CHUNK simply gets a chunk of its own.
+        """
+        sp = sorted((im.start, im.start + im.types.numel()) for im in (self._images or ()))
+        out, s = [], 0
+        while s < P:
+            e = min(s + MAX_CHUNK, P)
+            # a span that begins exactly here must be contained whole, even past MAX_CHUNK
+            floor = max([en for st, en in sp if st == s], default=0)
+            e = max(e, floor)
+            # any OTHER span beginning inside must start the next chunk instead. Checking every
+            # span matters: stopping at the first one let a second span inside the same chunk be
+            # cut in half.
+            cut = [st for st, en in sp if s < st < e]
+            if cut:
+                e = max(floor, min(cut))
+            out.append((s, min(e, P)))
+            s = min(e, P)
+        return out
+
     def _engram_readahead(self, ids, P, engram_mask=None):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
 
@@ -1166,15 +1192,15 @@ class V41Engine:
                 # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
                 # (layers 0..20, which is everything that writes global KV), and the decoder half is
                 # replayed once over the last `window_size` prompt tokens.
-                for s in range(0, P, MAX_CHUNK):
-                    _fwd(s, ids[s:s + MAX_CHUNK], need_logits=False, encoder_only=True)
+                for s, e in self._prefill_spans(P):
+                    _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
                     m.dspark_seed(mh, s_rep)
             else:
-                for s in range(0, P, MAX_CHUNK):
-                    chunk = ids[s:s + MAX_CHUNK]
-                    last = s + len(chunk) >= P
+                for s, e in self._prefill_spans(P):
+                    chunk = ids[s:e]
+                    last = e >= P
                     logits, mh = _fwd(s, chunk, need_logits=last)
                     if self.spec:
                         m.dspark_seed(mh, s)

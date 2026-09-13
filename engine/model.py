@@ -952,7 +952,10 @@ class Model:
         a = self.args
         assert self.c.len == S, (self.c.len, S)
         T = ids.size(0)
-        assert T <= MAX_CHUNK, (T, MAX_CHUNK)
+        # An image span must be spliced whole, so a span longer than MAX_CHUNK gets a chunk of
+        # its own (V41Engine._prefill_spans). Everything downstream is shape-generic; the cost is
+        # the indexer's [T, context] score buffer, which is why ordinary chunks stay at MAX_CHUNK.
+        assert T <= MAX_CHUNK or images, (T, MAX_CHUNK)
         # Vision masks for this chunk. TEXT is -1, so `types >= 0` is the whole image span --
         # delimiters included. image_mask selects the router's VL bias (Model.moe); its complement
         # shuts the engram off, both in the hasher (an n-gram must not span an image) and in the
