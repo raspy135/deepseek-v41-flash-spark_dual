@@ -1013,13 +1013,25 @@ class V41Engine:
             min_gain = float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05"))
         ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
         world = max(1, self.ep.world)
+        # Residency is only knowable for THIS rank's half; the peer's is symmetric because both
+        # ranks run the same keep set against the same arena size.
+        resident = set(self.store.lru) if getattr(self.store, "lru", None) is not None else None
         out = []
         for L, msk in self.model_prune_mask.items():
             keep = msk.detach().cpu().numpy().astype(bool)
             score = ranked[L]
             for r in range(world):
                 own = (np.arange(len(keep)) % world) == r
+                # "kept" is ROUTABLE, which is not the same as resident: if the keep set is
+                # larger than the arena's LRU slots the tail streams, and proposing to evict an
+                # expert that was never loaded fails the apply validator and takes the pair down.
+                # Only offer residents as eviction candidates.
                 kept_own = np.flatnonzero(keep & own)
+                if resident is not None:
+                    kept_own = np.array([e for e in kept_own if (L, int(e)) in resident],
+                                        dtype=kept_own.dtype)
+                    if not len(kept_own):
+                        continue
                 gone_own = np.flatnonzero(~keep & own)
                 if not len(kept_own) or not len(gone_own):
                     continue
