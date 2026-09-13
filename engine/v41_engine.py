@@ -617,6 +617,9 @@ class V41Engine:
         self._prune_trace = None
         self._token_types = self._images = None   # set per request by the VL path
         self._swap_baseline = 0.0   # recorded demand at the last applied adaptation
+        # One exact prompt-prefix snapshot.  The large compressed KV prefix remains append-only in
+        # ``self.caches``; this object only protects the small state decode overwrites.
+        self._prefix_cache = None
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
@@ -821,6 +824,53 @@ class V41Engine:
             # are clean. No-op when the flag is off.
             self.fast.route_stats_reset()
 
+    def _restore_prefix(self, prompt: list[int]) -> int:
+        """Restore a cached encoder prefix and return its length, or return zero.
+
+        Token equality is deliberately the whole admission policy. Vision bypasses this path in
+        ``_generate`` because placeholder-token equality says nothing about the image pixels.
+        A mismatch invalidates the one-entry cache before a full prefill overwrites its backing
+        compressed KV rows.
+        """
+        pc = self._prefix_cache
+        if (os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or pc is None
+                or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
+            self._prefix_cache = None
+            return 0
+        c = self.caches
+        n = len(pc["ids"])
+        for L, values in pc["win"].items():
+            c.win[L][pc["slots"]].copy_(values)
+        for L, pending in pc["pending"].items():
+            c.pending[L] = (None if pending is None else (pending[0].clone(), pending[1].clone()))
+        rep = pc["rep"]
+        self.model._rep = {k: ([v.clone()] if v is not None else [None])
+                           for k, v in rep.items()}
+        self.model._rep_end = n
+        c.len = n
+        return n
+
+    def _save_prefix(self, ids: torch.Tensor, P: int) -> None:
+        """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
+        if os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or P <= 0:
+            self._prefix_cache = None
+            return
+        c, m = self.caches, self.model
+        lo = max(0, P - self.args.window_size)
+        slots = (m._positions[lo:P] % M_.RING).clone()
+        h, pre, topk, cand, _ = m._rep_tail()
+        pending = {L: (None if value is None else (value[0].clone(), value[1].clone()))
+                   for L, value in c.pending.items()}
+        self._prefix_cache = {
+            "ids": tuple(ids.detach().cpu().tolist()),
+            "slots": slots,
+            "win": {L: c.win[L][slots].clone()
+                    for L in range(self.args.candidate_source_layer + 1)},
+            "pending": pending,
+            "rep": {"h": h.clone(), "pre_mix": pre.clone(), "topk": topk.clone(),
+                    "cand": None if cand is None else cand.clone()},
+        }
+
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
                  ignore_eos=False, grammar=None):
@@ -849,6 +899,10 @@ class V41Engine:
         P = len(prompt)
         assert P + max_tokens + 8 <= self.max_context, f"prompt {P} + max_tokens {max_tokens} > context {self.max_context}"
         ids = torch.tensor(prompt, dtype=torch.long, device=self.device)
+        has_vision = bool(getattr(self, "_images", None))
+        prefix_start = 0 if has_vision else self._restore_prefix(prompt)
+        if has_vision:
+            self._prefix_cache = None
         t_start = time.perf_counter()
         # Every counter the stats epilogue reads is initialised here, because the epilogue runs in a
         # `finally`: the server closes the generator on a stop string or a client disconnect, which
@@ -862,7 +916,7 @@ class V41Engine:
         t_decode0 = t_start
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
-                                         _st := {}, grammar, penalties)
+                                         _st := {}, grammar, penalties, prefix_start=prefix_start)
         except BaseException:
             # GeneratorExit (stop string / disconnect / server error) or a real exception. The
             # normal exit already told rank 1 to stop via the loop's own control(); only the
@@ -890,6 +944,7 @@ class V41Engine:
             m = self.model
             self.last_stats = {
                 "prompt_tokens": P, "completion_tokens": n_out, "prefill_s": round(t_prefill, 3),
+                "prefix_cached_tokens": _st.get("prefix_cached_tokens", 0),
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
@@ -1181,7 +1236,7 @@ class V41Engine:
         """Attach this request's vision inputs; cleared at the end of generate()."""
         self._token_types, self._images = token_types, images
 
-    def _prefill_spans(self, P: int):
+    def _prefill_spans(self, P: int, start: int = 0):
         """Chunk boundaries for this prompt: MAX_CHUNK, except that no image span may straddle one.
 
         A span must be spliced whole (inference/model.py:1254), and the obvious fix -- a bigger
@@ -1191,7 +1246,7 @@ class V41Engine:
         for any number of images; a span longer than MAX_CHUNK simply gets a chunk of its own.
         """
         sp = sorted((im.start, im.start + im.types.numel()) for im in (self._images or ()))
-        out, s = [], 0
+        out, s = [], start
         while s < P:
             e = min(s + MAX_CHUNK, P)
             # a span that begins exactly here must be contained whole, even past MAX_CHUNK
@@ -1207,7 +1262,7 @@ class V41Engine:
             s = min(e, P)
         return out
 
-    def _engram_readahead(self, ids, P, engram_mask=None, spans=None):
+    def _engram_readahead(self, ids, P, engram_mask=None, spans=None, hashes_t=None):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.
 
         Returns None for prompts of a single chunk (nothing to overlap with), when there are no
@@ -1215,14 +1270,17 @@ class V41Engine:
         """
         if (self.model.hash_state is None or not self.tables
                 or os.environ.get("DSV41_PREFILL_ENGRAM", "1") != "1"
-                or P <= MAX_CHUNK or os.environ.get("DSV41_ENGRAM_READAHEAD", "1") != "1"):
+                or (spans is not None and len(spans) <= 1)
+                or (spans is None and P <= MAX_CHUNK)
+                or os.environ.get("DSV41_ENGRAM_READAHEAD", "1") != "1"):
             return None
-        t0 = time.perf_counter()
-        # the whole-prompt hash needs the same token mask the per-chunk path would apply, or the
-        # n-grams inside an image span would be live here and dead there
-        hashes_t = self.model.hash_state(
-            ids[None], 0, None if engram_mask is None else engram_mask[None])[0]   # [P, n_eg, 24]
-        self.model.stats["engram_s"] += time.perf_counter() - t0
+        if hashes_t is None:
+            t0 = time.perf_counter()
+            # The whole-prompt hash needs the same token mask the per-chunk path would apply, or
+            # the n-grams inside an image span would be live here and dead there.
+            hashes_t = self.model.hash_state(
+                ids[None], 0, None if engram_mask is None else engram_mask[None])[0]
+            self.model.stats["engram_s"] += time.perf_counter() - t0
         # Use the SAME boundaries as the forward loop. Images deliberately move boundaries so a
         # span is never split; fixed MAX_CHUNK read-ahead would then hand a short image chunk the
         # rows for a 2048-token chunk (and engram_forward's reshape would fail).
@@ -1233,14 +1291,16 @@ class V41Engine:
         ra.hashes_t = hashes_t
         return ra
 
-    def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
+    def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None,
+                     penalties=None, prefix_start: int = 0):
 
         m = self.model
         t_start = time.perf_counter()
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
-        m.begin_prompt()
+        if prefix_start == 0:
+            m.begin_prompt()
         # Hash the whole prompt once so chunk k+1's engram rows can be read off NVMe while chunk k
         # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
         # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
@@ -1249,8 +1309,15 @@ class V41Engine:
         # is sliced per chunk exactly like them. TEXT is -1, so `>= 0` marks a whole image span.
         tt = getattr(self, "_token_types", None)
         eg_mask = None if tt is None else ~(tt >= 0)
-        spans = self._prefill_spans(P)
-        ra = self._engram_readahead(ids, P, eg_mask, spans)
+        spans = self._prefill_spans(P, prefix_start)
+        hashes_t = None
+        if prefix_start and spans and m.hash_state is not None:
+            # Hashing the full token sequence preserves n-grams crossing the cached boundary;
+            # only the suffix rows are fetched and forwarded.
+            th = time.perf_counter()
+            hashes_t = m.hash_state(ids[None], 0, None if eg_mask is None else eg_mask[None])[0]
+            m.stats["engram_s"] += time.perf_counter() - th
+        ra = self._engram_readahead(ids, P, eg_mask, spans, hashes_t=hashes_t)
         with ra if ra is not None else nullcontext():
             def _fwd(s, chunk, **kw):
                 if tt is not None:
@@ -1261,6 +1328,8 @@ class V41Engine:
                     kw["images"] = [_dc.replace(im, start=im.start - s)
                                     for im in (self._images or ()) if s <= im.start < s + len(chunk)]
                 if ra is None:
+                    if hashes_t is not None:
+                        kw["hashes"] = hashes_t[s:s + len(chunk)]
                     return m.forward(chunk, s, prefill=True, **kw)
                 out = m.forward(chunk, s, prefill=True, hashes=ra.hashes_t[s:s + len(chunk)],
                                 get_rows=ra.rows_for(s), **kw)
@@ -1272,6 +1341,9 @@ class V41Engine:
                 # replayed once over the last `window_size` prompt tokens.
                 for s, e in spans:
                     _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
+                # Save at the prompt boundary, before decoder replay and generation overwrite the
+                # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
+                self._save_prefix(ids, P)
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
                     m.dspark_seed(mh, s_rep)
@@ -1289,6 +1361,7 @@ class V41Engine:
         self.model.image_mask = self.model.engram_mask = None
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
+        out_st["prefix_cached_tokens"] = prefix_start
         pen = penalties if (penalties is not None and penalties.active) else None
         p = sample_probs(logits[-1], temperature, top_p)
         tok = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
