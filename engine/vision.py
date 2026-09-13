@@ -6,6 +6,18 @@ better, and re-implementing it would only add a surface for porting bugs. This i
 `inference/vision.py` from the checkpoint and loads the weights into it, exactly the way
 engine/engram.py imports the checkpoint's NgramHashState.
 
+STATUS (2026-09-13): the tower works; the LLM after it does not. Loading is verified
+(263/263 parameters bitwise), the ViT+aligner takes 0.65-0.77 s for a 1.2 MP image's 8547
+patches, and the splice lands 962 aligner rows on exactly the 962 IMAGE slots with the three
+delimiters carrying their learned embeddings. But on an image-bearing prompt the LLM then pins
+the GPU at 96 % indefinitely -- a 12-token generation from a 1014-token prompt (990 of them
+image) never returned, on a freshly restarted server with no queue. Decode here is
+memory-bandwidth bound and normally shows 70-90 % with dips, so a flat ceiling is prefill-shaped
+work or a spin, not decode. Ruled out: expert streaming (NVMe 0 MB/s throughout), a
+chunk-boundary loop (_prefill_spans yields (0,2),(2,1014) for that prompt), and this file (its
+own timer closes in under a second). DSV41_VISION=0 by default because an image request
+otherwise wedges the single-stream engine for every other client.
+
 Vision costs ~0.9 GB resident (tower 0.767 + aligner 0.137), about 2.5 experts per layer at
 fp4, and it only runs during prefill: the aligner's output replaces the embeddings at the
 image-token positions before layer 0, and nothing downstream of that knows an image was there
