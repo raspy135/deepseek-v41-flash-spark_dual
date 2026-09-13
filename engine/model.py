@@ -732,6 +732,18 @@ class Model:
             "worst_layers": [{"layer": L, "miss_rate": round(per_layer[L], 4)} for L in worst],
         }, counts, mass
 
+    def miss_snapshot(self):
+        """(missed, total) routing slots so far -- for a PER-REQUEST delta.
+
+        The accumulators are lifetime by design (they feed the demand database), so a cumulative
+        miss rate in a per-request log line stops moving after a few hundred requests and tells
+        you nothing about the prompt you just ran.
+        """
+        if self._miss_tot is None:
+            return None
+        tot = self._miss_tot.sum(dim=0)
+        return float(tot[0]), float(tot[1])
+
     def reset_prune_miss(self):
         self._want_counts = self._want_mass = self._miss_tot = None
 

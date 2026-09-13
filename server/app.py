@@ -747,11 +747,17 @@ class State:
             _cached = int(_s.get("prefix_cached_tokens") or 0)
             _prompt = int(_s.get("prompt_tokens") or len(prompt_ids))
             _reuse_pct = 100.0 * _cached / max(1, _prompt)
+            # THIS request's routing misses, not the lifetime figure: the accumulators are
+            # lifetime by design (they feed the demand database), so a cumulative rate stops
+            # moving after a few hundred requests and says nothing about the prompt just run.
+            _pm = _s.get("prune_miss_request") or {}
+            _pm_txt = (f" | routed-miss {_pm['miss_rate']*100:.1f}% ({_pm['missed_slots']}/{_pm['slots']})"
+                       if _pm else "")
             log.info("  prefill %.2fs (%s tok/s) | prefix=%d/%d (%.1f%%), suffix=%d | "
-                     "decode %s tok/s accept=%s | hit=%s nvme=%sGB | ep=%sx collective=%ss",
+                     "decode %s tok/s accept=%s | hit=%s nvme=%sGB%s | ep=%sx collective=%ss",
                      _s.get("prefill_s") or 0.0, _s.get("prefill_tok_s"),
                      _cached, _prompt, _reuse_pct, _prompt - _cached, _s.get("decode_tok_s"),
-                     _s.get("accept_len_mean"), _s.get("expert_hit_rate"), _s.get("nvme_gb"),
+                     _s.get("accept_len_mean"), _s.get("expert_hit_rate"), _s.get("nvme_gb"), _pm_txt,
                      _s.get("ep_world_size") or (_s.get("engine_config") or {}).get("ep_world_size", 1),
                      _s.get("ep_s"))
             for _k in ("attn_phases", "gpu_timing", "route_stats", "decode_accounting"):

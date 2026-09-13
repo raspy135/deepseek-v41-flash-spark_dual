@@ -1040,6 +1040,13 @@ class V41Engine:
             if pmr is not None:
                 summary, counts, mass = pmr
                 self.last_stats["prune_miss"] = summary
+                # per-request delta: what THIS prompt asked for that was not resident
+                _m1 = self.model.miss_snapshot()
+                _m0 = getattr(self, "_miss_at_request_start", None)
+                if _m0 is not None and _m1 is not None and _m1[1] > _m0[1]:
+                    dm, dt = _m1[0] - _m0[0], _m1[1] - _m0[1]
+                    self.last_stats["prune_miss_request"] = {
+                        "miss_rate": round(dm / dt, 4), "missed_slots": int(dm), "slots": int(dt)}
                 # The accumulators were seeded from the DB at startup, so what they hold IS the
                 # updated database -- write it back whole. Rank 1 would write an identical file
                 # (both ranks run the same router over the same tokens); only rank 0 does, so the
@@ -1304,7 +1311,8 @@ class V41Engine:
         # prefill in chunks
         logits = None
         if prefix_start == 0:
-            m.begin_prompt()
+            self._miss_at_request_start = m.miss_snapshot() if hasattr(m, "miss_snapshot") else None
+        m.begin_prompt()
         # Hash the whole prompt once so chunk k+1's engram rows can be read off NVMe while chunk k
         # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
         # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
