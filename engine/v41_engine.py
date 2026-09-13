@@ -560,6 +560,18 @@ class V41Engine:
 
         self.model = Model(self.W, self.store, self.caches, self.moe_fn, act_quant=act_quant)
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
+        # Vision tower: present only if the checkpoint has one, and skippable for a text-only
+        # server that would rather keep the 0.9 GB (about 2.5 experts per layer at fp4).
+        self.vision = None
+        if os.environ.get("DSV41_VISION", "1") == "1":
+            try:
+                from engine.vision import VisionTower
+                self.vision = VisionTower(model_dir, device)
+                self.model.vision = self.vision
+                log(f"vision tower loaded ({self.vision.cfg['vision_n_layers']} layers, "
+                    f"{self.vision.cfg['vision_dim']} dim); image inputs enabled")
+            except Exception as e:  # noqa: BLE001
+                log(f"vision tower not loaded ({e}); image inputs will be rejected")
         self.tables = {L: EngramTable(model_dir, index, L, device) for L in self.args.engram_layer_ids}
         for _t in self.tables.values():
             _t.ep = self.ep          # enables the DSV41_ENGRAM_ROW_SPLIT read split (prefill only)
@@ -1108,6 +1120,28 @@ class V41Engine:
         """Back-compat shim for callers that only want the predicate."""
         return self.maintain_demand()
 
+    def prepare_vl(self, prompt: str, images: list):
+        """prompt + image records -> (token ids, token_types, ImageInputs) via the checkpoint's own
+        image_processor. Every image-span position carries image_token_id; token_types is the only
+        thing that tells IMAGE apart from the three delimiters."""
+        if self.vision is None:
+            raise RuntimeError("no vision tower is loaded")
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(self.model_dir, "inference"))
+        import image_processor as IP
+
+        class _A:
+            pass
+        for k, v in self.vision.cfg.items():
+            setattr(_A, k, v)
+        _A.vision_enabled = True
+        toks, types, imgs = IP.prepare_vl_inputs(prompt, images, self.tokenizer, _A)
+        return toks, torch.tensor(types, dtype=torch.int64, device=self.device), imgs
+
+    def set_vl_inputs(self, token_types=None, images=None):
+        """Attach this request's vision inputs; cleared at the end of generate()."""
+        self._token_types, self._images = token_types, images
+
     def _prefill_spans(self, P: int):
         """Chunk boundaries for this prompt: MAX_CHUNK, except that no image span may straddle one.
 
@@ -1204,6 +1238,11 @@ class V41Engine:
                     logits, mh = _fwd(s, chunk, need_logits=last)
                     if self.spec:
                         m.dspark_seed(mh, s)
+        # Vision inputs belong to the prompt only. Leaving them set would apply this request's
+        # image mask to the next one's prefill, and the engine is single-sequence, so "the next
+        # one" is any later request.
+        self._token_types = self._images = None
+        self.model.image_mask = self.model.engram_mask = None
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
         pen = penalties if (penalties is not None and penalties.active) else None

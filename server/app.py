@@ -240,13 +240,20 @@ def resolve_thinking(body: dict, default_thinking: bool, default_effort: int) ->
 _IMAGE_BLOCK_TYPES = {"image", "image_url", "input_image"}
 
 
+# Set once in main(), from the engine: this process serves one model, and the request path needs
+# to know whether image blocks can be honoured before it has an engine handle.
+VISION_OK = False
+
+
 def _reject_images(messages: List[dict]) -> None:
     for i, m in enumerate(messages):
         content = m.get("content")
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES:
-                    raise APIError(400, "image inputs are not supported yet", param=f"messages[{i}].content")
+                    if not VISION_OK:
+                        raise APIError(400, "image inputs are not supported by this server "
+                                            "(no vision tower loaded)", param=f"messages[{i}].content")
 
 
 def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
@@ -290,8 +297,9 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
         )
     except (AssertionError, ValueError, KeyError, TypeError, NotImplementedError) as e:
         raise APIError(400, f"cannot encode messages: {e}", param="messages")
-    if media.get("images"):
-        raise APIError(400, "image inputs are not supported yet", param="messages")
+    if media.get("images") and not VISION_OK:
+        raise APIError(400, "image inputs are not supported by this server "
+                            "(no vision tower loaded)", param="messages")
     rendered = None
     if tools:
         try:
@@ -1233,6 +1241,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     tok = Tok(args.model_dir)
     enc = load_encoding_module(args.model_dir)
     engine = make_engine(args, tok, enc)
+    global VISION_OK
+    VISION_OK = getattr(engine, "vision", None) is not None
+    log.info("image inputs: %s", "enabled (vision tower loaded)" if VISION_OK else "rejected (no vision tower)")
     ep = getattr(engine, "ep", None)
     headless = args.headless or (ep is not None and getattr(ep, "active", False) and ep.rank != 0)
     if headless:
