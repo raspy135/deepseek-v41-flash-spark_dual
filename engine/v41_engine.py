@@ -1127,7 +1127,12 @@ class V41Engine:
         if self.vision is None:
             raise RuntimeError("no vision tower is loaded")
         import sys as _sys
-        _sys.path.insert(0, os.path.join(self.model_dir, "inference"))
+        # prepare_vl_inputs imports the checkpoint's `encoding` for IMAGE_PLACEHOLDER, which lives
+        # in a sibling directory of `inference` -- both have to be importable.
+        for _d in ("inference", "encoding"):
+            _p = os.path.join(self.model_dir, _d)
+            if _p not in _sys.path:
+                _sys.path.insert(0, _p)
         import image_processor as IP
 
         class _A:
