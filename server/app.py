@@ -1353,7 +1353,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         httpd.server_close()
         # EP2: tell rank 1 to go home. run_worker() blocks in broadcast_request between
         # requests, so without this the peer sits there holding its half of the pool until the
-        # process-group timeout expires -- and ./stop.sh's peer_wait_mem would watch it do it.
+        # process-group timeout expires -- and dual-down.sh's memory wait would watch it do it.
         # The engine lock is what makes this safe: a request still in flight owns the
         # collectives, and the shutdown message has to queue behind it, not interleave with it.
         if state.ep_active and not state.ep_fault:
@@ -1362,7 +1362,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     state.ep.broadcast_request({"cmd": "shutdown"})
                 log.info("EP2: shutdown broadcast to rank %d", 1)
             except Exception as e:
-                log.warning("EP2: could not tell the peer to shut down (%s); ./stop.sh will", e)
+                log.warning("EP2: could not tell the peer to shut down (%s); dual-down.sh will", e)
         engine.close()
 
 

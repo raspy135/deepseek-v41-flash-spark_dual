@@ -73,7 +73,8 @@ are in RESULTS.md. What follows is what is still missing or broken.
   `scripts/entrypoint.sh` exist and `docker compose config` resolves, but no image has been
   built or run on the box yet — the first build is the GitHub Actions arm64 job on the
   `v0.1.0-wip` tag, and nothing has served a request from a container. The native path
-  (`./start.sh`) is the one every number in RESULTS.md came from.
+  (upstream's `./start.sh`, removed in this fork) is the one every number in RESULTS.md came
+  from; this fork's numbers are from the containerised EP2 pair.
 * **There is no `setup.sh` and no lockfile.** The native path expects an interpreter that
   already has torch (CUDA 13 / sm_121), triton, transformers and safetensors; docs/install.md
   lists the versions that were used, but nothing pins them.

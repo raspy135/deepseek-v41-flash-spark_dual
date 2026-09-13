@@ -856,7 +856,7 @@ class V41Engine:
         if self.ep.active:
             # Force the NCCL communicator into existence now instead of inside the first
             # request's first combine: lazy setup is a multi-second stall on the user's first
-            # token, and a hang HERE fails loudly before /health ever binds (start.sh's health
+            # token, and a hang HERE fails loudly before /health ever binds (the launcher's health
             # wait is the right place to watch for it). Both ranks reach this exact point
             # after their warm start, so the dummy combine is symmetric.
             self.ep.combine(torch.zeros(1, 1, dtype=torch.float32, device=device))

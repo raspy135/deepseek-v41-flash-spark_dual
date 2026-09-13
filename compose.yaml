@@ -6,7 +6,7 @@
 # failing. See docs/dual-spark-plan.md.
 #
 # Read ./.env first (compose does this by itself), so the same file that configures
-# ./start.sh natively configures the container. See env.example for what the knobs mean
+# scripts/dual-up.sh configures the container. See env.example for what the knobs mean
 # and docs/install.md for the host side.
 #
 # The API is published on the loopback interface only. To reach it from another machine,

@@ -9,7 +9,7 @@
 #
 # Excluded, deliberately:
 #   .env       box-specific (HOST/PORT/MASTER_ADDR) and holds a token; the peer's rank gets its
-#              settings from the environment start.sh hands it over ssh, never from a file.
+#              settings from the environment the launcher hands it over ssh, never from a file.
 #   .venv      built per box, aarch64 wheels + CUDA; copying it is slower than it looks and
 #              breaks the absolute paths baked into the venv's scripts.
 #   models/logs  weights and run output: large, and per-box by nature.

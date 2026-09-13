@@ -34,7 +34,7 @@ cd "$ROOT"
 info() { echo "--- $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
 
-# Caller-supplied env beats .env, the same way start.sh does it. Sourcing .env with `set -a`
+# Caller-supplied env beats .env, the way a launcher should. Sourcing .env with `set -a`
 # overwrites anything already exported, so `SPEC=0 scripts/dual-up.sh` would silently run with
 # .env's SPEC=1 -- capture what the caller set, source, then put it back.
 declare -A _CLI=()
@@ -76,7 +76,7 @@ HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"
 # reaching it from another machine -- do that only on a network you trust, or put a reverse proxy
 # with auth in front. BIND_HOST=192.168.11.206 (one interface) is the narrower middle ground.
 # Falls back to HOST so .env stays the single place this is configured: HOST is what the native
-# path (start.sh) and the entrypoint already call it, and having a container-only second name for
+# path and the entrypoint already call it, and having a container-only second name for
 # the same thing meant editing .env had no effect on the pair. BIND_HOST still wins when set, for
 # a one-off `BIND_HOST=0.0.0.0 scripts/dual-up.sh`.
 BIND_HOST="${BIND_HOST:-${HOST:-127.0.0.1}}"

@@ -1,6 +1,6 @@
 # bench/
 
-`bench.py` measures one running server (`../start.sh`) and writes a JSON row.
+`bench.py` measures one running server (start it with `../scripts/dual-up.sh`) and writes a JSON row.
 It reports the two numbers the SGLang cookbook reports — TTFT and TPOT — plus
 decode tok/s, so a row here is directly comparable to a row from the
 [ling3-flash-spark](https://github.com/0xBakeer/ling3-flash-spark) harness that
@@ -96,7 +96,7 @@ measured run appends `-run2`. `--no-save-oneshot` turns the writing off.
 
 Speculative decoding is lossless — the target verifies every drafted token — so
 these workloads measure speed only, never quality. And the first bench after a
-`./start.sh` is a *cold* number in a way the ling3 recipe never had: the arena
+A freshly started server gives a *cold* number in a way the ling3 recipe never had: the arena
 is warm-started from the trace ranking, but everything outside the hot set is
 still an 18.8 MB NVMe read on first touch. `nvme_gb` in the first run versus the
 third is the size of that effect, and it is the number this whole recipe lives

@@ -6,11 +6,24 @@
 > — attention, Engram, router, the DSpark drafter, KV, sampling — stays bit-identically replicated.
 > The original README follows unchanged below, and still describes the engine this is built on.
 
-**What the second box buys.** Not raw FLOPs — decode on this model is bound by the bytes a step
-moves, and a step reads the same replicated dense weights on both machines. What it buys is
-**residency**: 82 GB of expert arena per box instead of one box's 73.8 GB, so 28.4 % of the routed
-experts stay resident with the rest streamed from NVMe, and the working set is re-fitted to the
-traffic as it arrives.
+## Quick start (two boxes)
+
+```bash
+cp env.example .env          # set PEER, MASTER_ADDR, MODEL_DIR, NCCL_SOCKET_IFNAME
+scripts/download-model.sh    # 510 GB, on BOTH boxes -- each needs its own local copy,
+                             # because the engine reads experts with O_DIRECT
+scripts/dual-build.sh        # build once here, ship the identical image to the peer
+scripts/dual-up.sh           # start both ranks; --check runs preflight and exits
+scripts/dual-down.sh         # stop both
+```
+
+There is no single-box path in this fork: `start.sh`/`stop.sh` are removed, and the engine is
+started only through the container scripts above. Upstream still serves one box if that is what
+you want.
+
+**What the second box buys.** Not raw FLOPs, but **residency**: 82 GB of expert arena 
+per box instead of one box's 73.8 GB, so 28.4 % of the routed experts stay resident with the rest 
+streamed from NVMe, and the working set is re-fitted to the traffic as it arrives.
 
 Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach RoCE):
 
@@ -23,6 +36,7 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
 
 **What this fork adds on top of the upstream engine**
 
+- **Docker image** - Docker image created for portability
 - **EP2 expert parallelism** — routed experts split `expert % 2 == rank`, one fp32 all-reduce per
   MoE layer, captured inside the decode CUDA graphs. A boot-time guard refuses to start when the
   two ranks disagree about how to compute, because a skewed pair does not fail — it quietly
@@ -31,7 +45,7 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
   blends it with the shipped trace, and swaps the arena toward observed demand. It adapts twice
   per request: once at the prefill→decode boundary, so a long prompt's demand is applied before
   the answer is written, and once after. The database survives restarts.
-- **Exact prompt-prefix reuse** — a continuing conversation re-prefills only its new tokens
+- **Prefix cache** — a continuing conversation re-prefills only its new tokens
   (95–100 % hits in practice). `tools/test_prefix_invariance.py` asserts the property the cache
   rests on: resuming from a cached prefix reproduces a cold prefill **byte for byte**, and that
   the cache was actually used.
@@ -40,15 +54,9 @@ Measured on the development pair (two GB10 / DGX Spark, 200 GbE direct-attach Ro
   (83 ms of a 196 ms step); the fused prefill attention had been switched off and is worth
   544 → 1047 tok/s.
 
-**Read [`docs/gotchas.md`](docs/gotchas.md) before tuning anything.** It records the negative
-results too — dense tensor parallelism, a wider speculation block, pinned engram staging and the
-EP row split at decode all made things *worse*, some of them while making GPU utilization look
-better. [`docs/dual-spark-plan.md`](docs/dual-spark-plan.md) has the parallelism arithmetic.
+--------------------------
 
-**Honest status.** Same caveat as upstream, doubled: this runs on exactly one pair of machines,
-the numbers above are from that pair, and the interesting failure mode of a two-box setup is not
-a crash but a silent divergence. The guards and tests exist because each of those was found the
-hard way.
+The original README.md is shown below
 
 ---
 
@@ -203,16 +211,19 @@ pip install "transformers>=4.57" "tokenizers>=0.21" "safetensors>=0.5" numpy sym
 
 cp env.example .env                  # set MODEL_DIR and PYTHON
 MODEL_DIR=./models/DeepSeek-V4.1-Flash ./scripts/download-model.sh    # 510 GB, resumable
-./start.sh                           # nohup server/app.py --engine v41; waits for /health
-./start.sh --no-wait                 # start and return; tail logs/server.log yourself
-./stop.sh                            # SIGTERM -> SIGKILL -> wait for the memory to come back
 ```
+
+> **This fork removed `start.sh`/`stop.sh`.** The venv above is still what the tests and the
+> profiling tools (`engine/profile_fast.py`, `engine/profile_batch2.py`) run in, but the server
+> itself is started with `scripts/dual-up.sh` / `scripts/dual-down.sh`. The paragraphs below
+> describe upstream's native launcher and are kept for context.
 
 `triton` arrives as a dependency of `torch` from the cu130 index and must not be replaced with
 a PyPI build — the FP4 MoE kernel is JIT-compiled against whichever Triton is installed.
 
-`start.sh` refuses to start if the port is taken or if less than `MIN_FREE_GIB` (90) is
-available, and names the processes and containers holding the pool. The health wait is 20
+Upstream's `start.sh` refused to start if the port was taken or if less than `MIN_FREE_GIB`
+(90) was available, and named the processes and containers holding the pool; `scripts/dual-up.sh`
+runs the same checks on *both* boxes before either container starts. The health wait is 20
 minutes on purpose: the warm start fills the resident FP4 expert arena from NVMe *before* the
 socket is bound, ranked by the newest `results/trace-*/stats/coverage.json` it can find. A
 server that is not answering at minute 5 is normal.
@@ -336,11 +347,11 @@ HTTP range requests. Serving needs all of it.
 ## Layout
 
 ```
-start.sh / stop.sh    native launcher: memory and port guards, nohup + pidfile, health wait
+scripts/dual-*.sh     build / up / down for the EP2 pair: preflight on both boxes, one image
 run.sh                container dispatcher: setup | serve | logs | stop | shell | bench | config
 compose.yaml          loopback-only service, /models bind mount, unified-memory ulimits
 Dockerfile            arm64 CUDA-13 devel base, torch cu130 + triton; weights mounted, never baked
-scripts/              entrypoint.sh (the container's start.sh) · download-model.sh (510 GB, resumable)
+scripts/              entrypoint.sh (the container's launcher) · download-model.sh (510 GB, resumable)
 env.example           every knob, for both paths
 engine/               the serving engine: v41_engine.py (generation loop, DSpark, arena + NVMe
                       store) · model.py · experts.py · engram.py

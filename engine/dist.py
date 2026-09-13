@@ -70,7 +70,7 @@ class EPDistributed:
     """
 
     def __init__(self, rank: int | None = None, world_size: int | None = None):
-        # torchrun-style env is the default; explicit args (or start.sh flags) win.
+        # torchrun-style env is the default; explicit args (or launcher flags) win.
         self.rank = int(os.environ.get("RANK", 0)) if rank is None else int(rank)
         self.world = int(os.environ.get("WORLD_SIZE", 1)) if world_size is None else int(world_size)
         self.active = self.world > 1

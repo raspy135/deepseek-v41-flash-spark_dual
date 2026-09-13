@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# entrypoint.sh -- the container's ./start.sh.
+# entrypoint.sh -- the container's launcher: what PID 1 runs inside each rank.
 #
 # Runs `server/app.py --engine v41` in the foreground as PID 1 (so `docker stop`
 # reaches it with SIGTERM and the engine gets to release its pinned buffers).
