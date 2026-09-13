@@ -1457,8 +1457,14 @@ class V41Engine:
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
+        # Every request, NOT only the cold ones. This is the baseline the per-request routed-miss
+        # delta is measured from, and leaving it unreset on a prefix-cache hit made that delta span
+        # every cached turn back to the last cold prompt -- so a conversation reported a miss rate
+        # that barely moved (31.6 -> 31.4 -> 30.3%) while the true per-turn rate was falling
+        # (31.6 -> 23.6 -> 19.1%). The adaptation looked broken when it was working, and
+        # maintain_inline's gate reads this same delta to decide whether the prompt needs fixing.
+        self._miss_at_request_start = m.miss_snapshot() if hasattr(m, "miss_snapshot") else None
         if prefix_start == 0:
-            self._miss_at_request_start = m.miss_snapshot() if hasattr(m, "miss_snapshot") else None
             # begin_prompt() EMPTIES the replay buffer, and on a prefix-cache hit _restore_prefix
             # has already filled it with the cached window tail -- so resetting here threw away
             # exactly the state the cache exists to keep. Two failures came out of that: a prompt
