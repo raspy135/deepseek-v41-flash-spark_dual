@@ -54,6 +54,15 @@ class EngramTable:
                 except (AttributeError, OSError):
                     pass
         self.gather_threads = int(os.environ.get("DSV41_ENGRAM_GATHER_THREADS", "64"))
+        # EP2 row split: both ranks hash the same tokens, so both were reading the SAME rows off
+        # their own NVMe -- the work was duplicated, and it is the prefill bottleneck. With the
+        # split each rank reads only `uniq % world == rank` into a zero-filled full array and one
+        # all-reduce (the halves are disjoint, so SUM is exactly the union) rebuilds it on both.
+        # That halves per-box read volume AND halves the footprint each box's page cache has to
+        # cover. Default off: a collective that only one rank reaches wedges the pair.
+        # Set by the engine after construction; None means single-box.
+        self.ep = None
+        self.row_split = os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0") == "1"
         self.pool = ThreadPoolExecutor(max(threads, self.gather_threads if self.mmap_rows else 0))
         self.device = device
         self.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
@@ -104,13 +113,31 @@ class EngramTable:
             list(self.pool.map(one, starts))
         return out
 
+    def _splitting(self) -> bool:
+        """Both ranks must agree, so this reads only constants -- never per-call state."""
+        return bool(self.row_split and self.ep is not None and self.ep.active)
+
     def read_raw(self, hashes_np: np.ndarray):
         """Host-only part (safe in a background thread: no CUDA calls): NVMe reads of the unique rows.
-        hashes_np: int64 [T, 24]. Returns (raw uint8 [n, 264], inv, shape)."""
+        hashes_np: int64 [T, 24]. Returns (raw uint8 [n, 264], inv, shape).
+
+        Under the EP2 row split this reads only this rank's share; the rest stays zero and
+        to_device's all-reduce fills it in."""
         t1 = time.perf_counter()
         flat = hashes_np.reshape(-1)
         uniq, inv = np.unique(flat, return_inverse=True)
         n = len(uniq)
+        if self._splitting():
+            # np.unique sorts, so both ranks see identical `uniq` and pick disjoint halves.
+            mine = (uniq % self.ep.world) == self.ep.rank
+            raw = np.zeros((n, 264), np.uint8)
+            sel = uniq[mine]
+            if len(sel):
+                raw[mine] = (self._gather_rows(sel) if self.mmap_rows
+                             else self._read_rows(sel))
+            self.stats["read_s"] = self.stats.get("read_s", 0.0) + time.perf_counter() - t1
+            self.stats["rows"] += int(len(sel)); self.stats["calls"] += 1
+            return raw, inv, hashes_np.shape
         if self.mmap_rows:
             raw = self._gather_rows(uniq)
         else:
@@ -136,7 +163,14 @@ class EngramTable:
         if not self.pinned:
             rawt = torch.from_numpy(raw).to(self.device)
             invt = torch.from_numpy(inv.reshape(-1)).to(self.device)
+            if self._splitting():
+                # Disjoint halves over a zero background: SUM is the union, bit-exact, no
+                # overflow. Must run on every rank for the same (chunk, layer) or the pair wedges.
+                import torch.distributed as _dist
+                _dist.all_reduce(rawt, op=_dist.ReduceOp.SUM)
         else:
+            assert not self._splitting(), \
+                "DSV41_ENGRAM_PINNED and DSV41_ENGRAM_ROW_SPLIT are not wired together"
             i = self._cur
             self._cur ^= 1  # two buffers: the wait is on the copy from two calls ago
             if self._stage[i] is None or self._stage[i].shape[0] < n:

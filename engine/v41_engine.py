@@ -503,6 +503,10 @@ class V41Engine:
         self.model = Model(self.W, self.store, self.caches, self.moe_fn, act_quant=act_quant)
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
         self.tables = {L: EngramTable(model_dir, index, L, device) for L in self.args.engram_layer_ids}
+        for _t in self.tables.values():
+            _t.ep = self.ep          # enables the DSV41_ENGRAM_ROW_SPLIT read split (prefill only)
+        if self.ep.active and self.tables and next(iter(self.tables.values())).row_split:
+            log("engram row split on: each rank reads uniq %% world == rank, one all-reduce rebuilds")
         from concurrent.futures import ThreadPoolExecutor as _TPE
         # one worker per (engram layer x read-ahead depth) so chunk k+1's reads are not queued
         # behind chunk k's; the NVMe parallelism itself comes from each table's own 32-thread pool
