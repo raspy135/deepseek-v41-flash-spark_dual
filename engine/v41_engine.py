@@ -840,7 +840,7 @@ class V41Engine:
         c = self.caches
         n = len(pc["ids"])
         for L, values in pc["win"].items():
-            c.win[L][pc["slots"]].copy_(values)
+            c.win[L].index_copy_(0, pc["slots"], values)
         for L, pending in pc["pending"].items():
             c.pending[L] = (None if pending is None else (pending[0].clone(), pending[1].clone()))
         rep = pc["rep"]
