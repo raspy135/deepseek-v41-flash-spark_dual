@@ -268,10 +268,15 @@ class EngramReadAhead:
         self.depth = max(1, depth)
         self.total = hashes_np.shape[0]
         self.spans = [(int(s), int(e)) for s, e in spans]
-        if (not self.spans or self.spans[0][0] != 0 or self.spans[-1][1] != self.total
+        self.start = self.spans[0][0] if self.spans else 0
+        # A normal prefill tiles [0, total). Exact-prefix reuse deliberately supplies only the
+        # uncached suffix, so its first span may be > 0 while hashes still contains the full
+        # sequence (n-grams at the boundary need the prefix tokens). In both cases the supplied
+        # spans must be one contiguous tiling through ``total``.
+        if (not self.spans or self.start < 0 or self.spans[-1][1] != self.total
                 or any(s >= e for s, e in self.spans)
                 or any(e != ns for (_s, e), (ns, _ne) in zip(self.spans, self.spans[1:]))):
-            raise ValueError(f"read-ahead spans must tile [0, {self.total}): {self.spans}")
+            raise ValueError(f"read-ahead spans must tile [{self.start}, {self.total}): {self.spans}")
         self.span_index = {s: i for i, (s, _e) in enumerate(self.spans)}
         self.futures: dict[int, dict] = {}
 

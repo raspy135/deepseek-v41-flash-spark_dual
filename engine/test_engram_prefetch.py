@@ -96,6 +96,23 @@ class ReadAhead(unittest.TestCase):
             finally:
                 ra.close()
 
+    def test_cached_suffix_spans_keep_absolute_offsets(self):
+        """Prefix reuse reads only [cached, total), but hashes retain absolute indexing."""
+        hashes = np.arange(20 * 2 * 24).reshape(20, 2, 24)
+        spans = [(11, 15), (15, 20)]
+        tables = {1: self.Table(), 14: self.Table()}
+        with ThreadPoolExecutor(4) as pool:
+            ra = EngramReadAhead(tables, pool, [1, 14], hashes, spans, depth=2)
+            try:
+                for s, e in spans:
+                    rows = ra.rows_for(s)
+                    for li, layer in enumerate((1, 14)):
+                        got = rows(layer, torch.from_numpy(hashes[s:e, li]))
+                        np.testing.assert_array_equal(got, hashes[s:e, li])
+                    ra.done(s)
+            finally:
+                ra.close()
+
 
 class RealRows(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('MODEL_DIR'), 'set MODEL_DIR for checkpoint row parity')
