@@ -613,7 +613,16 @@ class State:
                 raise APIError(400, f"prompt {len(prompt_ids)} + max_tokens {max_tokens} exceeds "
                                     f"context {self.engine.max_context} by {over} tokens",
                                code="context_length_exceeded", param="max_tokens")
-            self.ep.broadcast_request({"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs})
+            # The VL inputs travel WITH the request. Without them rank 1 prefills the same ids
+            # with no image: it skips the splice, and -- fatally -- chunks uniformly where rank 0
+            # aligns its boundaries to the image span, so the two ranks issue different numbers of
+            # per-layer all-reduces and the pair deadlocks. That is a hang with an idle GPU, not an
+            # error. token_types is small; the patches are ~5 MB and go over the same gloo path.
+            payload = {"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs}
+            if vl is not None:
+                types, imgs = vl
+                payload["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
+            self.ep.broadcast_request(payload)
         if ignore_eos:
             try:
                 gen = self.engine.generate(prompt_ids, ignore_eos=True, **{k: v for k, v in gen_kwargs.items() if k != "ignore_eos"})
@@ -1192,6 +1201,10 @@ def run_worker(engine) -> None:
             n += 1
             t0 = time.time()
             try:
+                _vl = req.get("vl")
+                if _vl is not None and hasattr(engine, "set_vl_inputs"):
+                    # same masks, same chunk boundaries, same collective count as the head
+                    engine.set_vl_inputs(_vl["token_types"].to(engine.device), _vl["images"])
                 for _ in engine.generate(req["prompt_ids"], **req["kwargs"]):
                     pass
             except Exception:
