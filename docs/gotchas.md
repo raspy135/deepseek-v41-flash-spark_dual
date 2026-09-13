@@ -221,3 +221,41 @@ Back on by default: prefill 544 → 1047 tok/s, `generation_gate.py` 6/6, cache 
 byte-identical. Note that `DSV41_PREFILL_ATTN_BLOCK_H`/`_BLOCK_N` in `.env` were tuned in
 `df74991` while this path was switched off, so those values measured nothing — they are read per
 call at the `_prefill_attn` call site and are worth re-tuning now that the path is live.
+
+## A wider verify block makes utilization better and decode slower
+
+`DSV41_BLOCK=9` (T_VERIFY=10 instead of 6) was tried because the dense weights are read once per
+step however many token rows ride along — measured, at the shapes decode uses:
+
+```
+wq_b  M=6: 0.193 ms   M=16: 0.200 ms      MoE  T=6, 30 experts: 2.824 ms
+w1    M=6: 0.044      M=16: 0.044              T=64, 32 experts: 3.389 ms
+```
+
+So rows look free, and GPU utilization does visibly improve with the wider block. Decode got **27%
+slower**:
+
+```
+              step      accept   decode
+T=6           162.7 ms   2.95    18.10 tok/s
+T=10          217.4 ms   2.87    13.24 tok/s
+```
+
+Two reasons. **Rows are free for dense weights but not for routed experts** — more tokens route to
+more *distinct* experts, and that read grows nearly linearly with T until it saturates:
+
+```
+T=6    21.13 distinct experts/layer    7.94 GB/step
+T=10   29.85 distinct experts/layer   11.23 GB/step
+```
+
+Total bytes 14.86 → 18.1 GB. And **acceptance did not move** (2.95 → 2.87): the DSpark head is
+trained at `dspark_block_size=5`, so drafts 6–9 are outside its horizon and are essentially never
+accepted. Four more candidate positions, paid for, none collected.
+
+This is the clearest case in the repo of utilization and throughput pointing opposite ways. Fuller
+tiles are not the goal; tokens per byte read is.
+
+Note also that the documented `DSV41_BLOCK` range (odd, 1–15) is wrong. The graph-capturable
+routing path (`build_routing_small`) handles P ≤ 64 pairs and P = T_VERIFY × 6, so T_VERIFY ≤ 10
+caps it at 9; above that the MoE falls into a `torch.unique` path that cannot be captured at all.
