@@ -567,6 +567,8 @@ class V41Engine:
         self.model.engram_prefetch = lambda hashes: prefetch_rows(
             self.tables, self.eg_pool, hashes, self.args.engram_layer_ids)
         self.prune_keep = prune_keep
+        self._prune_trace = None
+        self._swap_baseline = 0.0   # recorded demand at the last applied adaptation
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
@@ -590,6 +592,7 @@ class V41Engine:
             # with the model; the demand DB is this box's own history and accumulates across
             # restarts, so a server used mostly for one kind of work drifts towards the experts
             # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
+            self._prune_trace = {L: v.copy() for L, v in counts.items()}   # pre-blend, for plan_swaps
             db = load_prune_db() if os.environ.get("DSV41_PRUNE_ADAPT", "1") == "1" else None
             if db is not None:
                 prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
@@ -934,6 +937,103 @@ class V41Engine:
                 k: {"s": round(v, 2), "pct": round(v / _req * 100, 1)} for k, v in _parts.items()
             }
             self.last_stats["accounting_covers"] = "prefill+decode"
+
+    # ------------------------------------------------------------ online adaptation (stage 2)
+    def plan_swaps(self, max_swaps: int = 64):
+        """Which residents should be replaced, given everything the router has asked for since boot.
+
+        Swaps are planned WITHIN each ownership class. Both ranks hold the same number of arena
+        slots, so the count of kept-and-owned experts per (layer, rank) has to stay fixed -- pairing
+        an owned promotion with a non-owned demotion would leave one arena over-subscribed and the
+        other with a hole. Ownership is `e % world`, and both ranks record identical demand (the
+        router runs replicated over the same tokens), so both compute the SAME plan for BOTH classes
+        with no collective; each then loads only its own half, while the mask update applies to all
+        of it on both ranks.
+
+        Returns [(layer, expert_out, expert_in, gain), ...], best gain first.
+        """
+        import numpy as np
+        if self._prune_trace is None or not getattr(self, "model_prune_mask", None):
+            return []
+        rep = self.model.prune_miss_report()
+        if rep is None:
+            return []
+        _summary, demand, _mass = rep
+        demand = demand.numpy()
+        total = float(demand.sum())
+        if total <= 0:
+            return []
+        prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
+        ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
+        world = max(1, self.ep.world)
+        out = []
+        for L, msk in self.model_prune_mask.items():
+            keep = msk.detach().cpu().numpy().astype(bool)
+            score = ranked[L]
+            for r in range(world):
+                own = (np.arange(len(keep)) % world) == r
+                kept_own = np.flatnonzero(keep & own)
+                gone_own = np.flatnonzero(~keep & own)
+                if not len(kept_own) or not len(gone_own):
+                    continue
+                # worst resident vs best absentee, within this class
+                weakest = kept_own[np.argsort(score[kept_own])]
+                strongest = gone_own[np.argsort(-score[gone_own])]
+                for e_out, e_in in zip(weakest, strongest):
+                    gain = float(score[e_in] - score[e_out])
+                    if gain <= 0:
+                        break          # sorted, so nothing after this pair wins either
+                    out.append((int(L), int(e_out), int(e_in), gain))
+        out.sort(key=lambda t: -t[3])
+        return out[:max_swaps]
+
+    def apply_swaps(self, swaps) -> int:
+        """Move the arena slots this rank owns and update the routing state in place.
+
+        The mask and the device LUT are read from inside the captured decode graphs, so they are
+        mutated IN PLACE: the graph holds their addresses, and a fresh tensor would be ignored
+        while the stale one kept driving the router.
+        """
+        if not swaps:
+            return 0
+        st = self.store
+        world, rank = max(1, self.ep.world), self.ep.rank
+        done = 0
+        for L, e_out, e_in, _gain in swaps:
+            mine = (e_in % world) == rank
+            if mine:
+                slot = st.lru.pop((L, e_out), None)
+                if slot is None:
+                    continue                      # not resident here; nothing to recycle
+                try:
+                    st._load_into_slot((L, e_in), slot)
+                except Exception as e:            # noqa: BLE001
+                    log(f"swap load failed for layer {L} expert {e_in}: {e}")
+                    st.lru[(L, e_out)] = slot      # put it back exactly as it was
+                    continue
+                st.lru[(L, e_in)] = slot
+                st.slot_key[slot] = (L, e_in)
+                if self.fast is not None and getattr(self.fast, "lut", None) is not None:
+                    self.fast.lut[L, e_in] = slot
+                    self.fast.lut[L, e_out] = int(getattr(st, "null_slot", -1))
+            # the router mask is global and must stay identical on both ranks
+            self.model_prune_mask[L][e_out] = False
+            self.model_prune_mask[L][e_in] = True
+            done += 1
+        if done:
+            torch.cuda.synchronize()
+            self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
+            log(f"adapted {done} expert slots to observed demand")
+        return done
+
+    def swaps_due(self, min_growth: float = 5e6) -> bool:
+        """Only re-plan once the database has grown enough for the answer to have changed."""
+        if os.environ.get("DSV41_PRUNE_SWAP", "0") != "1":
+            return False
+        rep = self.model.prune_miss_report()
+        if rep is None:
+            return False
+        return float(rep[1].sum()) - self._swap_baseline >= min_growth
 
     def _engram_readahead(self, ids, P):
         """One read-ahead over the prompt's engram rows, or None to keep the per-chunk prefetch.

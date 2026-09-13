@@ -1109,6 +1109,16 @@ def run_worker(engine) -> None:
                 break
             if req is None or req.get("cmd") == "shutdown":
                 break
+            if req.get("cmd") == "maintain":
+                # Same plan rank 0 is applying, at the same point in the broadcast stream, so the
+                # two arenas and the two routers stay identical. A failure here desyncs the pair
+                # exactly like a failed request does, and is treated the same way.
+                try:
+                    engine.apply_swaps(req["swaps"])
+                except Exception:
+                    log.exception("EP2 worker: expert adaptation failed; the pair is desynced, exiting")
+                    os._exit(1)
+                continue
             if req.get("cmd") == "ping":
                 # Idle keepalive from rank 0 (see _ep_heartbeat). The blocking collective this
                 # loop sits in is bounded by the process-group timeout, so without traffic it
@@ -1154,7 +1164,27 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
             with state.lock:
                 if stop.is_set():
                     return
-                state.ep.broadcast_request({"cmd": "ping"})
+                # The pair is idle here by construction: this holds the request lock, so no
+                # generate can be in flight, and the next one waits. That makes the keepalive
+                # tick the natural place to re-fit the resident experts to observed demand --
+                # it is the one moment both ranks are known quiet and already synchronised.
+                swaps = []
+                try:
+                    if state.engine.swaps_due():
+                        swaps = state.engine.plan_swaps(
+                            max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("expert adaptation planning failed (%s: %s); skipping", type(e).__name__, e)
+                    swaps = []
+                if swaps:
+                    # Both ranks recompute nothing: the plan travels with the command, so there is
+                    # no way for them to disagree about which slots moved.
+                    state.ep.broadcast_request({"cmd": "maintain", "swaps": swaps})
+                    t0 = time.time()
+                    n = state.engine.apply_swaps(swaps)
+                    log.info("expert adaptation: %d slots in %.2fs", n, time.time() - t0)
+                else:
+                    state.ep.broadcast_request({"cmd": "ping"})
         except Exception as e:  # noqa: BLE001
             log.warning("EP2 heartbeat failed (%s: %s); the pair is probably gone", type(e).__name__, e)
             return
