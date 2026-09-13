@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
-from engine.engram import EngramTable, make_hash_state  # noqa: E402
+from engine.engram import EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 import v41_ref as R  # noqa: E402
@@ -374,7 +374,8 @@ class V41Engine:
             self.kernel = "triton-cb3"
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
-        def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.bfloat16, slots_repeat=False):
+        def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.bfloat16, slots_repeat=False,
+                   null_slot=-1, routing_ids=None, routing_slot_map=None):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
             drafter would cost acceptance for nothing.
@@ -384,8 +385,11 @@ class V41Engine:
             FP4 arena at construction -- so that branch keeps its exact signature."""
             if cb3_cls is not None and isinstance(arena, cb3_cls):
                 return cb3_moe_fn(x, slots, weights, arena, limit)
+            extra = {"null_slot": null_slot} if null_slot >= 0 and self.kernel == "triton-fp4" else {}
+            if routing_ids is not None and self.kernel == "triton-fp4":
+                extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
             return fp4_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
-                              slots_repeat=slots_repeat)
+                              slots_repeat=slots_repeat, **extra)
 
         self.moe_fn = moe_fn
         arena_cls = fp4_arena_cls
@@ -501,6 +505,8 @@ class V41Engine:
         from concurrent.futures import ThreadPoolExecutor as _TPE
         self.eg_pool = _TPE(len(self.args.engram_layer_ids))
         self.model.engram_rows = lambda L, h: self.tables[L].rows(h)
+        self.model.engram_prefetch = lambda hashes: prefetch_rows(
+            self.tables, self.eg_pool, hashes, self.args.engram_layer_ids)
         self.prune_keep = prune_keep
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
@@ -606,6 +612,18 @@ class V41Engine:
                 self.fast.build_lut()
                 # prefill routes through Model.moe, which takes the same table when it is there
                 self.model.slot_lut = self.fast.lut
+                if self.ep.active and self.kernel == "triton-fp4":
+                    # Stable, compact per-layer IDs: resident owned experts plus one null.
+                    # Built once on the host; serving needs only a fixed-shape device gather.
+                    routes = {}
+                    for L in range(len(self.W.layers)):
+                        owned = sorted((e, slot) for (layer, e), slot in self.store.lru.items() if layer == L)
+                        ids = torch.full((384,), len(owned), dtype=torch.int32)
+                        for i, (e, _) in enumerate(owned):
+                            ids[e] = i
+                        slots = torch.tensor([s for _, s in owned] + [self.store.null_slot], dtype=torch.int32)
+                        routes[L] = (ids.to(device), slots.to(device))
+                    self.model.prefill_routes = routes
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
                 % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
@@ -1084,6 +1102,11 @@ class V41Engine:
             "sim_cb2_frac": self.sim_cb2_frac,
             "act_quant": self.act_quant,
             "swa_replay": self.swa_replay,
+            "prefill_skip_null": (self.ep.active and self.kernel == "triton-fp4" and
+                                  os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1"),
+            "prefill_fixed_routing": (bool(getattr(self.model, "prefill_routes", None)) and
+                                      os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1"),
+            "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
             "prune_select": getattr(self, "prune_select", None),
             "hot_profile": self.hot_profile,

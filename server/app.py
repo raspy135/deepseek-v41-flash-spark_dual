@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 import threading
 import time
@@ -1159,7 +1160,16 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
             return
 
 
+def _terminate(signum, frame):
+    raise SystemExit(0)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
+    # Docker runs this process as PID 1, where an unhandled SIGTERM is ignored.
+    # Raise through the existing finally blocks instead of waiting for SIGKILL.
+    # Do not call HTTPServer.shutdown() here: serve_forever runs on this thread.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     tok = Tok(args.model_dir)

@@ -41,7 +41,7 @@ declare -A _CLI=()
 for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT BIND_HOST MIN_FREE_GIB NAME0 NAME1 NCCL_SOCKET_IFNAME \
          MODELS_DIR MODEL_DIR MODEL_NAME SERVED_MODEL_NAME MAX_SEQ SPEC ARENA_GB TRACE_STATS \
          PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS \
-         DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S; do
+         DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S STOP_TIMEOUT; do
     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
 done
 # shellcheck disable=SC1091
@@ -136,7 +136,7 @@ common_flags=(
     --ipc host
     --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536
     --restart no
-    --stop-timeout "${STOP_TIMEOUT:-30}"   # matches dual-down.sh; see the note there
+    --stop-timeout "${STOP_TIMEOUT:-5}"   # matches dual-down.sh
     -v "$HOST_MODELS:/models"
     -v "$ROOT/results:/app/results"
     -v "$ROOT/.triton-cache:/app/.triton"

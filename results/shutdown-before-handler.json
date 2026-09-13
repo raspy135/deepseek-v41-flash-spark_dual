@@ -1,0 +1,5 @@
+{
+  "dual_shutdown_s": 8.428,
+  "grace_s": 5,
+  "server_sigterm_handler": false
+}

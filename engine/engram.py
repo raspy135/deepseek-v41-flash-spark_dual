@@ -12,7 +12,8 @@ import os
 import struct
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -134,6 +135,25 @@ class EngramTable:
         out = deq[torch.from_numpy(inv).to(self.device)].view(hashes.shape[0], hashes.shape[1], 256)
         self.stats["rows"] += int(n); self.stats["seconds"] += time.perf_counter() - t0; self.stats["calls"] += 1
         return out
+
+
+@contextmanager
+def prefetch_rows(tables, pool, hashes, layer_ids):
+    """Overlap a chunk's host row reads with its GPU layers, joining on every exit."""
+    host_hashes = hashes.cpu().numpy()
+    futures = {}
+    try:
+        for li, layer in enumerate(layer_ids):
+            futures[layer] = pool.submit(tables[layer].read_raw, host_hashes[:, li, :])
+
+        def rows(layer, _hashes):
+            return tables[layer].to_device(*futures[layer].result())
+
+        yield rows
+    finally:
+        # Workers must finish before the next request resets counters/caches,
+        # including when a forward fails before reaching the second table.
+        wait(list(futures.values()))
 
 
 def make_hash_state(model_dir: str, tokenizer, max_seq: int, device: str):

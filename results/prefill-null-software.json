@@ -1,0 +1,122 @@
+[
+  {
+    "fixed_ms": 1.681,
+    "combined_speedup": 1.092,
+    "tokens": 17,
+    "remote_fraction": 0.0,
+    "bit_exact": true,
+    "baseline_ms": 1.837,
+    "optimized_ms": 1.746,
+    "speedup": 1.052
+  },
+  {
+    "fixed_ms": 1.879,
+    "combined_speedup": 1.052,
+    "tokens": 17,
+    "remote_fraction": 0.5,
+    "bit_exact": true,
+    "baseline_ms": 1.977,
+    "optimized_ms": 1.794,
+    "speedup": 1.102
+  },
+  {
+    "fixed_ms": 0.088,
+    "combined_speedup": 4.995,
+    "tokens": 17,
+    "remote_fraction": 1.0,
+    "bit_exact": true,
+    "baseline_ms": 0.442,
+    "optimized_ms": 0.19,
+    "speedup": 2.322
+  },
+  {
+    "fixed_ms": 2.621,
+    "combined_speedup": 1.094,
+    "tokens": 128,
+    "remote_fraction": 0.0,
+    "bit_exact": true,
+    "baseline_ms": 2.867,
+    "optimized_ms": 2.411,
+    "speedup": 1.189
+  },
+  {
+    "fixed_ms": 2.143,
+    "combined_speedup": 1.323,
+    "tokens": 128,
+    "remote_fraction": 0.5,
+    "bit_exact": true,
+    "baseline_ms": 2.834,
+    "optimized_ms": 1.962,
+    "speedup": 1.444
+  },
+  {
+    "fixed_ms": 0.172,
+    "combined_speedup": 8.728,
+    "tokens": 128,
+    "remote_fraction": 1.0,
+    "bit_exact": true,
+    "baseline_ms": 1.504,
+    "optimized_ms": 0.286,
+    "speedup": 5.256
+  },
+  {
+    "fixed_ms": 9.931,
+    "combined_speedup": 0.997,
+    "tokens": 513,
+    "remote_fraction": 0.0,
+    "bit_exact": true,
+    "baseline_ms": 9.902,
+    "optimized_ms": 10.168,
+    "speedup": 0.974
+  },
+  {
+    "fixed_ms": 4.756,
+    "combined_speedup": 2.02,
+    "tokens": 513,
+    "remote_fraction": 0.5,
+    "bit_exact": true,
+    "baseline_ms": 9.61,
+    "optimized_ms": 4.868,
+    "speedup": 1.974
+  },
+  {
+    "fixed_ms": 0.716,
+    "combined_speedup": 9.429,
+    "tokens": 513,
+    "remote_fraction": 1.0,
+    "bit_exact": true,
+    "baseline_ms": 6.755,
+    "optimized_ms": 0.858,
+    "speedup": 7.871
+  },
+  {
+    "fixed_ms": 40.55,
+    "combined_speedup": 1.038,
+    "tokens": 2048,
+    "remote_fraction": 0.0,
+    "bit_exact": true,
+    "baseline_ms": 42.096,
+    "optimized_ms": 41.66,
+    "speedup": 1.01
+  },
+  {
+    "fixed_ms": 24.186,
+    "combined_speedup": 1.721,
+    "tokens": 2048,
+    "remote_fraction": 0.5,
+    "bit_exact": true,
+    "baseline_ms": 41.612,
+    "optimized_ms": 24.156,
+    "speedup": 1.723
+  },
+  {
+    "fixed_ms": 2.777,
+    "combined_speedup": 13.414,
+    "tokens": 2048,
+    "remote_fraction": 1.0,
+    "bit_exact": true,
+    "baseline_ms": 37.252,
+    "optimized_ms": 3.211,
+    "speedup": 11.601
+  }
+]

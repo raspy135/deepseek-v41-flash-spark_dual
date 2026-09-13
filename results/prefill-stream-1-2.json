@@ -1,0 +1,350 @@
+[
+  {
+    "run": 0,
+    "wall_s": 7.78889084502589,
+    "usage": {
+      "prompt_tokens": 4509,
+      "completion_tokens": 16,
+      "total_tokens": 4525,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "stats": {
+      "engine": "v41",
+      "ep_world_size": 2,
+      "ep_rank": 0,
+      "arena_gb": 88.0,
+      "arena_slots": 4680,
+      "lru_slots": 4663,
+      "transient_slots": 16,
+      "resident_expert_pct": 30.5,
+      "max_seq": 32768,
+      "spec": true,
+      "trace_stats": "/app/results/trace-union/stats/coverage.json",
+      "kernel": "triton-fp4",
+      "expert_format": "fp4",
+      "expert_mb": 18.8,
+      "dense_fp4": "off",
+      "head_fmt": "bf16",
+      "routed_topk": 6,
+      "sim_cb2_frac": 0.0,
+      "act_quant": false,
+      "swa_replay": true,
+      "prune_keep": 0.6,
+      "prune_select": "uniform",
+      "hot_profile": "mixed",
+      "prefill_chunk": 2048,
+      "io_threads": 12,
+      "read_threads": 24,
+      "read_chunk_mb": 4.0,
+      "prompt_tokens": 4509,
+      "completion_tokens": 19,
+      "prefill_s": 7.143,
+      "prefill_tok_s": 631.23,
+      "decode_s": 0.543,
+      "decode_tok_s": 33.18,
+      "steps": 3,
+      "accept_len_mean": 6.0,
+      "expert_hit_rate": 1.0,
+      "expert_misses": 0,
+      "prefill_expert_misses": 0,
+      "nvme_gb": 0.0,
+      "nvme_read_s": 0.0,
+      "engram_rows": 94973,
+      "engram_s": 2.474,
+      "engram_read_s": 0.109,
+      "attn_s": 3.09,
+      "moe_s": 0.43,
+      "ep_s": 0.02,
+      "remote_experts": 0,
+      "route_s": 0.0,
+      "load_wait_s": 0.0,
+      "sync_s": 0.0,
+      "book_s": 0.0,
+      "resolves": 0,
+      "ep_calls": 82,
+      "ep_us_per_call": 298.0,
+      "lease_s": 0.0,
+      "h2d_s": 0.0,
+      "kernel_s": 0.43,
+      "nvme_gb_per_token": 0.0,
+      "promoted": 0,
+      "decode_accounting": {
+        "attn": {
+          "s": 3.09,
+          "pct": 40.2
+        },
+        "moe_sync_gpu_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_book_host": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_nvme_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_compute": {
+          "s": 0.41,
+          "pct": 5.3
+        },
+        "ep_collective": {
+          "s": 0.02,
+          "pct": 0.3
+        },
+        "engram": {
+          "s": 2.47,
+          "pct": 32.2
+        },
+        "unaccounted": {
+          "s": 1.69,
+          "pct": 22.0
+        }
+      },
+      "accounting_covers": "prefill+decode",
+      "server_completion_tok_per_s": 2.1
+    },
+    "choices": [
+      {
+        "text": "def function_300(value): return value * 301 + 11\ndef"
+      }
+    ],
+    "prompt_sha256": "57d36bbf118984bef5e564f2a3a979d037df2ab784a3a0377b28dfacba2d5f84",
+    "ttft_s": 7.246081802994013
+  },
+  {
+    "run": 1,
+    "wall_s": 6.367091592983343,
+    "usage": {
+      "prompt_tokens": 4509,
+      "completion_tokens": 16,
+      "total_tokens": 4525,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "stats": {
+      "engine": "v41",
+      "ep_world_size": 2,
+      "ep_rank": 0,
+      "arena_gb": 88.0,
+      "arena_slots": 4680,
+      "lru_slots": 4663,
+      "transient_slots": 16,
+      "resident_expert_pct": 30.5,
+      "max_seq": 32768,
+      "spec": true,
+      "trace_stats": "/app/results/trace-union/stats/coverage.json",
+      "kernel": "triton-fp4",
+      "expert_format": "fp4",
+      "expert_mb": 18.8,
+      "dense_fp4": "off",
+      "head_fmt": "bf16",
+      "routed_topk": 6,
+      "sim_cb2_frac": 0.0,
+      "act_quant": false,
+      "swa_replay": true,
+      "prune_keep": 0.6,
+      "prune_select": "uniform",
+      "hot_profile": "mixed",
+      "prefill_chunk": 2048,
+      "io_threads": 12,
+      "read_threads": 24,
+      "read_chunk_mb": 4.0,
+      "prompt_tokens": 4509,
+      "completion_tokens": 19,
+      "prefill_s": 5.747,
+      "prefill_tok_s": 784.62,
+      "decode_s": 0.537,
+      "decode_tok_s": 33.53,
+      "steps": 3,
+      "accept_len_mean": 6.0,
+      "expert_hit_rate": 1.0,
+      "expert_misses": 0,
+      "prefill_expert_misses": 0,
+      "nvme_gb": 0.0,
+      "nvme_read_s": 0.0,
+      "engram_rows": 94973,
+      "engram_s": 1.948,
+      "engram_read_s": 0.106,
+      "attn_s": 2.56,
+      "moe_s": 0.4,
+      "ep_s": 0.02,
+      "remote_experts": 0,
+      "route_s": 0.0,
+      "load_wait_s": 0.0,
+      "sync_s": 0.0,
+      "book_s": 0.0,
+      "resolves": 0,
+      "ep_calls": 82,
+      "ep_us_per_call": 255.5,
+      "lease_s": 0.0,
+      "h2d_s": 0.0,
+      "kernel_s": 0.4,
+      "nvme_gb_per_token": 0.0,
+      "promoted": 0,
+      "decode_accounting": {
+        "attn": {
+          "s": 2.56,
+          "pct": 40.7
+        },
+        "moe_sync_gpu_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_book_host": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_nvme_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_compute": {
+          "s": 0.38,
+          "pct": 6.1
+        },
+        "ep_collective": {
+          "s": 0.02,
+          "pct": 0.3
+        },
+        "engram": {
+          "s": 1.95,
+          "pct": 31.0
+        },
+        "unaccounted": {
+          "s": 1.38,
+          "pct": 21.9
+        }
+      },
+      "accounting_covers": "prefill+decode",
+      "server_completion_tok_per_s": 2.5
+    },
+    "choices": [
+      {
+        "text": "def function_300(value): return value * 301 + 11\ndef"
+      }
+    ],
+    "prompt_sha256": "57d36bbf118984bef5e564f2a3a979d037df2ab784a3a0377b28dfacba2d5f84",
+    "ttft_s": 5.829688220052049
+  },
+  {
+    "run": 2,
+    "wall_s": 6.352725584991276,
+    "usage": {
+      "prompt_tokens": 4509,
+      "completion_tokens": 16,
+      "total_tokens": 4525,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "stats": {
+      "engine": "v41",
+      "ep_world_size": 2,
+      "ep_rank": 0,
+      "arena_gb": 88.0,
+      "arena_slots": 4680,
+      "lru_slots": 4663,
+      "transient_slots": 16,
+      "resident_expert_pct": 30.5,
+      "max_seq": 32768,
+      "spec": true,
+      "trace_stats": "/app/results/trace-union/stats/coverage.json",
+      "kernel": "triton-fp4",
+      "expert_format": "fp4",
+      "expert_mb": 18.8,
+      "dense_fp4": "off",
+      "head_fmt": "bf16",
+      "routed_topk": 6,
+      "sim_cb2_frac": 0.0,
+      "act_quant": false,
+      "swa_replay": true,
+      "prune_keep": 0.6,
+      "prune_select": "uniform",
+      "hot_profile": "mixed",
+      "prefill_chunk": 2048,
+      "io_threads": 12,
+      "read_threads": 24,
+      "read_chunk_mb": 4.0,
+      "prompt_tokens": 4509,
+      "completion_tokens": 19,
+      "prefill_s": 5.73,
+      "prefill_tok_s": 786.95,
+      "decode_s": 0.54,
+      "decode_tok_s": 33.32,
+      "steps": 3,
+      "accept_len_mean": 6.0,
+      "expert_hit_rate": 1.0,
+      "expert_misses": 0,
+      "prefill_expert_misses": 0,
+      "nvme_gb": 0.0,
+      "nvme_read_s": 0.0,
+      "engram_rows": 94973,
+      "engram_s": 1.92,
+      "engram_read_s": 0.091,
+      "attn_s": 2.57,
+      "moe_s": 0.39,
+      "ep_s": 0.03,
+      "remote_experts": 0,
+      "route_s": 0.0,
+      "load_wait_s": 0.0,
+      "sync_s": 0.0,
+      "book_s": 0.0,
+      "resolves": 0,
+      "ep_calls": 82,
+      "ep_us_per_call": 309.0,
+      "lease_s": 0.0,
+      "h2d_s": 0.0,
+      "kernel_s": 0.39,
+      "nvme_gb_per_token": 0.0,
+      "promoted": 0,
+      "decode_accounting": {
+        "attn": {
+          "s": 2.57,
+          "pct": 41.0
+        },
+        "moe_sync_gpu_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_book_host": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_nvme_wait": {
+          "s": 0.0,
+          "pct": 0.0
+        },
+        "moe_compute": {
+          "s": 0.37,
+          "pct": 5.9
+        },
+        "ep_collective": {
+          "s": 0.03,
+          "pct": 0.4
+        },
+        "engram": {
+          "s": 1.92,
+          "pct": 30.6
+        },
+        "unaccounted": {
+          "s": 1.39,
+          "pct": 22.1
+        }
+      },
+      "accounting_covers": "prefill+decode",
+      "server_completion_tok_per_s": 2.5
+    },
+    "choices": [
+      {
+        "text": "def function_300(value): return value * 301 + 11\ndef"
+      }
+    ],
+    "prompt_sha256": "57d36bbf118984bef5e564f2a3a979d037df2ab784a3a0377b28dfacba2d5f84",
+    "ttft_s": 5.812114168889821
+  }
+]

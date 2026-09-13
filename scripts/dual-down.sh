@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # dual-down.sh -- stop the EP2 pair and wait for the unified pool to come back on BOTH boxes.
 #
-# Order matters a little: rank 0 first, so its shutdown broadcast (server/app.py) reaches the
-# headless worker and that rank exits on its own instead of sitting in broadcast_request until
-# the process-group timeout. The explicit rank-1 removal afterwards is the backstop for when
-# the head died badly and never sent it.
+# Stop both ranks concurrently: one grace period for the pair, then verify both
+# memory pools have been reclaimed before returning. --force skips the grace.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
+declare -A _CLI=()
+for v in STOP_TIMEOUT MIN_FREE_GIB PEER NAME0 NAME1; do
+    [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
+done
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
+for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
 PEER="${PEER:-}"
 NAME0="${NAME0:-deepseek-v41-ep2-rank0}"
 NAME1="${NAME1:-deepseek-v41-ep2-rank1}"
@@ -17,34 +20,54 @@ MIN_FREE_GIB="${MIN_FREE_GIB:-90}"
 
 # Grace is short on purpose. A clean Python unwind of an 88 GB pinned arena rarely finishes
 # inside a few minutes anyway; past STOP_TIMEOUT docker SIGKILLs, and the kernel reclaims the
-# unified pool in seconds. The expensive part of dual-down is wait_mem below, not this grace.
-STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
+# unified pool in seconds. Memory reclamation is checked separately below.
+STOP_TIMEOUT="${STOP_TIMEOUT:-5}"
+case "${1:-}" in
+    --force|-f) STOP_TIMEOUT=0 ;;
+    "") ;;
+    *) echo "usage: $0 [--force]" >&2; exit 2 ;;
+esac
+[[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "STOP_TIMEOUT must be a nonnegative integer" >&2; exit 2; }
 
-echo "--- stopping rank 0 ($NAME0) (grace ${STOP_TIMEOUT}s)"
-docker stop -t "$STOP_TIMEOUT" "$NAME0" >/dev/null 2>&1 || true
-docker rm -f "$NAME0" >/dev/null 2>&1 || true
-
+echo "--- stopping both ranks (grace ${STOP_TIMEOUT}s, concurrent)"
+(
+    if docker container inspect "$NAME0" >/dev/null 2>&1; then
+        docker stop -t "$STOP_TIMEOUT" "$NAME0" >/dev/null 2>&1 || true
+        docker rm -f "$NAME0" >/dev/null
+    fi
+) &
+local_stop=$!
+peer_stop=""
 if [[ -n "$PEER" ]]; then
-    echo "--- stopping rank 1 on $PEER ($NAME1) (grace ${STOP_TIMEOUT}s)"
-    ssh -o BatchMode=yes "$PEER" "docker stop -t '$STOP_TIMEOUT' '$NAME1' >/dev/null 2>&1 || true; docker rm -f '$NAME1' >/dev/null 2>&1 || true" || true
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" "if docker container inspect '$NAME1' >/dev/null 2>&1; then docker stop -t '$STOP_TIMEOUT' '$NAME1' >/dev/null 2>&1 || true; docker rm -f '$NAME1' >/dev/null; fi" &
+    peer_stop=$!
 fi
+rc=0
+wait "$local_stop" || rc=1
+[[ -z "$peer_stop" ]] || wait "$peer_stop" || rc=1
 
 wait_mem() {   # $1 = label, $2 = "" local or ssh target
     local label="$1" tgt="${2:-}" a
-    echo -n "--- waiting for $label to return >= ${MIN_FREE_GIB} GiB: "
+    echo "--- waiting for $label to return >= ${MIN_FREE_GIB} GiB: "
     for _ in $(seq 1 60); do
         if [[ -z "$tgt" ]]; then
             a=$(awk '/^MemAvailable:/ {printf "%d", $2/1048576}' /proc/meminfo)
         else
-            a=$(ssh -o BatchMode=yes "$tgt" 'awk "/^MemAvailable:/ {printf \"%d\", \$2/1048576}" /proc/meminfo' 2>/dev/null)
+            a=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$tgt" 'awk "/^MemAvailable:/ {printf \"%d\", \$2/1048576}" /proc/meminfo' 2>/dev/null)
         fi
-        if [[ -n "$a" ]] && (( a >= MIN_FREE_GIB )); then echo "OK, ${a} GiB"; return 0; fi
+        if [[ -n "$a" ]] && (( a >= MIN_FREE_GIB )); then echo "--- $label: OK, ${a} GiB"; return 0; fi
         sleep 3
     done
     echo "WARNING: still at ${a:-?} GiB -- do not start another server yet" >&2
     return 1
 }
-rc=0
-wait_mem "this box" "" || rc=1
-[[ -n "$PEER" ]] && { wait_mem "$PEER" "$PEER" || rc=1; }
+wait_mem "this box" "" &
+local_mem=$!
+peer_mem=""
+if [[ -n "$PEER" ]]; then
+    wait_mem "$PEER" "$PEER" &
+    peer_mem=$!
+fi
+wait "$local_mem" || rc=1
+[[ -z "$peer_mem" ]] || wait "$peer_mem" || rc=1
 exit $rc

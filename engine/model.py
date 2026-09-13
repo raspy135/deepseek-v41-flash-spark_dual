@@ -15,6 +15,7 @@ Any (S, T) with T <= 512 works, which is what chunked prefill and 6-token verify
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 import os
 import sys
 import time
@@ -648,15 +649,30 @@ class Model:
         # fp32, all-reduces, and rounds once, exactly where the single-box path rounds: what
         # remains is purely the REGROUPED fp32 addition engine/dist.py documents.
         if getattr(store, "null_slot", None) is not None:
+            route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
+            route_args = {}
+            if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
+                route_args = {"routing_ids": route[0][indices], "routing_slot_map": route[1]}
             # slots_repeat: every non-owned expert of this call shares the ONE null slot, so the
             # decode block aims ~half its (token, k) pairs at a single slot. The decode-sized
             # routing builder gives each slot one BM-wide block and silently overflows past BM
             # pairs -- with BM=16 and a 6-token verify block that corrupted ~1 token in 10 while
             # staying fluent enough to look like a sampling quirk. tools/fp4_moe.py.
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
-                                 slots_repeat=True)
+                                 slots_repeat=True,
+                                 null_slot=(store.null_slot if prefill and
+                                            os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1" else -1),
+                                 **route_args)
+            # Split the combine off on the GPU timeline. The host timer below (ep_s) measures the
+            # LAUNCH -- dist.all_reduce is async on CUDA -- which is why it reports ~0.25 ms for a
+            # collective that G2 measured at 3.5 ms for this payload. The gap between these two
+            # marks is the real cost, and it includes waiting for the peer to arrive: with 40
+            # rendezvous per chunk, that wait is the prime suspect for the GPU going up and down
+            # during prefill.
+            _mark("moe_kernel")
             tc = time.perf_counter()
             store.ep.combine(routed)
+            _mark("ep_combine")
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
             self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
             routed = routed.to(torch.bfloat16).float()
@@ -793,23 +809,28 @@ class Model:
         main_hiddens = []
         n_layers = len(self.W.layers)
         last = a.candidate_source_layer if encoder_only else n_layers - 1
-        for L in range(last + 1):
-            w = self.W.layers[L]
-            if L in self.W.engram:
-                t0 = time.perf_counter()
-                li = list(a.engram_layer_ids).index(L)
-                rows = self.engram_rows(L, hashes[:, li, :])
-                self._tap("engram_rows", L, rows)
-                h = R.engram_forward(h, rows, self.W.engram[L], a)
-                self._tap("engram_out", L, h)
-                self.stats["engram_s"] += time.perf_counter() - t0
-                _mark("engram")
-            if L in a.dspark_target_layer_ids:
-                main_hiddens.append(h.float().mean(dim=1))
-            freqs = self.freqs_c if w.ratio else self.freqs_w
-            h, pre_mix = self.block(h, pre_mix, w, L, S, sh, self.c.win[L], freqs, prefill, self.store,
-                                    self.store.arena, a.n_routed_experts)
-            self._tap("h", L, h); self._tap("pre_mix", L, pre_mix)
+        prefetch = getattr(self, "engram_prefetch", None)
+        context = (prefetch(hashes) if prefill and hashes is not None and prefetch is not None
+                   and os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1"
+                   else nullcontext(self.engram_rows))
+        with context as get_rows:
+            for L in range(last + 1):
+                w = self.W.layers[L]
+                if L in self.W.engram:
+                    t0 = time.perf_counter()
+                    li = list(a.engram_layer_ids).index(L)
+                    rows = get_rows(L, hashes[:, li, :])
+                    self._tap("engram_rows", L, rows)
+                    h = R.engram_forward(h, rows, self.W.engram[L], a)
+                    self._tap("engram_out", L, h)
+                    self.stats["engram_s"] += time.perf_counter() - t0
+                    _mark("engram")
+                if L in a.dspark_target_layer_ids:
+                    main_hiddens.append(h.float().mean(dim=1))
+                freqs = self.freqs_c if w.ratio else self.freqs_w
+                h, pre_mix = self.block(h, pre_mix, w, L, S, sh, self.c.win[L], freqs, prefill, self.store,
+                                        self.store.arena, a.n_routed_experts)
+                self._tap("h", L, h); self._tap("pre_mix", L, pre_mix)
         self.c.len = S + T
         self.stats["tokens"] += T
         if encoder_only:

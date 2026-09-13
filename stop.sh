@@ -37,6 +37,8 @@ avail_gib() {
 # shellcheck disable=SC1091
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
 PEER="${PEER:-}"
+STOP_TIMEOUT="${STOP_TIMEOUT:-5}"
+[[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "STOP_TIMEOUT must be a nonnegative integer" >&2; exit 2; }
 PEER_PID_FILE="$SCRIPT_DIR/logs/server_peer.pid"
 peer_stop() {
     [[ -n "$PEER" ]] || return 0
@@ -97,9 +99,9 @@ echo "stopping pids: $(echo "$pids" | tr '\n' ' ')"
 
 if [[ "$FORCE" == false ]]; then
     for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
-    for _ in $(seq 1 30); do
+    for ((i=0; i<STOP_TIMEOUT; i++)); do
         [[ -z "$(server_pids)" ]] && break
-        sleep 2
+        sleep 1
     done
 fi
 
@@ -107,7 +109,7 @@ remaining=$(server_pids)
 if [[ -n "$remaining" ]]; then
     echo "escalating to SIGKILL: $(echo "$remaining" | tr '\n' ' ')"
     for p in $remaining; do kill -KILL "$p" 2>/dev/null || true; done
-    sleep 5
+    sleep 1
 fi
 
 if [[ -n "$(server_pids)" ]]; then

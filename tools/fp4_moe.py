@@ -244,7 +244,7 @@ def _moe_up_kernel(
     wgt_ptr, block_slot_ptr, block_pair_ptr,
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, SCALED: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -252,6 +252,8 @@ def _moe_up_kernel(
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
     if slot < 0:
+        return
+    if slot == NULL_SLOT:
         return
     slot = slot.to(tl.int64)
 
@@ -302,7 +304,7 @@ def _moe_down_kernel(
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, SCALED: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -317,6 +319,12 @@ def _moe_down_kernel(
     mask_m = offs_m >= 0
     offs_m = tl.where(mask_m, offs_m, 0)
     offs_n = nb * BN + tl.arange(0, BN)
+    if slot == NULL_SLOT:
+        # The up kernel skipped these pairs. Write their contribution explicitly:
+        # parts is uninitialized, and its final reduction includes every pair.
+        row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
+        tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], 0.0, mask=mask_m[:, None])
+        return
     offs_j = tl.arange(0, 64)
     offs_q = tl.arange(0, 4)
 
@@ -338,9 +346,18 @@ def _moe_down_kernel(
 
 # --------------------------------------------------------------------------- routing
 @triton.jit
+def _route_counts(slots_ptr, counts_ptr, P: tl.constexpr, PB: tl.constexpr):
+    s = tl.program_id(0)
+    p = tl.arange(0, PB)
+    v = tl.load(slots_ptr + p, mask=p < P, other=-1)
+    tl.store(counts_ptr + s, tl.sum((v == s).to(tl.int32), 0))
+
+
+@triton.jit
 def _route_kernel(
-    slots_ptr, block_slot_ptr, block_pair_ptr, P, NB,
+    slots_ptr, block_slot_ptr, block_pair_ptr, P, NB, counts_ptr,
     S: tl.constexpr, PB: tl.constexpr, PC: tl.constexpr, BM: tl.constexpr, NBB: tl.constexpr,
+    PRECOUNT: tl.constexpr = False, NS: tl.constexpr = 0,
 ):
     """Program s owns arena slot s: finds its pairs and assigns them BM-padded block positions.
 
@@ -351,11 +368,14 @@ def _route_kernel(
     """
     s = tl.program_id(0)
     slot_ids = tl.arange(0, S)
-    counts = tl.zeros([S], dtype=tl.int32)
-    for c in range(0, PB, PC):
-        offs_c = c + tl.arange(0, PC)
-        v = tl.load(slots_ptr + offs_c, mask=offs_c < P, other=-1)
-        counts += tl.sum((v[:, None] == slot_ids[None, :]).to(tl.int32), 0)
+    if PRECOUNT:
+        counts = tl.load(counts_ptr + slot_ids, mask=slot_ids < NS, other=0)
+    else:
+        counts = tl.zeros([S], dtype=tl.int32)
+        for c in range(0, PB, PC):
+            offs_c = c + tl.arange(0, PC)
+            v = tl.load(slots_ptr + offs_c, mask=offs_c < P, other=-1)
+            counts += tl.sum((v[:, None] == slot_ids[None, :]).to(tl.int32), 0)
     nblk = (counts + BM - 1) // BM
     blk_start = tl.cumsum(nblk, 0) - nblk
     my_start = tl.sum(tl.where(slot_ids == s, blk_start, 0))
@@ -427,7 +447,7 @@ def build_routing_small(slots: torch.Tensor, BM: int):
     return block_slot, block_pair, P
 
 
-def build_routing(slots: torch.Tensor, n_slots: int, BM: int):
+def build_routing(slots: torch.Tensor, n_slots: int, BM: int, precount: bool = False):
     """Group the (token, k) pairs by arena slot, each slot's run padded to a multiple of BM, so that
     one program == one expert x BM pairs. One small Triton launch,
     no host sync, so the CPU launch overhead of the main kernels overlaps with GPU work.
@@ -446,8 +466,12 @@ def build_routing(slots: torch.Tensor, n_slots: int, BM: int):
     block_pair = torch.empty((NB * BM,), dtype=torch.int32, device=dev)
     S = _next_pow2(max(n_slots, 2))
     PB = _next_pow2(max(P, 16))
+    counts = torch.empty((n_slots,), dtype=torch.int32, device=dev) if precount else flat
+    if precount:
+        _route_counts[(n_slots,)](flat, counts, P=P, PB=PB)
     _route_kernel[(n_slots,)](
-        flat, block_slot, block_pair, P, NB,
+        flat, block_slot, block_pair, P, NB, counts,
+        PRECOUNT=precount, NS=n_slots,
         S=S, PB=PB, PC=max(16, min(PB, 8192 // S)), BM=BM, NBB=_next_pow2((P + BM - 1) // BM + 1), num_warps=4,
     )
     return block_slot, block_pair, NB
@@ -477,6 +501,9 @@ def moe_forward(
     down_cfg: tuple[int, int, int] | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     slots_repeat: bool = False,
+    null_slot: int = -1,
+    routing_ids: torch.Tensor | None = None,
+    routing_slot_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
 
@@ -492,6 +519,7 @@ def moe_forward(
     only when P <= 64, and a slot cannot hold more pairs than there are pairs, so BM = 64 >= P > rank
     always. See build_routing_small's HARD INVARIANT. Default False keeps the single-box BM (and the
     sweep-tuned configs) exactly as they were."""
+    # null_slot must denote a known zero expert, never an ordinary arena slot.
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     assert weights.shape == (T, K)
@@ -500,7 +528,11 @@ def moe_forward(
     BM = block_m or (64 if (slots_repeat and P <= 64) else _pick_bm(P))
     bn1, nw1, ns1 = up_cfg or _UP_CFG[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
-    if P <= 64:  # decode-sized call. build_routing_small needs BM >= the longest per-slot run:
+    if routing_ids is not None and P > 64:
+        assert routing_slot_map is not None and routing_ids.shape == slots.shape
+        block_slot, block_pair, NB = build_routing(routing_ids, routing_slot_map.numel(), BM, precount=True)
+        block_slot = torch.where(block_slot >= 0, routing_slot_map[block_slot.clamp_min(0)], block_slot)
+    elif P <= 64:  # decode-sized call. build_routing_small needs BM >= the longest per-slot run:
         # distinct top-k picks give <= T <= 6 on one box, but EP2's shared null slot does not --
         # hence slots_repeat, which lifts BM to 64 >= P. build_routing (below) pads long runs
         # across multiple blocks itself, so the prefill path was never exposed to this.
@@ -533,13 +565,13 @@ def moe_forward(
         x, arena.w1, arena.s1, arena.w3, arena.s3, h,
         wgt, block_slot, block_pair,
         x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, num_warps=nw1, num_stages=ns1,
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
     )
     _moe_down_kernel[(NB, DIM // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
-        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, num_warps=nw2, num_stages=ns2,
+        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw2, num_stages=ns2,
     )
     return parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
 
