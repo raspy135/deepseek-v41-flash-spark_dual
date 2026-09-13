@@ -163,9 +163,11 @@ class EngramTable:
         if not self.pinned:
             rawt = torch.from_numpy(raw).to(self.device)
             invt = torch.from_numpy(inv.reshape(-1)).to(self.device)
-            if self._splitting():
+            if self._splitting() and n:
                 # Disjoint halves over a zero background: SUM is the union, bit-exact, no
-                # overflow. Must run on every rank for the same (chunk, layer) or the pair wedges.
+                # overflow. Must run on every rank for the same (chunk, layer) or the pair wedges
+                # -- `n` is derived from the hashes, which both ranks compute identically, so the
+                # skip-on-empty is taken on both or neither.
                 import torch.distributed as _dist
                 _dist.all_reduce(rawt, op=_dist.ReduceOp.SUM)
         else:
