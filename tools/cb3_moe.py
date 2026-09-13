@@ -696,14 +696,24 @@ CB3_DOWN_CFG = {16: (32, 4, 3), 32: (32, 4, 3), 64: (32, 4, 3)}
 
 def moe_forward_v3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: CB3ArenaV2,
                    swiglu_limit: float = 10.0, block_m: int | None = None,
-                   cfg_up=None, cfg_down=None) -> torch.Tensor:
+                   cfg_up=None, cfg_down=None, out_dtype=torch.bfloat16,
+                   slots_repeat: bool = False) -> torch.Tensor:
+    """`out_dtype=torch.float32` is the EP2 hook (engine/model.py::moe): this rank's HALF of the
+    k-sum must stay unrounded until after the all-reduce, or each half rounds separately and their
+    fp32 total carries both errors. `parts` is fp32 throughout, so this only skips the final cast.
+
+    `slots_repeat=True` says many (token, k) pairs may land on ONE slot -- true under EP2, where
+    every non-owned expert shares the arena's null slot. It lifts BM the same way the FP4 path
+    does (fp4_moe.moe_forward); without it a 6-token verify block overflows a BM=16 block and
+    corrupts roughly one token in ten while staying fluent enough to look like a sampling quirk.
+    """
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     P = T * K
     if P >= PREFILL_MIN_P and PREFILL_MODE == "fp4" and block_m is None and cfg_up is None:
-        return moe_forward_prefill(x, slots, weights, arena, swiglu_limit)
+        return moe_forward_prefill(x, slots, weights, arena, swiglu_limit, out_dtype=out_dtype)
     dev = x.device
-    BM = block_m or _pick_bm(P)
+    BM = block_m or (64 if (slots_repeat and P <= 64) else _pick_bm(P))
     bn1, nw1, ns1 = cfg_up or CB3_UP_CFG[BM]
     bn2, nw2, ns2 = cfg_down or CB3_DOWN_CFG[BM]
     if P <= 64:  # decode-sized call: pure-torch routing (static shapes, graph-capturable)
@@ -722,7 +732,8 @@ def moe_forward_v3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, 
     _cb3v3_down_kernel[(NB, DIM // bn2)](
         h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
         h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1], num_warps=nw2, num_stages=ns2)
-    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+    out = parts.view(K, T, DIM).sum(dim=0)
+    return out if out_dtype == torch.float32 else out.to(out_dtype)
 
 
 # ---------------------------------------------------------------------------- prefill: unpack to FP4
@@ -810,7 +821,7 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch) -> None:
 
 def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
                         arena: CB3ArenaV2, swiglu_limit: float = 10.0,
-                        batch: int | None = None) -> torch.Tensor:
+                        batch: int | None = None, out_dtype=torch.bfloat16) -> torch.Tensor:
     """Prefill-sized call over a CB3 arena, via the FP4 kernel and a batched unpack scratch."""
     T, K = slots.shape
     P = T * K
@@ -848,7 +859,8 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
         F4._moe_down_kernel[(NB, DIM // bn2)](
             h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
             TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
-    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+    out = parts.view(K, T, DIM).sum(dim=0)
+    return out if out_dtype == torch.float32 else out.to(out_dtype)
 
 
 # ============================================================================= CB2: the 2-bit tier

@@ -139,8 +139,12 @@ class ExpertStore:
         self.null_slot = None
         self.n_slots = arena.slots - 1 if ep_active else arena.slots
         if ep_active:
-            assert type(arena).__name__ == "ExpertArena", \
-                "EP2 is wired for the FP4 arena only (the CB3 null-slot load is unwritten)"
+            # Both arena formats can hold a zero expert now. The FP4 arena stores the zeros
+            # verbatim; the CB3 arena packs them, which yields an all-zero codebook whose codes
+            # all decode to zero -- verified against dequant_slot rather than assumed, because a
+            # null slot that decodes to anything else adds silent garbage to every token routed
+            # to a non-owned expert.
+            assert type(arena).__name__ in ("ExpertArena", "CB3ArenaV2"), type(arena).__name__
             self.null_slot = arena.slots - 1
         self.transient_slots = transient_slots
         self.lru_slots = self.n_slots - transient_slots

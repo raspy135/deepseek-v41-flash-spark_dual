@@ -438,10 +438,13 @@ class V41Engine:
             drafter would cost acceptance for nothing.
 
             `out_dtype` is the EP2 hook (engine/model.py::moe): fp32 keeps this rank's HALF of
-            the k-sum unrounded until after the all-reduce. CB3 never sees it -- EP2 asserts the
-            FP4 arena at construction -- so that branch keeps its exact signature."""
+            the k-sum unrounded until after the all-reduce. Both arena formats take it now."""
             if cb3_cls is not None and isinstance(arena, cb3_cls):
-                return cb3_moe_fn(x, slots, weights, arena, limit)
+                # out_dtype/slots_repeat are the EP2 hooks, same meaning as the FP4 path below.
+                # null_slot is not passed: the CB3 kernels have no skip, so a pair routed at the
+                # null slot computes zeros instead of being skipped -- correct, just not free.
+                return cb3_moe_fn(x, slots, weights, arena, limit,
+                                  out_dtype=out_dtype, slots_repeat=slots_repeat)
             extra = {"null_slot": null_slot} if null_slot >= 0 and self.kernel == "triton-fp4" else {}
             if routing_ids is not None and self.kernel == "triton-fp4":
                 extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
@@ -468,8 +471,7 @@ class V41Engine:
         # is left (the keep_free floor then quietly eats itself).
         self.ep = DT.EPDistributed(rank, world_size)
         if self.ep.active:
-            assert expert_format in ("", "fp4"), \
-                "EP2 is wired for the FP4 arena only; the CB3 null-slot load is unwritten"
+            assert expert_format in ("", "fp4", "cb3"), expert_format
             self.ep.init(device)
             log(f"EP2 up: rank {self.ep.rank}/{self.ep.world}; this arena holds only experts"
                 f" where expert % {self.ep.world} == {self.ep.rank}, unowned ones map to its null slot")
