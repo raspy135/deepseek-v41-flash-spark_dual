@@ -1,102 +1,107 @@
-"""Read results/prune_miss.npz (DSV41_PRUNE_MISS=1) and say what pruning is costing THIS traffic.
+"""What is the expert pruning costing THIS server's traffic?
 
-The prune set is ranked from a traced corpus (coding + general). On traffic unlike that corpus the
-router keeps asking for experts that were dropped, and nothing downstream can see it: masking
-happens before the topk, so the second-choice expert looks like an ordinary pick. This reads the
-recorded preferences back and answers three things:
+Reads the persisted routing-demand database (DSV41_PRUNE_MISS=1 records it; it accumulates
+across restarts) and compares it against the keep set currently in force.
 
-  * how often the router's first choice was unreachable, per layer
-  * which specific experts it wanted, weighted by the score they would have carried
-  * which swaps would recover the most, holding the per-layer budget fixed
+The prune set ships ranked from a traced corpus (coding + general, combined with "sum", which by
+its own comment drops each workload's specialists -- the two top sets overlap by a Jaccard of only
+0.18-0.31). This says whether that ranking fits what the server is actually asked to do.
 
-Usage: python3 tools/prune_miss_report.py [npz] [--trace coverage.json] [--top N]
+Usage: python3 tools/prune_miss_report.py [db.npz] [--keep 0.6] [--top 12]
 """
 import argparse
-import json
 import os
 import sys
 
 import numpy as np
 
 
-def load_trace_counts(path):
-    """Per-layer normalized frequencies the prune set was ranked from (v41_engine: 'sum')."""
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "experts", os.path.join(os.path.dirname(__file__), "..", "engine", "experts.py"))
-        EX = importlib.util.module_from_spec(spec)
-        sys.modules["experts"] = EX
-        spec.loader.exec_module(EX)
-        cc, cg = EX.category_counts(path, "coding"), EX.category_counts(path, "general")
-        if len(cc) != 40 or len(cg) != 40:
-            return None
-        return {L: cc[L] / cc[L].sum() + cg[L] / cg[L].sum() for L in range(40)}
-    except Exception as e:  # noqa: BLE001
-        print(f"  (trace not loaded: {e})")
-        return None
+def trace_counts(path):
+    """The shipped per-layer ranking (v41_engine's DSV41_PRUNE_RANK='sum')."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "experts", os.path.join(os.path.dirname(__file__), "..", "engine", "experts.py"))
+    EX = importlib.util.module_from_spec(spec)
+    sys.modules["experts"] = EX
+    spec.loader.exec_module(EX)
+    cc, cg = EX.category_counts(path, "coding"), EX.category_counts(path, "general")
+    if len(cc) != 40 or len(cg) != 40:
+        raise ValueError("per-layer trace npz files not found next to coverage.json")
+    return {L: cc[L] / cc[L].sum() + cg[L] / cg[L].sum() for L in range(40)}
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("npz", nargs="?", default="results/prune_miss.npz")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("db", nargs="?", default=os.environ.get("DSV41_PRUNE_DB", "results/prune_demand.npz"))
     ap.add_argument("--trace", default="results/trace-union/stats/coverage.json")
-    ap.add_argument("--keep", type=float, default=None, help="prune_keep in force (for the swap list)")
+    ap.add_argument("--keep", type=float, default=0.6)
     ap.add_argument("--top", type=int, default=12)
     a = ap.parse_args()
 
-    d = np.load(a.npz)
-    counts, mass = d["counts"], d["mass"]          # [n_layers, n_experts]
-    nL, nE = counts.shape
-    total_miss = counts.sum()
-    print(f"{a.npz}: {nL} layers x {nE} experts")
-    if total_miss == 0:
-        print("no misses recorded -- every expert the router wanted was resident")
+    if not os.path.exists(a.db):
+        print(f"no demand database at {a.db}\n"
+              f"run the server with DSV41_PRUNE_MISS=1 and put traffic through it first.")
         return
-    print(f"total missed (token, k) slots: {total_miss:,.0f}")
-    print(f"distinct experts wanted but pruned: {(counts > 0).sum():,} of {nL * nE:,}")
+    d = np.load(a.db)
+    demand, mass = d["counts"], d["mass"]
+    nL, nE = demand.shape
+    total = demand.sum()
+    print(f"{a.db}: {nL} layers x {nE} experts, {total:,.0f} recorded routing slots")
+    if total == 0:
+        print("database is empty")
+        return
 
-    per_layer = counts.sum(axis=1)
-    order = np.argsort(-per_layer)
-    print(f"\nworst layers by missed slots:")
+    try:
+        tr = trace_counts(a.trace)
+    except Exception as e:  # noqa: BLE001
+        print(f"cannot load the shipped trace ({e}) -- reporting demand only")
+        tr = None
+
+    n_keep = int(round(a.keep * nE))
+    if tr is None:
+        return
+    # what the SHIPPED ranking keeps, and how much of this server's demand it serves
+    served, lost, per_layer_loss = 0.0, 0.0, []
+    swaps = []
+    for L in range(nL):
+        kept = np.argsort(-tr[L])[:n_keep]
+        keep_mask = np.zeros(nE, bool)
+        keep_mask[kept] = True
+        s = demand[L][keep_mask].sum()
+        m = demand[L][~keep_mask].sum()
+        served += s
+        lost += m
+        per_layer_loss.append(m / max(demand[L].sum(), 1e-9))
+        # which pruned experts does this traffic want most, and which kept ones does it not use?
+        want = [(demand[L][e], e) for e in range(nE) if not keep_mask[e] and demand[L][e] > 0]
+        want.sort(reverse=True)
+        unused = [(demand[L][e], e) for e in range(nE) if keep_mask[e]]
+        unused.sort()
+        if want:
+            swaps.append((per_layer_loss[L], L, want[:3], unused[:3]))
+
+    print(f"\nagainst the shipped ranking at keep={a.keep:.2f} ({n_keep}/{nE} per layer):")
+    print(f"  routing demand served by resident experts : {served/total*100:5.1f}%")
+    print(f"  routing demand landing on pruned experts  : {lost/total*100:5.1f}%   <-- the cost")
+
+    order = np.argsort(-np.array(per_layer_loss))
+    print(f"\nworst layers (share of that layer's demand that cannot be routed):")
     for L in order[:8]:
-        share = per_layer[L] / total_miss * 100
-        print(f"  layer {L:>2}: {per_layer[L]:>10,.0f}  ({share:4.1f}% of all misses)  "
-              f"{(counts[L] > 0).sum():>3} distinct experts")
+        print(f"  layer {L:>2}: {per_layer_loss[L]*100:5.1f}%   "
+              f"{int((demand[L] > 0).sum()):>3} experts wanted, "
+              f"{int(((demand[L] > 0) & ~np.isin(np.arange(nE), np.argsort(-tr[L])[:n_keep])).sum()):>3} of them pruned")
 
-    print(f"\ntop {a.top} experts the router wanted but could not reach "
-          f"(ranked by the score mass they would have carried):")
-    flat = [(mass[L, e], counts[L, e], L, e) for L in range(nL) for e in range(nE) if counts[L, e] > 0]
-    flat.sort(reverse=True)
-    for m, c, L, e in flat[:a.top]:
-        print(f"  layer {L:>2} expert {e:>3}:  wanted {c:>9,.0f} times   score mass {m:>12,.1f}")
-
-    trace = load_trace_counts(a.trace)
-    if trace is None:
-        return
-    # Holding each layer's budget fixed, which kept experts would this traffic evict, and which
-    # pruned ones would it promote? Rank by observed mass vs the trace score that put them in.
-    print(f"\nswaps this traffic would make, holding the per-layer budget fixed:")
-    shown = 0
-    for L in order[:6]:
-        tr = trace[L]
-        wanted = [(mass[L, e], e) for e in range(nE) if counts[L, e] > 0]
-        if not wanted:
-            continue
-        wanted.sort(reverse=True)
-        # the kept set is the trace top-N; N is whatever the engine used
-        n_keep = int(round((a.keep or 0.6) * nE))
-        kept = set(np.argsort(-tr)[:n_keep].tolist())
-        promote = [(m, e) for m, e in wanted if e not in kept][:3]
-        if not promote:
-            continue
-        # the weakest kept experts by trace score are what a re-rank would drop
-        demote = [e for e in np.argsort(tr).tolist() if e in kept][:3]
-        print(f"  layer {L:>2}: promote {[int(e) for _, e in promote]} "
-              f"(mass {[round(float(m)) for m, _ in promote]})  <-  drop {demote}")
-        shown += 1
-    if not shown:
-        print("  none: every expert this traffic wanted is already kept")
+    print(f"\nswaps this traffic would make, holding each layer's budget fixed:")
+    swaps.sort(reverse=True)
+    for loss, L, want, unused in swaps[:a.top]:
+        pr = [int(e) for _, e in want]
+        dr = [int(e) for _, e in unused]
+        print(f"  layer {L:>2} ({loss*100:4.1f}% lost): promote {pr}  <-  drop {dr}")
+    if not swaps:
+        print("  none -- every expert this traffic wants is already resident")
+    print(f"\nThe running server applies this automatically (DSV41_PRUNE_ADAPT=1, the default):\n"
+          f"the blend weight rises as the database grows, so this report is what it is acting on.")
 
 
 if __name__ == "__main__":

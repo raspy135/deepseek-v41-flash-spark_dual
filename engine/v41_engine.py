@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
 from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
-from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
+from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 import v41_ref as R  # noqa: E402
 
@@ -323,6 +323,57 @@ def build_keep_masks(counts: dict, frac: float, select: str, device, min_per_lay
     return masks, keep
 
 
+PRUNE_DB = os.environ.get("DSV41_PRUNE_DB", "results/prune_demand.npz")
+
+
+def load_prune_db(path: str = PRUNE_DB):
+    """Persisted per-(layer, expert) routing demand, or None. Survives restarts by design:
+    the point is to accumulate enough of THIS server's traffic to out-vote the shipped trace."""
+    try:
+        if not os.path.exists(path):
+            return None
+        import numpy as np
+        d = np.load(path)
+        return d["counts"], d["mass"]
+    except Exception as e:  # noqa: BLE001
+        log(f"prune demand DB unreadable ({e}); starting fresh")
+        return None
+
+
+def save_prune_db(counts, mass, path: str = PRUNE_DB):
+    """Atomic replace: a torn file here would silently re-rank the experts on the next boot."""
+    import numpy as np
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    # savez appends ".npz" when handed a NAME that lacks it -- which would write db.npz.tmp.npz
+    # and leave the rename below pointing at a file that was never created. Hand it a HANDLE.
+    with open(tmp, "wb") as f:
+        np.savez(f, counts=counts, mass=mass)
+    os.replace(tmp, path)
+
+
+def blend_demand(trace_counts: dict, db, prior_slots: float):
+    """Blend the shipped trace ranking with observed demand, per layer.
+
+    The trace ranks experts by a corpus that is not this server's traffic; observed demand is
+    this server's traffic but starts empty. Weight the observed half by how much of it there is:
+    w = observed / (observed + prior). With prior = DSV41_PRUNE_PRIOR slots, a cold database
+    changes nothing and a well-exercised one dominates, with no threshold to tune or trip over.
+    """
+    import numpy as np
+    counts, _mass = db
+    out, ws = {}, []
+    for L, tr in trace_counts.items():
+        obs = np.asarray(counts[L], dtype=np.float64)
+        n = obs.sum()
+        w = float(n / (n + prior_slots)) if n > 0 else 0.0
+        ws.append(w)
+        t = tr / (tr.sum() or 1.0)
+        o = obs / (n or 1.0)
+        out[L] = (1.0 - w) * t + w * o
+    return out, (sum(ws) / len(ws) if ws else 0.0)
+
+
 class V41Engine:
     #: this engine can constrain sampling with a decoding gate (``generate(grammar=...)``)
     supports_grammar = True
@@ -535,6 +586,16 @@ class V41Engine:
                 counts = {L: np.maximum(cc[L] / cc[L].sum(), cg[L] / cg[L].sum()) for L in range(40)}
             else:
                 raise ValueError(f"unknown DSV41_PRUNE_RANK {rank!r} (max | sum)")
+            # Adapt the ranking to what this server has actually been asked for. The trace ships
+            # with the model; the demand DB is this box's own history and accumulates across
+            # restarts, so a server used mostly for one kind of work drifts towards the experts
+            # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
+            db = load_prune_db() if os.environ.get("DSV41_PRUNE_ADAPT", "1") == "1" else None
+            if db is not None:
+                prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
+                counts, w = blend_demand(counts, db, prior)
+                log(f"prune ranking adapted from {PRUNE_DB}: observed weight {w:.1%} "
+                    f"({db[0].sum():,.0f} recorded routing slots)")
             self.prune_select = prune_select
             masks, keep = build_keep_masks(counts, prune_keep, prune_select, device)
             n_keep = max(len(v) for v in keep.values())
@@ -587,6 +648,18 @@ class V41Engine:
                       else [(L, e) for e in range(384) for L in range(40)])
         self.model.prune_mask = self.model_prune_mask
         self.store.warm_start(ranked, log=log)
+        if PRUNE_MISS:
+            # Seed the accumulators from the persisted DB so what they hold is always the whole
+            # history, not just this process's slice -- the per-request write-back then replaces
+            # the file wholesale. Must precede FastDecoder, which captures graphs that record
+            # into these exact tensors.
+            _db = load_prune_db()
+            if _db is not None:
+                self.model.load_demand(*_db)
+                log(f"prune demand DB loaded: {_db[0].sum():,.0f} recorded routing slots")
+            else:
+                self.model.alloc_prune_miss(self.args.n_routed_experts, self.device)
+                log("prune demand DB: starting a new one")
         self.fast = None
         # FastDecoder captures CUDA graphs; a graph-captured NCCL all-reduce (EP2) is its own
         # bring-up (capture-time rendezvous, buffer stability across replays). The skeleton runs
@@ -832,15 +905,15 @@ class V41Engine:
             if pmr is not None:
                 summary, counts, mass = pmr
                 self.last_stats["prune_miss"] = summary
-                # same shape as the coverage histogram the prune set is ranked from, so a run over
-                # real traffic can re-rank it directly (tools/prune_miss_report.py)
-                try:
-                    import numpy as _np
-                    _out = os.environ.get("DSV41_PRUNE_MISS_OUT", "results/prune_miss.npz")
-                    os.makedirs(os.path.dirname(_out) or ".", exist_ok=True)
-                    _np.savez(_out, counts=counts.numpy(), mass=mass.numpy())
-                except Exception as _e:  # noqa: BLE001
-                    log(f"prune-miss dump failed: {_e}")
+                # The accumulators were seeded from the DB at startup, so what they hold IS the
+                # updated database -- write it back whole. Rank 1 would write an identical file
+                # (both ranks run the same router over the same tokens); only rank 0 does, so the
+                # peer's results/ is not a second source of truth.
+                if self.ep.rank == 0:
+                    try:
+                        save_prune_db(counts.numpy(), mass.numpy())
+                    except Exception as _e:  # noqa: BLE001
+                        log(f"prune demand DB write failed: {_e}")
                 rep = self.fast.route_stats_report()
                 if rep:
                     per_layer_mean = rep["mean"]

@@ -350,7 +350,7 @@ class Model:
                                               a.beta_fast, a.beta_slow, self.dev)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
-        self._miss_counts = self._miss_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
+        self._want_counts = self._want_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
             R.act_qdq_fp8 = lambda x, block=32: x.to(torch.bfloat16)
@@ -616,39 +616,49 @@ class Model:
 
     # ------------------------------------------------------------------ blocks
     def _record_prune_miss(self, logits, scores, keep_mask, L: int, k: int):
-        """Count (layer, expert) pairs the router preferred but pruning made unreachable.
+        """Record what the router WANTED, per (layer, expert) -- reachable or not.
 
-        `logits` here is still UNMASKED. Everything stays on the GPU and is only read out at the
-        end of a request, so no step pays a synchronise for being measured.
+        Recording only misses would make the database self-erasing: promote an expert and it
+        stops being missed, so the evidence that justified promoting it disappears and the next
+        adaptation demotes it again. Demand is stable under adaptation, and the miss set is just
+        demand restricted to the currently-pruned experts, so nothing is lost.
+
+        `logits` is still UNMASKED here. Everything is fixed-shape (the decode path records from
+        inside a captured CUDA graph) and stays on the GPU until a request ends.
         """
-        want = logits.topk(k, dim=-1)[1]                      # [T, k] what an unpruned router picks
-        miss = (~keep_mask[want]).double()                    # [T, k] 1.0 where that pick is gone
+        want = logits.topk(k, dim=-1)[1]                       # [T, k] an unpruned router's picks
         self.alloc_prune_miss(logits.size(-1), logits.device)
         flat = want.reshape(-1)
-        self._miss_counts[L].scatter_add_(0, flat, miss.reshape(-1))
-        # the score the router would have given it: a miss on a high-scoring expert costs more
-        # than one on a marginal pick
-        self._miss_mass[L].scatter_add_(0, flat, (scores.gather(1, want).double() * miss).reshape(-1))
+        self._want_counts[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.float64))
+        # score mass: being denied a high-scoring expert costs more than a marginal one
+        self._want_mass[L].scatter_add_(0, flat, scores.gather(1, want).double().reshape(-1))
+        miss = (~keep_mask[want]).double()
         self._miss_tot[L, 0] += miss.sum()
         self._miss_tot[L, 1] += miss.numel()
 
     def alloc_prune_miss(self, n_experts: int, device):
         """Allocate the accumulators eagerly. The decode path records inside a captured CUDA
         graph, so the tensors must already exist (and keep their addresses) before capture --
-        every op in here is fixed-shape for the same reason."""
-        if self._miss_counts is None:
+        every op in the recorder is fixed-shape for the same reason."""
+        if self._want_counts is None:
             z = lambda *sh: torch.zeros(*sh, dtype=torch.float64, device=device)  # noqa: E731
-            self._miss_counts = z(self.args.n_layers, n_experts)
-            self._miss_mass = z(self.args.n_layers, n_experts)
+            self._want_counts = z(self.args.n_layers, n_experts)
+            self._want_mass = z(self.args.n_layers, n_experts)
             self._miss_tot = z(self.args.n_layers, 2)
 
+    def load_demand(self, counts, mass):
+        """Seed the accumulators from a persisted database so it accumulates across restarts."""
+        self.alloc_prune_miss(counts.shape[1], self.dev)
+        self._want_counts += torch.as_tensor(counts, dtype=torch.float64, device=self.dev)
+        self._want_mass += torch.as_tensor(mass, dtype=torch.float64, device=self.dev)
+
     def prune_miss_report(self):
-        """(summary dict, per-(layer,expert) miss counts [40, 384]) or None if nothing recorded."""
-        if self._miss_counts is None:
+        """(summary, demand counts [L, E], demand mass [L, E]) or None if nothing recorded."""
+        if self._want_counts is None:
             return None
         tot = self._miss_tot.cpu()
-        counts = self._miss_counts.cpu()
-        mass = self._miss_mass.cpu()
+        counts = self._want_counts.cpu()
+        mass = self._want_mass.cpu()
         missed, slots = float(tot[:, 0].sum()), float(tot[:, 1].sum())
         per_layer = (tot[:, 0] / tot[:, 1].clamp_min(1)).tolist()
         worst = sorted(range(len(per_layer)), key=lambda L: -per_layer[L])[:5]
@@ -660,7 +670,7 @@ class Model:
         }, counts, mass
 
     def reset_prune_miss(self):
-        self._miss_counts = self._miss_mass = self._miss_tot = None
+        self._want_counts = self._want_mass = self._miss_tot = None
 
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
