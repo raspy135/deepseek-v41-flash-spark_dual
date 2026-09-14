@@ -1626,6 +1626,8 @@ class V41Engine:
                     drafts, q, conf = m.dspark_draft(tok, pos - 1, temperature)
                     block = torch.cat([torch.tensor([tok], device=self.device), drafts])  # T_VERIFY tokens at pos..
                     logits, mh = m.forward(block, pos, prefill=False)
+                if logits.is_inference():
+                    logits = logits.clone()   # same reason as the single-token path below
                 # Constrained decoding, before anything reads the logits. Row i is the
                 # distribution after block[0..i], so its legal set depends on the drafts accepted
                 # ahead of it; the gate walks the block token by token and leaves its own state
@@ -1760,6 +1762,14 @@ class V41Engine:
                     ph.steps = steps
             else:
                 logits, mh = m.forward(torch.tensor([tok], device=self.device), pos, prefill=False)
+                # Model.forward runs under @torch.inference_mode, so what comes back is an
+                # INFERENCE tensor, and this loop is not inside that mode -- mutating one here
+                # raises rather than writing. Both the grammar mask and the penalties write in
+                # place, so give them a normal tensor. The graphed path never hit this because
+                # its logits live in static buffers allocated at capture time, which is why the
+                # whole eager branch could rot unnoticed. 517 KB per token, once.
+                if logits.is_inference():
+                    logits = logits.clone()
                 if grammar is not None:
                     grammar.mask_rows(logits, None)
                 if pen is not None:
