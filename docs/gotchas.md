@@ -368,3 +368,34 @@ width:
   so they redistribute the same error; there is no higher-precision source to download.
 
 If you serve the native checkpoint, expect this family to fail and do not spend engine time on it.
+
+## The dense fp4 and fp8 head buy ~5% decode and cost structure
+
+Prompted by the byte budget: per decode step a rank reads ~16 GB of replicated dense against ~6 GB
+of split routed experts, so the dense is the *bigger per-step read*, and the fork keeps it at
+checkpoint precision on purpose. Measured anyway, on the served pair (`generation_gate.py` 6/6 in
+every arm; ms/step is `1000/tok_s * accept_len`, so it does not move with acceptance):
+
+| arm | dense_fp4 | head | ms/step | nesting (3 reps) | copy_transform (3 reps) |
+|---|---|---|---|---|---|
+| B | off | bf16 | 180.4 | 0.458 | 1.00 |
+| C | off | fp8 | **171.0** | 0.483 | **0.50** |
+| A | attn,wo_a | fp8 | 170.9 | **0.278** | — |
+
+Two results, both negative:
+
+* **All of the ~5% is the head, and it costs exact-string fidelity.** C is 5.2% faster and
+  nesting-neutral, but `copy_transform` "level radar civic" comes back "lavev radar civic" in 3/3
+  reps where B is correct 3/3. The single-box measurement had the fp8 head at +0.0014 nats and
+  byte-identical greedy output; under EP2 that margin is gone on a palindrome reversal, which is a
+  near-tie on the last characters. The head stays bf16.
+* **Attention/`wo_a` fp4 is free of speed and full of cost.** A is not faster than C
+  (170.9 vs 171.0) despite removing another 2.4 GB/step, because the attention projections at M=6
+  are launch/latency-bound, not byte-bound -- the same reason the dense-TP experiment moved
+  nothing. And it drops nesting depth=6 from 0.83 to 0.11. It stays off.
+
+The lesson matches the entry above: on this model the levers that move are residency and the expert
+bytes, not the dense ones, and "it looks right" is not the quality these near-tie probes measure.
+
+`dense_fp4` and `head_fmt` are now in the EP2 boot config guard: they are load-time numerics
+choices read from the environment, so a pair split across them would diverge silently.

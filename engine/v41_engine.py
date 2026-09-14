@@ -770,6 +770,11 @@ class V41Engine:
                 "spec": bool(self.spec),
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
+                # Dense/attention re-quantization and the LM head's stored format. Both are read
+                # from the environment at load and change numerics, so a pair started with them
+                # differing would compute different logits with nothing raising.
+                "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
+                "head_fmt": R.head_fmt(),
                 # Both halves of the engram split decision. row_split says whether the ranks
                 # split rows at all; split_min_rows says at which gather size they start -- and a
                 # rank that splits a gather its peer read whole reaches an all-reduce alone and
