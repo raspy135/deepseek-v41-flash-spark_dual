@@ -380,6 +380,15 @@ def load_prune_db(path: str = PRUNE_DB):
             return None
         import numpy as np
         d = np.load(path)
+        # The database's unit is part of its meaning: 671k/layer in slot units is a busy server,
+        # the same number in request units is not a server at all. Reading one as the other would
+        # silently pin the observed weight at ~100% (or ~0%), so a mismatch is ignored, not read.
+        want = 1 if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request" else 0
+        have = int(d["unit"][0]) if "unit" in d.files else 0
+        if have != want:
+            log(f"prune demand DB {path} is in {'request' if have else 'slot'} units but this run "
+                f"uses {'request' if want else 'slot'}; ignoring it and starting from the trace")
+            return None
         return d["counts"], d["mass"]
     except Exception as e:  # noqa: BLE001
         log(f"prune demand DB unreadable ({e}); starting fresh")
@@ -394,7 +403,8 @@ def save_prune_db(counts, mass, path: str = PRUNE_DB):
     # savez appends ".npz" when handed a NAME that lacks it -- which would write db.npz.tmp.npz
     # and leave the rename below pointing at a file that was never created. Hand it a HANDLE.
     with open(tmp, "wb") as f:
-        np.savez(f, counts=counts, mass=mass)
+        np.savez(f, counts=counts, mass=mass,
+                 unit=np.array([1 if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request" else 0]))
     os.replace(tmp, path)
 
 
@@ -772,6 +782,13 @@ class V41Engine:
                 # matters as much as the switch: it decides WHETHER the collective happens.
                 "prune_swap_prefill": os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0"),
                 "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
+                # The prefill indexer's score reduction. The tiled path is meant to select the
+                # same positions as the monolithic one, but a per-tile topk can break a tie
+                # differently, so a split pair could read different sparse KV with nothing
+                # raising. Keep both ranks on the same side of the switch, and on the same score
+                # dtype -- bf16 vs fp32 changes the selection the same way.
+                "index_stream": os.environ.get("DSV41_INDEX_STREAM", "0"),
+                "index_score_bf16": os.environ.get("DSV41_INDEX_SCORE_BF16", "1"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
             diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}
@@ -876,6 +893,7 @@ class V41Engine:
         for t in self.tables.values():
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
+        self.model.reset_request_demand()   # request-unit mode: a fresh accumulator per request
         if self.fast is not None:
             self.fast.gpu_timing_reset()
             # DSV41_ROUTE_STATS: per-request counts. Capture's own warm-up runs _layer_a and would
@@ -1121,6 +1139,10 @@ class V41Engine:
                         "draft_share": (round(gt.get("draft", 0) /
                                               max(1e-9, gt.get("draft", 0) + gt.get("layers", 0)), 3)),
                     }
+            # Request-unit mode folds this request in as one normalized vote; no-op in slot mode.
+            # Before prune_miss_report so the save below and the per-request delta both see it.
+            self.model.flush_request_demand(
+                float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7")))
             pmr = self.model.prune_miss_report() if hasattr(self.model, "prune_miss_report") else None
             if pmr is not None:
                 summary, counts, mass = pmr
@@ -1297,6 +1319,11 @@ class V41Engine:
             return False
         total = float(rep[1].sum())
         grown = total - self._swap_baseline
+        if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request":
+            # Request-unit mode already aged the database at request end, and `grown` is in
+            # requests -- the slot-tuned MIN_GROWTH (5e5) would never fire. Re-plan once any
+            # request has landed since the last plan.
+            return grown >= float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH_REQ", "1"))
         half = float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7"))
         if half > 0 and grown > 0:
             # decay proportional to the evidence that arrived since the last tick, so the rate is

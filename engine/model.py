@@ -40,10 +40,26 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
 # Record which experts the router wanted but pruning removed (Model._record_prune_miss).
 PRUNE_MISS = os.environ.get("DSV41_PRUNE_MISS", "0") == "1"
+# How the demand database counts evidence. "slot" (default) adds one per (token, expert) routing
+# decision, so a request's vote is its token count: a 10k-token prompt outvotes a three-sentence
+# story in proportion to their lengths, and short benchmark probes are effectively invisible.
+# "request" normalizes each request's per-layer routed distribution to sum 1 and ages the database
+# once per request, so every request is one vote. The unit changes with the mode -- per-layer
+# routing slots vs requests -- so DSV41_PRUNE_PRIOR and DSV41_PRUNE_HALFLIFE must be set to match,
+# and the persisted DB is tagged with its unit so a mismatched one is ignored rather than misread.
+PRUNE_UNIT_REQUEST = os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request"
 # Storage dtype of the prefill indexer's score buffer (see Model._indexer). DSV41_INDEX_SCORE_BF16=0
 # restores fp32 for an A/B.
 SCORE_DTYPE = (torch.bfloat16 if os.environ.get("DSV41_INDEX_SCORE_BF16", "1") == "1"
                else torch.float32)
+# Stream the prefill indexer's score buffer one query tile at a time (Model._indexer_stream)
+# instead of materializing the whole [chunk, context] matrix. The score never feeds arithmetic --
+# it is masked_fill -> block amax -> topk -- and the query axis is independent, so the same einsum
+# tiles can be reduced per query tile. At 512k the monolithic buffer is 2.1 GB of bf16 (4.2 GB
+# before DSV41_INDEX_SCORE_BF16); the tiled one is [ATTN_TILE, n_pad] = 67 MB. DSV41_INDEX_STREAM=0
+# restores the monolithic path, which stays the default until test_prefix_invariance passes on the
+# streaming one.
+INDEX_STREAM = os.environ.get("DSV41_INDEX_STREAM", "0") == "1"
 # Dense tensor parallelism (DSV41_TP_DENSE): world size, or 1 when off. Read once -- both ranks
 # must agree, and a rank that shards while its peer does not desyncs on the first all-reduce.
 TP_DENSE_WORLD = (int(os.environ.get("WORLD_SIZE", 1))
@@ -616,6 +632,11 @@ class Model:
         if k.size(0) < n_pad:
             k = torch.cat([k, k.new_zeros(n_pad - k.size(0), k.size(1))])
         B = ATTN_TILE if ATTN_TILE > 0 else T
+        if INDEX_STREAM:
+            # Same key/query tiles, reduced one query tile at a time; see _indexer_stream.
+            # DSV41_INDEX_STREAM=0 restores the monolithic [T, n_pad] buffer below.
+            return self._indexer_stream(q, wts, k, n_pad, min(a.index_topk, n_c), L,
+                                        compress_lens, sh, B, NB, T)
         # The score buffer is a RANKING quantity -- masked_fill, amax over blocks, topk -- and
         # never feeds arithmetic, so it only has to preserve ORDER, not value. The per-head sum
         # below is still accumulated in fp32; only the store is narrowed. That halves the largest
@@ -647,6 +668,54 @@ class Model:
         idx = score.topk(k_, dim=-1, sorted=False).indices.sort(dim=-1).values
         idx = torch.where(idx < compress_lens[:, None], idx, torch.full_like(idx, -1))
         return self._pad_topk(idx)
+
+    def _indexer_stream(self, q, wts, k, n_pad, k_, L, compress_lens, sh, B, NB, T):
+        """_indexer's math with the score reduced one query tile at a time.
+
+        The query axis is independent at every step this buffer takes part in (einsum over keys,
+        masked_fill, topk), so processing a query tile of ATTN_TILE rows yields the same per-row
+        result as the whole [T, n_pad] matrix while keeping only [ATTN_TILE, n_pad] live. At 512k
+        that is 67 MB instead of 2.1 GB, which is the transient Model._indexer's comment names as
+        the thing that caps the context. Compute is unchanged: the same einsum tiles, the same
+        total topk/amax work. DSV41_INDEX_STREAM=0 restores the monolithic buffer.
+        """
+        a = self.args
+        cpos = self._positions[:n_pad]
+        is_cand_src = L == a.candidate_source_layer
+        later = 0 <= a.candidate_source_layer < L and sh.candidates is not None
+        if is_cand_src:
+            # Filled tile by tile; the decoder indexers read it whole, exactly as before.
+            sh.candidates = torch.zeros(T, n_pad, dtype=torch.bool, device=self.dev)
+        idx_out = torch.full((T, k_), -1, dtype=torch.int64, device=self.dev)
+        for i in range(0, T, B):
+            j = min(i + B, T)
+            bq = j - i
+            qt, wt = q[i:j], wts[i:j]
+            cl = compress_lens[i:j]
+            if bq < B:
+                # Same zero padding the monolithic path does for its last query tile; the padded
+                # rows are scored and then dropped.
+                pad = B - bq
+                qt = torch.cat([qt, qt.new_zeros(pad, *qt.shape[1:])])
+                wt = torch.cat([wt, wt.new_zeros(pad, wt.size(1))])
+                cl = torch.cat([cl, cl.new_zeros(pad)])
+            score = torch.empty(B, n_pad, dtype=SCORE_DTYPE, device=self.dev)
+            for jb in range(0, n_pad, NB):
+                sc = torch.einsum("thd,nd->thn", qt, k[jb:jb + NB])  # bf16
+                sc = sc.float().relu_() * wt[:, :, None]
+                score[:, jb:jb + NB] = sc.sum(dim=1).to(score.dtype)
+            score.masked_fill_(cpos[None, :] >= cl[:, None], float("-inf"))
+            if is_cand_src:
+                keep = self._select_candidates(score, cl, a.candidate_topk_blocks,
+                                               a.candidate_block_size)
+                sh.candidates[i:j] = keep[:bq]
+            elif later:
+                # Only the real rows carry a candidate mask; the zero-padded tail is discarded.
+                score[:bq].masked_fill_(~sh.candidates[i:j], float("-inf"))
+            tv = score.topk(k_, dim=-1, sorted=False).indices.sort(dim=-1).values
+            tv = torch.where(tv < cl[:, None], tv, torch.full_like(tv, -1))
+            idx_out[i:j] = tv[:bq]
+        return self._pad_topk(idx_out)
 
     def _pad_topk(self, idx: torch.Tensor) -> torch.Tensor:
         """Always hand back exactly index_topk columns, the tail filled with -1 (= masked off).
@@ -689,7 +758,7 @@ class Model:
         flat = want.reshape(-1)
         ones = torch.ones_like(flat, dtype=torch.float64)
         sc = scores.gather(1, want).double().reshape(-1)
-        self._want_counts[L].scatter_add_(0, flat, ones)
+        self._rec_counts[L].scatter_add_(0, flat, ones)
         # score mass: being denied a high-scoring expert costs more than a marginal one
         self._want_mass[L].scatter_add_(0, flat, sc)
         # Split by phase. The prompt shows the router ~18x more expert choices than the
@@ -715,6 +784,12 @@ class Model:
             self._miss_tot = z(self.args.n_layers, 2)
             self._want_phase = [z(self.args.n_layers, n_experts), z(self.args.n_layers, n_experts)]
             self._miss_phase = z(2, 2)
+            # Where _record_prune_miss writes. In request mode the live request accumulates here
+            # raw and is folded into _want_counts normalized at request end; in slot mode it IS the
+            # database. The captured decode graph holds the chosen tensor's address, so this is
+            # fixed for the process lifetime.
+            self._req_counts = z(self.args.n_layers, n_experts)
+            self._rec_counts = self._req_counts if PRUNE_UNIT_REQUEST else self._want_counts
 
     def decay_demand(self, factor: float):
         """Scale recorded demand down, in place, so old evidence fades.
@@ -728,6 +803,34 @@ class Model:
             return
         self._want_counts *= factor
         self._want_mass *= factor
+
+    def reset_request_demand(self):
+        """Zero the per-request accumulator at request start (request-unit mode)."""
+        if PRUNE_UNIT_REQUEST and self._req_counts is not None:
+            self._req_counts.zero_()
+
+    def flush_request_demand(self, halflife_requests: float) -> int:
+        """Fold this request in as ONE vote, then age the database by one request.
+
+        Per layer the request's routed counts are normalized to a distribution, then
+        db = db * 0.5**(1/H) + distribution. Every request contributes a unit of mass however many
+        tokens it moved, which is what makes a three-sentence prompt count as much as a 10k-token
+        one. Returns the number of layers that saw any demand. No-op in slot mode, where
+        _record_prune_miss writes straight into the database and decay_demand ages it on idle ticks.
+        """
+        if not PRUNE_UNIT_REQUEST or self._req_counts is None:
+            return 0
+        decay = (0.5 ** (1.0 / halflife_requests)
+                 if halflife_requests and halflife_requests > 0 else 1.0)
+        self._want_counts.mul_(decay)
+        self._want_mass.mul_(decay)
+        tot = self._req_counts.sum(dim=1)
+        folded = 0
+        for L in torch.nonzero(tot > 0).flatten().tolist():
+            self._want_counts[L].add_(self._req_counts[L] / tot[L])
+            folded += 1
+        self._req_counts.zero_()
+        return folded
 
     def load_demand(self, counts, mass):
         """Seed the accumulators from a persisted database so it accumulates across restarts."""
