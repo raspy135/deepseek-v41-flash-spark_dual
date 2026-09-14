@@ -310,3 +310,61 @@ The symptom to watch for is the swap count sitting near `DSV41_PRUNE_SWAP_MAX` w
 is already low. That combination always means the ranking is churning, never that there is real
 work to do; reach for the half-life before `DSV41_PRUNE_SWAP_MIN_GAIN`, because the gain threshold
 only suppresses the symptom.
+
+## Structural corruption in greedy decode is the expert quant, not the engine
+
+Symptom, found comparing this engine against MiaAI's EXL3 2.9 bpw build of the same checkpoint on a
+nesting probe (`llm_benchmark/quality_quant2.py --only nesting`): asked to emit `{"n": ...}` nested
+N deep, it instead produces, deterministically,
+
+```
+depth=4   {"n": {"n": {"n": {"n": 44}}}}                          ok
+depth=8   {"n": {"n": {"n": {"n": {"n": {{"n": {"n": 48}}}}}}}}}   doubled brace
+depth=10  {"n": {"n": {... {"n": "n": {...  "nn": 50}}...        dropped quote, merged key
+```
+
+Depth 4 is always right, 6 marginal, 8+ broken, and the corruption is character duplication and a
+lost quote -- not a semantic substitution. It reproduced on every engine configuration tried, so no
+switch the engine exposes is the cause:
+
+| hypothesis | test | result |
+|---|---|---|
+| checkpoint corrupt | sha256 of all 48 shards vs the Hub's LFS metadata | all match |
+| wrong base revision | ours `dba1be0a` vs the quant's source `fb2764a5` | one encoding commit apart; weights unchanged |
+| pruning | `PRUNE_KEEP=1.0` (full model, streaming) | still fails |
+| speculative decoding | `SPEC=0` | still fails |
+| `tl.dot_scaled` MoE | `DSV41_FP4_DOT_SCALED=0` | still fails |
+| Decoder SWA Bounded Replay | documented bit-exact for ≤128-token prompts; this prompt is ~50 | not reachable |
+| chat template | official `encode_messages(thinking_mode="chat")`; `reasoning_effort` is inert outside thinking mode | standard |
+| detokenizer | canonical nesting strings through `IncrementalDetokenizer`, 1- and 6-token bursts | byte-exact |
+| prefix cache | cold (evict), warm, cold again | identical corruption |
+
+The same weights under a per-row codebook requant (EXL3 2.9 bpw, vLLM) answer all four depths
+exactly. So this is a property of the checkpoint's **MXFP4 scale model** -- UE8M0, one power of two
+per 32 K -- on repeated low-margin tokens, not of this engine. The effective precision at 4
+bits/weight is gated by that scale grid, not by the code width, which is why a well-fitted 3-bit
+codebook can win this particular family.
+
+**Do not generalize it.** The battery's macro is decided by `nesting` + `constraint` +
+`char_count`; `counter`, `json_strict`, `verbatim`, `copy_transform` and `escape_json` saturate at
+1.00 for both models. Accurate JSON does not mean 4-bit loses everywhere against 3-bit: the native
+MXFP4 is competitive on the other families and on held-out teacher-forced loss. The finding is
+"repeated structural output is where the MXFP4 scale model shows", nothing broader.
+
+**If you want to fix it**, the fix is a requant and the lever is the scale/error model, not the bit
+width:
+
+* **NVFP4** (E2M1 + E4M3 per 16) is the small change -- only the routed experts differ, and e4m3
+  scales carry 3 mantissa bits instead of a power of two. It is **not reachable natively here yet**:
+  `tl.dot_scaled`'s shape validator accepts the layout (`is_fp8e4nv()` selects block 16) but the
+  sm_121a backend asserts in `TritonGPUAccelerateMatmul` (`type.getElementType().isIntOrIndex()`).
+  MXFP4 (e8m0, block 32) lowers fine. So NVFP4 needs a software MoE path (decode ~free, it is
+  byte-bound; prefill pays) or a newer Triton.
+* **Size runs the other way.** MXFP4 is 18.80 MB/expert (4.25 bits/weight), NVFP4 19.91 MB
+  (4.5 b/w, +5.9%), CB3 14.45 MB. At one arena NVFP4 costs ~4% of residency, itself a quality cost
+  on a model where residency is the dominant lever. The bet is whether E4M3-per-16 beats
+  UE8M0-per-32 by more than 4% fewer experts costs.
+* Public "NVFP4" checkpoints are MXFP4→NVFP4 casts of this same checkpoint (`base_model:quantized`),
+  so they redistribute the same error; there is no higher-precision source to download.
+
+If you serve the native checkpoint, expect this family to fail and do not spend engine time on it.
