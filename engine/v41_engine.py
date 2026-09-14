@@ -1141,7 +1141,11 @@ class V41Engine:
                         save_prune_db(counts.numpy(), mass.numpy())
                     except Exception as _e:  # noqa: BLE001
                         log(f"prune demand DB write failed: {_e}")
-                rep = self.fast.route_stats_report()
+                # `self.fast` is None whenever the graphed decode path is off -- SPEC=0 is the
+                # documented way to get there, and this call crashed every request under it,
+                # with DSV41_ROUTE_STATS not even set. route_stats_report() already returns None
+                # when the counters are off; it just has to be reachable first.
+                rep = self.fast.route_stats_report() if self.fast is not None else None
                 if rep:
                     per_layer_mean = rep["mean"]
                     owned = per_layer_mean / max(1, self.ep.world) if self.ep.active else per_layer_mean
