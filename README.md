@@ -6,10 +6,6 @@
 > — attention, Engram, router, the DSpark drafter, KV, sampling — stays bit-identically replicated.
 > The original README follows below, unmodified, and still describes the engine this is built on.
 
-## Quality issue
-
-Quality issue found during evaluation. It's not recommended to try this repo.
-
 
 
 

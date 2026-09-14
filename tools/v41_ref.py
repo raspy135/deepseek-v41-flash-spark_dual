@@ -528,20 +528,21 @@ def head_logits(x: torch.Tensor, head) -> torch.Tensor:
 
 
 def mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """F.linear(x, w), but with a result that does not depend on how many rows are in the call.
+    """F.linear(x, w), padding decode-sized calls to a fixed row count.
 
     cuBLAS picks its tile shape AND its split-K count from M, so F.linear(x[:m], w) is generally
     NOT the first m rows of F.linear(x, w) -- for the small-N projections here (wkv N=512, the
     router gate N=384, hc_fn N=24) the two differ by ~1e-4 relative, which is enough to round a
-    bf16 activation to a different ulp and to flip a borderline router top-k. A GEMM row never
-    depends on the other rows in the call, so issuing every call with exactly MM_TILE rows makes
-    the result identical for any chunk length. Set MM_TILE from engine/model.py; 0 keeps the
-    plain behaviour for tools/expert_trace.py and the stored reference trace.
+    bf16 activation to a different ulp and to flip a borderline router top-k. Padding M=1..16 to
+    MM_TILE makes sequential decode and a speculative verify block identical. Larger calls are
+    prefill and stay as one GEMM; splitting a 2048-row projection into 128 launches is both
+    unnecessary for speculative correctness and substantially slower. Set MM_TILE from
+    engine/model.py; 0 keeps plain behaviour for tools/expert_trace.py and the stored trace.
     """
     if (FP8Weight is not None and isinstance(w, FP8Weight)) or (FP4Weight is not None and isinstance(w, FP4Weight)):
         return dense(x, w)  # quantized-weight kernel; row-invariant by construction, not row-tiled
     B = MM_TILE
-    if B <= 0 or x.ndim != 2 or x.size(0) == B:
+    if B <= 0 or x.ndim != 2 or x.size(0) >= B:
         return F.linear(x, w)
     m = x.size(0)
     n = (m + B - 1) // B * B
@@ -554,16 +555,16 @@ def mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 def tiled_rows(fn, *xs: torch.Tensor):
-    """Apply `fn` to its argument(s) in fixed-size row tiles when MM_TILE > 0 (see mm()).
+    """Pad decode-sized calls to MM_TILE rows before applying `fn` (see mm()).
 
     Torch picks the block/vector configuration of a last-dim reduction from the number of rows, so
     x.square().mean(-1) is not row-count-invariant either (it differs for M <= ~14 against a large
-    M). Same cure as for the GEMMs: always work on exactly MM_TILE rows at a time. `fn` may return
-    a tensor or a tuple of tensors; the tail rows of the last tile are zero padding and dropped.
+    M). Decode uses exactly MM_TILE rows while prefill stays a single wide operation. `fn` may
+    return a tensor or a tuple of tensors; zero padding rows are dropped.
     """
     B = MM_TILE
     m = xs[0].size(0)
-    if B <= 0 or m == B:
+    if B <= 0 or m >= B:
         return fn(*xs)
     n = (m + B - 1) // B * B
     if n != m:

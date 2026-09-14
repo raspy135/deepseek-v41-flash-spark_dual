@@ -56,11 +56,9 @@ TP_DENSE_WORLD = (int(os.environ.get("WORLD_SIZE", 1))
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
-# ... and the same GEMM must be issued with the same M whatever the chunk length, or cuBLAS
-# switches tiling/split-K and a row comes out a few ulps different. See v41_ref.mm().
-# 16 and not something larger: for several of these shapes (wq_a, the expert w1/w3) cuBLAS gives a
-# row a slightly different result depending on its OFFSET inside the tile, and a token's offset is
-# chunk-relative. 8 and 16 are offset-invariant for every shape the model uses; 32/64/128 are not.
+# Sequential decode (M=1) and speculative verification (M<=16) must issue the same GEMM shape or
+# cuBLAS switches tiling/split-K and changes verifier logits. Larger calls are prefill and run as
+# one wide GEMM; see v41_ref.mm().
 MM_TILE = 16
 # The attention softmax is a *batched* GEMM (one independent problem per token), which is already
 # offset-invariant, so it can use a bigger tile.

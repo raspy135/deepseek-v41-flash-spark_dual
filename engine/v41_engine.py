@@ -1668,6 +1668,12 @@ class V41Engine:
                     emitted = list(new)
                     if bonus is not None:
                         emitted.append(bonus)
+                    # A speculative step can settle up to T_VERIFY tokens at once, but the
+                    # caller's limit is on emitted tokens, not verifier steps.  Without this
+                    # clamp the final burst overshot max_tokens even though the loop condition
+                    # itself was correct; test_spec_lossless then had identical shared prefixes
+                    # but different lengths.
+                    emitted = emitted[:max_tokens - n_out]
                     pos = pos + a + 1
                     tok = emitted[-1] if emitted else tok
                     if emitted:
@@ -1739,6 +1745,7 @@ class V41Engine:
                 emitted = list(new)
                 if bonus is not None:
                     emitted.append(bonus)
+                emitted = emitted[:max_tokens - n_out]
                 pos = pos + a + 1
                 tok = emitted[-1] if emitted else tok
                 if emitted:

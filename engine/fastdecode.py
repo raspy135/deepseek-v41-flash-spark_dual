@@ -15,9 +15,10 @@ expert ids), then the host resolves expert slots (LRU / NVMe), then B = MoE + sh
 residual. With every routed expert resident (`--prune-keep`) the host step is a LUT lookup and the
 whole layer could be one graph; that is left for later.
 
-Numerics vs `Model.forward`: identical math, but GEMMs are not issued in fixed 16-row tiles and the
-head is bf16, so the two paths can differ in the last bits (the chunk-invariance guarantee of
-model.py does not extend across the two paths). `engine/test_fastdecode.py` measures the gap.
+Numerics vs `Model.forward`: operations whose CUDA implementation depends on the activation row
+count use the same fixed 16-row shape as the eager path.  This is required for speculative decode:
+the verifier must produce the target model's logits, not merely a close approximation to them.
+`engine/test_fastdecode.py` measures the gap.
 """
 
 from __future__ import annotations
@@ -30,18 +31,12 @@ import torch.nn.functional as F
 
 from engine import model as M
 from engine.model import HC_OPS as _HC_OPS, _hc_post_fused, _hc_pre_rn_fused
-from engine.hc_sinkhorn import hc_split_sinkhorn
 import v41_ref as R
 
 try:
     from decode_attn import decode_attention  # tools/decode_attn.py (Triton)
 except Exception:  # noqa: BLE001
     decode_attention = None
-
-try:
-    from fp32_skinny import skinny_linear, wins as skinny_wins, BLOCK_MP as SKINNY_MAX_M  # tools/fp32_skinny.py (Triton)
-except Exception:  # noqa: BLE001
-    skinny_linear, skinny_wins, SKINNY_MAX_M = None, None, 0
 
 # One fused Triton kernel for the sinked softmax attention instead of two fp32 SIMT batched GEMMs
 # and the elementwise passes around them. DSV41_FUSED_ATTN=0 restores the torch path.
@@ -50,9 +45,6 @@ except Exception:  # noqa: BLE001
 # repetition loop (NOTES 2026-09-11 20:30, engine/test_spec_lossless.py). Each piece is fine
 # alone; together they cross the precision the verify step needs. DSV41_FUSED_ATTN=1 re-enables.
 FUSED_ATTN = os.environ.get("DSV41_FUSED_ATTN", "0") == "1" and decode_attention is not None
-# Split-K Triton kernel for the skinny fp32 projections (the HC mix GEMM: M=6, N=24, K=20480, where
-# cuBLAS is latency-bound at ~30 GB/s). DSV41_HC_KERNEL=0 restores F.linear everywhere.
-HC_KERNEL = os.environ.get("DSV41_HC_KERNEL", "1") == "1" and skinny_linear is not None
 # Capture whole runs of layers into one graph instead of one graph per layer (resident mode only).
 # DSV41_GRAPH_SEGMENTS=0 restores one graph per layer.
 GRAPH_SEGMENTS = os.environ.get("DSV41_GRAPH_SEGMENTS", "1") == "1"
@@ -66,18 +58,6 @@ LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 # A/Bs and emergency rollback; it restores the old full-max-seq graph shapes exactly.
 INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
 
-
-def _fp32_lin(x, w):
-    """fp32 y = x @ w^T with an fp32 weight. `x` may be bf16: the Triton kernel upcasts the loaded
-    tile itself (same values, half the activation bytes); the cuBLAS fallback needs the fp32 copy."""
-    # The row bound is part of the guard, not an assert inside the kernel: skinny_linear's partial
-    # buffer is BLOCK_MP rows and it asserts M <= BLOCK_MP. DSV41_BLOCK is documented as 1..15, and
-    # anything wide enough to push M past 8 used to reach that assert and take the pair out of step
-    # mid-request -- a supported knob with a crash behind it. cuBLAS handles the wider M fine; this
-    # kernel exists only for the shapes it handles badly (see fp32_skinny.wins).
-    if HC_KERNEL and skinny_wins(w.size(0)) and x.size(0) <= SKINNY_MAX_M:
-        return skinny_linear(x, w)
-    return F.linear(x.float(), w)
 
 # The verify block: one accepted token plus DSV41_BLOCK drafted ones. The checkpoint's DSpark head
 # was trained at `dspark_block_size` = 5 (so 6 verify positions), which stays the default; a larger
@@ -174,9 +154,9 @@ class FastDecoder:
         self._d_premix0 = torch.zeros(T_DRAFT, a.hc_mult, dtype=torch.float32, device=dev)
         self._d_premix0[:, 0] = 1.0
         # weights in decode-friendly dtypes (views/copies; small)
-        # bf16 tensor, or the FP8Weight / FP4Weight `make_head` produced; `_lin` (= R.dense)
-        # dispatches on the object, so the graphs capture the matching kernel either way.
-        self.head_bf16 = self.W.head.to(torch.bfloat16) if torch.is_tensor(self.W.head) else self.W.head
+        # Preserve the configured head format.  In particular, DSV41_HEAD_FP32 is a numerical
+        # choice and the verifier must not silently narrow it to bf16.
+        self.head = self.W.head
         self.gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.layers]
         self.mtp_gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.mtp]
         self.markov_embed_bf16 = self.W.mtp[2].markov_embed.to(torch.bfloat16)
@@ -198,7 +178,6 @@ class FastDecoder:
                          for L in a.kv_source_layers if a.compress_ratios[L] > 1}
         self.kvl_buf = {L: torch.zeros(T, a.head_dim, dtype=torch.float32, device=dev) for L in self.pend_buf}
         self.sc_buf = {L: torch.zeros(T, a.head_dim, dtype=torch.float32, device=dev) for L in self.pend_buf}
-        R.MM_TILE = 0  # plain GEMMs in this path (and from now on in prefill too); the 16-row tiling was a test aid
         self.stats = {"steps": 0, "graph_s": 0.0, "resolve_s": 0.0, "engram_s": 0.0, "draft_s": 0.0}
         # DSV41_GPU_TIMING=1: CUDA events around each phase of a step. Host timers cannot decompose
         # this path -- every one of them measures the host waiting for, or launching into, an async
@@ -235,19 +214,21 @@ class FastDecoder:
         return torch.cat([x[..., :-rd], R.apply_rotary(x[..., -rd:], fq, inverse=inverse)], dim=-1)
 
     def _hc_mixes(self, x, hc_fn, hc_scale, hc_base):
-        xb = x.flatten(1)
-        rsqrt = torch.rsqrt(xb.float().square().mean(-1, keepdim=True) + self.a.norm_eps)
-        mixes = _fp32_lin(xb, hc_fn) * rsqrt
-        return hc_split_sinkhorn(mixes, hc_scale, hc_base, self.a.hc_mult, self.a.hc_sinkhorn_iters, self.a.hc_eps)
+        # This projection is numerically load-bearing: an M=6 cuBLAS call does not reduce K in
+        # the same order as Model._hc_mixes' zero-padded M=16 call.  The resulting ~1e-4 change in
+        # the 24 HC coefficients is first visible in the post-attention residual and grows until
+        # router top-k choices differ.  Calling the model implementation also keeps the RMS
+        # reduction and Sinkhorn path identical instead of maintaining a second approximation.
+        return self.m._hc_mixes(x, hc_fn, hc_scale, hc_base)
 
     # ------------------------------------------------------------------ attention (decode, T tokens)
     def _attention(self, x, w, L, ring, freqs, pos, sh_state, mtp_last=None):
         a = self.a
         T = x.size(0)
         fq = freqs[pos]
-        qr = R.rmsnorm(_lin(x, w.wq_a), w.q_norm, a.norm_eps)
-        q = self._rope(_lin(qr, w.wq_b).view(T, a.n_heads, a.head_dim), fq)
-        kv = self._rope(R.rmsnorm(_lin(x, w.wkv), w.kv_norm, a.norm_eps), fq)
+        qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
+        q = self._rope(R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim), fq)
+        kv = self._rope(R.rmsnorm(R.qlinear(x, w.wkv), w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
         # torch fallback materialises kv_all. The draft's window is a stride-0 broadcast view.
@@ -278,8 +259,8 @@ class FastDecoder:
             denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
             o = torch.einsum("thn,tnd->thd", p / denom, kv_all.float()).to(torch.bfloat16)
         o = self._rope(o, fq, inverse=True).reshape(T, a.o_groups, -1)
-        o = R.wo_a_proj(o, w.wo_a)
-        return _lin(o.flatten(1), w.wo_b)
+        o = R.wo_a_proj(o, w.wo_a, tiled=True)
+        return R.qlinear(o.flatten(1), w.wo_b)
 
     def _compressed(self, x, qr, w, L, pos, st):
         """st: dict with 'parity' (python int, S % 2, fixed per graph), 'ckv', 'ik', 'ratio'."""
@@ -289,7 +270,7 @@ class FastDecoder:
         T = x.size(0)
         if w.is_kv_source:
             if r > 1:
-                kvl, sc = _fp32_lin(x, w.comp_wkv), _fp32_lin(x, w.comp_wgate)
+                kvl, sc = R.mm(x.float(), w.comp_wkv), R.mm(x.float(), w.comp_wgate)
                 # static per-layer copies for Caches.rollback (host patches the tuple after the step)
                 self.kvl_buf[L].copy_(kvl); self.sc_buf[L].copy_(sc)
                 buf = self.pend_buf[L]  # [2, 512]: kv, score of the pending token (host-maintained)
@@ -303,14 +284,14 @@ class FastDecoder:
                 latent = R.rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
                 j0 = (pos[0] - st["parity"]) // r
             else:
-                latent = R.rmsnorm(_lin(x, w.comp_wkv), w.comp_norm, a.norm_eps)
+                latent = R.rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
                 j0 = pos[0]
             nj = latent.size(0)
             jidx = j0 + self._ar_t[:nj]
             fj = self.m.freqs_c[jidx * r]
             if L in self.W.indexers:
                 iw = self.W.indexers[L]
-                k = R.rmsnorm(_lin(latent, iw.wk), iw.k_norm, a.norm_eps)
+                k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
                 c.ik[L][jidx] = self._rope(k, fj)
             c.ckv[L][jidx] = self._rope(latent, fj)
             st["ckv"], st["ik"], st["ratio"] = c.ckv[L], c.ik[L], r
@@ -325,8 +306,8 @@ class FastDecoder:
         a = self.a
         iw = self.W.indexers[L]
         T = x.size(0)
-        q = self._rope(_lin(qr, iw.wq_b).view(T, a.index_n_heads, a.index_head_dim), self.m.freqs_c[pos])
-        wts = _lin(x, iw.weights_proj).float() * (a.index_head_dim ** -0.5 * a.index_n_heads ** -0.5)
+        q = self._rope(R.qlinear(qr, iw.wq_b).view(T, a.index_n_heads, a.index_head_dim), self.m.freqs_c[pos])
+        wts = R.mm(x, iw.weights_proj).float() * (a.index_head_dim ** -0.5 * a.index_n_heads ** -0.5)
         # CUDA graphs require a fixed N, but scoring all max_seq rows makes every request pay for
         # the configured context capacity.  ``index_bucket`` is fixed for one graph variant and
         # expressed in uncompressed token positions; convert it to this layer's cache rows.  The
@@ -381,7 +362,8 @@ class FastDecoder:
         self.h.copy_(h)
         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
         self.ffn_pre.copy_(ffn_pre); self.ffn_post.copy_(ffn_post); self.ffn_comb.copy_(ffn_comb)
-        y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
+        y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if _HC_OPS
+             else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
         self.y.copy_(y)
         # fp32, exactly as Model.moe does it. The gate picks 6 of 384 experts and its scores are
         # full of near-ties, so a bf16 GEMM here (which this path used until 2026-09-11) changes
@@ -439,19 +421,20 @@ class FastDecoder:
         if M.TP_DENSE_WORLD > 1:      # partial: this rank holds half the intermediate dim
             torch.distributed.all_reduce(_sh, op=torch.distributed.ReduceOp.SUM)
         out += _sh
-        h = R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb)
+        h = (_hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb) if _HC_OPS
+             else R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb))
         self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)
 
     def _final(self):
         a = self.a
         x = R.rmsnorm(R.hc_pre(self.h, self.pre_mix), self.W.norm, a.norm_eps)
-        self.logits.copy_(_lin(x, self.head_bf16).float())
+        self.logits.copy_(R.head_logits(x, self.head))
         # seed the drafter rings for all 6 positions (harmless beyond the accepted ones)
         m0 = self.W.mtp[0]
-        main_x = R.rmsnorm(_lin(self.main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
+        main_x = R.rmsnorm(R.qlinear(self.main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
         fq = self.m.freqs_w[self.pos]
         for k, w in enumerate(self.W.mtp):
-            kv = self._rope(R.rmsnorm(_lin(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
+            kv = self._rope(R.rmsnorm(R.qlinear(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
             self.c.mtp_win[k][self.pos % M.RING] = kv
 
     def _draft(self, greedy: bool):
@@ -466,13 +449,15 @@ class FastDecoder:
         for k, w in enumerate(self.W.mtp):
             residual = h
             attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
-            y = R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps)
+            y = (_hc_pre_rn_fused(h, pre_mix, w.attn_norm, a.norm_eps) if _HC_OPS
+                 else R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps))
             y = self._attention(y, w, 40 + k, self.c.mtp_win[k], self.m.freqs_w, pos, None, mtp_last=self.d_last[0])
             h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
              else R.hc_post(y, residual, attn_post, attn_comb))
             residual = h
             ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-            y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
+            y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if _HC_OPS
+                 else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
             scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
             idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
             wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
@@ -484,11 +469,12 @@ class FastDecoder:
             # that runs five times per step to save 3 blocks' worth of weights. All-reducing an
             # UNSHARDED output would simply double it.
             out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-            h = R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb)
+            h = (_hc_post_fused(out.to(torch.bfloat16), residual, ffn_post, ffn_comb) if _HC_OPS
+                 else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))
             pre_mix = ffn_pre
         w = self.W.mtp[2]
         x = R.rmsnorm(R.hc_pre(h, pre_mix), w.norm, a.norm_eps)
-        logits = _lin(x, self.head_bf16).float()  # [T_DRAFT, V]
+        logits = R.head_logits(x, self.head)  # [T_DRAFT, V]
         prev = self.d_tok[0]
         for i in range(T_DRAFT):
             bias = _lin(self.markov_embed_bf16[prev.view(1)], self.markov_head_bf16).float()[0]  # 1-d index: a 0-d tensor index syncs

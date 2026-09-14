@@ -47,18 +47,24 @@ class Batch2FastDecoder:
         cfg = self.a
         w = self.W.layers[layer]
         y = torch.cat((a0.y, a1.y), dim=0)
-        slots = torch.cat((a0.lut[layer][a0.route_idx], a1.lut[layer][a1.route_idx]), dim=0)
+        routing_ids = torch.cat((a0.route_idx, a1.route_idx), dim=0)
+        slot_map = a0.lut[layer]
+        slots = slot_map[routing_ids]
         route_w = torch.cat((a0.route_w, a1.route_w), dim=0)
 
         if getattr(self.store, "null_slot", None) is not None:
             out = a0.m.moe_fn(
                 y, slots, route_w, self.store.arena, cfg.swiglu_limit,
                 out_dtype=torch.float32, slots_repeat=True, null_slot=self.store.null_slot,
+                routing_ids=routing_ids, routing_slot_map=slot_map,
             )
             self.store.ep.combine(out)
             out = out.to(torch.bfloat16).float()
         else:
-            out = a0.m.moe_fn(y, slots, route_w, self.store.arena, cfg.swiglu_limit).float()
+            out = a0.m.moe_fn(
+                y, slots, route_w, self.store.arena, cfg.swiglu_limit,
+                routing_ids=routing_ids, routing_slot_map=slot_map,
+            ).float()
 
         # The shared expert is identical on both ranks and is evaluated once over the 12 rows.
         out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, cfg.swiglu_limit).float()
