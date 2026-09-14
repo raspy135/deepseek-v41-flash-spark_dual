@@ -37,6 +37,30 @@ def run(eng, prompt: str, max_tokens: int):
     return out
 
 
+def _await_memory(kw, timeout_s: int = 300):
+    """Block until the previous arm's arena is actually back.
+
+    Both arms run in ONE process, and the first engine holds ~70 GB of HOST memory for its expert
+    arena. `del eng` returns immediately; the pages come back to MemAvailable some time later, and
+    until they do the second engine's own preflight refuses to start:
+
+        not enough host memory to start: MemAvailable 4.8 GB leaves -15.2 GB for the expert arena
+
+    which is the guard doing its job on a test that did not wait. Polling is enough -- the release
+    is prompt once the allocator actually returns the pages, it is simply not synchronous.
+    """
+    import time
+    need = float(kw.get("keep_free_gb", 20.0)) + 40.0
+    for _ in range(timeout_s):
+        with open("/proc/meminfo") as f:
+            avail = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable:")) / 1048576
+        if avail >= need:
+            return
+        time.sleep(1)
+    print(f"WARNING: only {avail:.1f} GiB available after {timeout_s}s; starting anyway",
+          file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default=os.path.expanduser("~/models/DeepSeek-V4.1-Flash"))
@@ -48,11 +72,14 @@ def main() -> int:
 
     outs = {}
     for spec in (False, True):
+        _await_memory(kw)
         eng = V41Engine(a.model_dir, max_seq=8192, spec=spec, **kw)
         outs[spec] = [run(eng, p, a.max_tokens) for p in PROMPTS]
         tk = eng.tokenizer
+        eng.close() if hasattr(eng, "close") else None
         del eng
-        import torch
+        import gc, torch
+        gc.collect()
         torch.cuda.empty_cache()
 
     failed = 0
