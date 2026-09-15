@@ -293,7 +293,10 @@ class FastDecoder:
                 iw = self.W.indexers[L]
                 k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
                 c.ik[L][jidx] = self._rope(k, fj)
-            c.ckv[L][jidx] = self._rope(latent, fj)
+            ckv = self._rope(latent, fj)
+            if M.KV_CACHE_QDQ:
+                ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
+            c.ckv[L][jidx] = ckv
             st["ckv"], st["ik"], st["ratio"] = c.ckv[L], c.ik[L], r
         compress_lens = (pos + 1) // r
         if L in self.W.indexers:
@@ -413,7 +416,6 @@ class FastDecoder:
                                 out_dtype=torch.float32, slots_repeat=True,
                                 null_slot=store.null_slot)
             store.ep.combine(out)
-            out = out.to(torch.bfloat16).float()
         else:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
         # shared expert is replicated and added AFTER the combine, so it is counted once

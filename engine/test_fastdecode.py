@@ -70,6 +70,8 @@ for parity_test in (0, 1):
     rel = float((lg2 - ref_logits).norm() / ref_logits.norm())
     relh = float((mh2 - ref_mh).norm() / ref_mh.norm())
     print(f"parity {parity_test}: drafts equal={same_draft}  logits rel err {rel:.4f}  argmax agree {top1:.2f}  main_hidden rel {relh:.4f}")
+    assert same_draft and torch.equal(lg2, ref_logits) and torch.equal(mh2, ref_mh), \
+        f"FastDecoder differs from eager decode at parity {parity_test}"
     # timing: repeat the step at the same position
     torch.cuda.synchronize(); t0 = time.perf_counter(); n = 5
     for _ in range(n):

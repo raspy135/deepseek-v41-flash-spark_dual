@@ -43,11 +43,12 @@ import triton.language as tl
 
 DIM = 5120  # model hidden size (K of w1/w3, N of w2)
 INTER = 2304  # expert intermediate size (N of w1/w3, K of w2)
-# Let the tensor core consume the e2m1 codes and their UE8M0 scales directly (tl.dot_scaled)
-# instead of decoding FP4 in software first. Measured at MoE dimensions on GB10 (sm_121a):
-# software decode 19.8 TFLOPS, dot_scaled 29.5. Off by default until the generation gate has run
-# on it -- the scale is applied inside the MMA rather than to the fp32 partial sum of each 32-group,
-# so this is a numerics change, not just a speed one. DSV41_FP4_DOT_SCALED=1 turns it on.
+# Delegate FP4 unpack/scale to Triton (tl.dot_scaled). With a BF16 activation operand the
+# installed GB10 backend lowers this to BF16 x BF16 MMA with FP32 accumulation, not FP4
+# activation arithmetic (inspect _moe_up_kernel.ptx). Software decode was measured at
+# 19.8 TFLOPS, dot_scaled at 29.5, but their reduction orders differ: software resets the
+# partial sum per scale group, whereas dot_scaled carries the MMA accumulator along K.
+# This is a numerics change; a random-error/generation floor gate alone cannot qualify it.
 DOT_SCALED = os.environ.get("DSV41_FP4_DOT_SCALED", "0") == "1"
 
 GROUP = 32  # K elements per UE8M0 scale
@@ -216,14 +217,14 @@ def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
 @triton.jit
 def _quad_dot_scaled(x_base, mask_m, w_tile_ptr, s_ptr, acc, BM: tl.constexpr, BN: tl.constexpr):
     """Same 128 logical K as _quad_dot, but the tensor core eats the e2m1 codes and their UE8M0
-    scales directly (`tl.dot_scaled`) instead of us decoding them in software first.
+    scales through Triton's `tl.dot_scaled` lowering instead of our manual decoder.
 
     _quad_dot spends real ALU on every weight byte -- `cvt.rn.f16x2.e2m1x2`, the prmt shuffles that
     regroup even/odd nibbles, and a per-32-group scale applied to the fp32 partial sum -- and that
     work competes with the MMA it is feeding. Measured on this box at MoE dimensions: software
     decode 19.8 TFLOPS, dot_scaled 29.5 TFLOPS.
-    (vLLM's MXFP4 path does the same thing; its software-decode variant is the HOPPER fallback,
-    for hardware without block-scaled MMA. GB10 is sm_121a and has it.)
+    On this installed sm_121a backend the mixed BF16/FP4 operation lowers to BF16 MMA;
+    it does not quantize the activation to FP4. Avoid inferring arithmetic from the API name.
 
     The layouts already line up: the caller's tile is [BN, 64] packed bytes = 128 logical K with
     [BN, 4] scales, which is exactly dot_scaled's [BK, BN] / [BN, BK//32] contract after the
@@ -234,6 +235,10 @@ def _quad_dot_scaled(x_base, mask_m, w_tile_ptr, s_ptr, acc, BM: tl.constexpr, B
     packed = tl.load(w_tile_ptr)                       # [BN, 64] uint8, e2m1 two per byte
     sc = tl.load(s_ptr)                                # [BN, 4]  uint8, UE8M0, one per 32 K
     x = tl.load(x_base + tl.arange(0, 128)[None, :], mask=mask_m, other=0.0)   # [BM, 128] bf16
+    # Resetting the MMA accumulator every 128 K and adding partials in FP32 was tested:
+    # it passed depth-8 generation only by choosing compact JSON earlier, while the identical
+    # spaced-prefix closing margin worsened from -0.25 to -1.0 and T=512 took 10.6 vs 8.8 ms.
+    # Keep the negative: a tokenization-dependent pass is not a numerical fix.
     return tl.dot_scaled(x, None, "bf16", packed.trans(), sc, "e2m1", acc=acc)
 
 
@@ -282,8 +287,13 @@ def _moe_up_kernel(
             acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
             acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
 
-    gate = tl.minimum(acc_g, limit)
-    up = tl.minimum(tl.maximum(acc_u, -limit), limit)
+    # Expert.forward's quantized linear returns BF16 (`fp4_gemm(..., out_dtype=BF16)`) and the
+    # reference clamps that bf16-rounded value in fp32.  The tensor-core accumulator is fp32, so
+    # without this round the gate/up retain FP32 mantissas; the SwiGLU output then differs from the
+    # dequant path by ~4e-3, which is enough to flip a low-margin token in the verifier (the
+    # nesting probe fails at depth 8 with fp32 but passes through the bf16 dequant fallback).
+    gate = tl.minimum(acc_g.to(tl.bfloat16).to(tl.float32), limit)
+    up = tl.minimum(tl.maximum(acc_u.to(tl.bfloat16).to(tl.float32), -limit), limit)
     wgt = tl.load(wgt_ptr + offs_m, mask=mask_m, other=0.0)
     h = gate * tl.sigmoid(gate) * up * wgt[:, None]
     tl.store(h_ptr + offs_m[:, None] * stride_h + offs_n[None, :], h.to(tl.bfloat16), mask=mask_m[:, None])
@@ -341,7 +351,11 @@ def _moe_down_kernel(
             acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
 
     row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
-    tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc, mask=mask_m[:, None])
+    # Expert.forward's quantized linear returns BF16.  The MoE then accumulates those BF16 expert
+    # outputs into its FP32 y buffer.  Keeping each expert's down projection in FP32 until after
+    # the top-k sum moves a real checkpoint rounding boundary and compounds across layers.
+    tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc.to(tl.bfloat16),
+             mask=mask_m[:, None])
 
 
 # --------------------------------------------------------------------------- routing
@@ -515,11 +529,12 @@ def moe_forward(
 ) -> torch.Tensor:
     """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
 
-    `out_dtype` exists for EP2 (engine/dist.py). The k-sum is accumulated in fp32 and rounded to
-    bf16 exactly once, here. Under expert parallel this call returns only *part* of the k-sum --
+    `out_dtype` controls the routed sum, not each expert's BF16 linear output. The engine requests
+    FP32 even on one box, adds the shared expert, and only then rounds the combined sum to BF16.
+    Under expert parallel this call returns only *part* of the k-sum --
     the rest is on the peer -- so rounding it now would put a bf16 rounding on each half and a
     third on their sum. engine/model.py::moe asks for fp32, all-reduces, and rounds once at the
-    same point the single-node path does. Default unchanged: every existing caller gets bf16.
+    same point the single-node path does. Standalone callers still default to BF16.
 
     `slots_repeat=True` says many (token, k) pairs may land on ONE slot -- true under expert
     parallel, where every non-owned expert shares the null slot. When `null_slot` is known, the
@@ -597,7 +612,8 @@ def moe_forward(
 
 @torch.no_grad()
 def moe_forward_reference(
-    x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: ExpertArena, swiglu_limit: float = 10.0
+    x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: ExpertArena,
+    swiglu_limit: float = 10.0, out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Dequant + torch matmul per expert, mirroring inference/model.py::Expert.forward (bf16 GEMMs, fp32 epilogue)."""
     T, K = slots.shape
@@ -613,4 +629,4 @@ def moe_forward_reference(
             gate = gate.clamp(max=swiglu_limit)
         hs = torch.nn.functional.silu(gate) * up * weights[t_idx, k_idx].float()[:, None]
         y.index_add_(0, t_idx, (hs.to(torch.bfloat16) @ w2.T).float())
-    return y.to(torch.bfloat16)
+    return y.to(out_dtype)

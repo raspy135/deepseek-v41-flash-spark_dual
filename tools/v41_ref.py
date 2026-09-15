@@ -180,7 +180,8 @@ def act_qdq_fp8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     return y.reshape(shape).to(torch.bfloat16)
 
 
-def fp4_qdq(x: torch.Tensor, group: int, scale_dtype: str) -> torch.Tensor:
+def fp4_qdq(x: torch.Tensor, group: int, scale_dtype: str,
+            grid: torch.Tensor | None = None) -> torch.Tensor:
     """Emulates kernel.fp4_act_quant(x, group, inplace=True): FP4 e2m1 values with either
     UE8M0 (power-of-two) or E4M3 group scales, dequantized back. Used for the compressed
     (global) KV cache which the model stores in FP4 (E4M3 scales, groups of 16)."""
@@ -194,7 +195,8 @@ def fp4_qdq(x: torch.Tensor, group: int, scale_dtype: str) -> torch.Tensor:
         amax = amax.clamp_min(6 * 2 ** -126)
         s = torch.exp2(torch.ceil(torch.log2(amax / 6.0)))
     v = (xf / s).clamp(-6.0, 6.0)
-    grid = FP4_GRID.to(x.device)
+    grid = FP4_GRID.to(x.device) if grid is None else grid
+    assert grid.device == x.device
     mid = (grid[1:] + grid[:-1]) / 2
     idx = torch.bucketize(v.abs(), mid)  # nearest grid point (ties go up; measure-zero on real data)
     q = grid[idx] * torch.sign(v)

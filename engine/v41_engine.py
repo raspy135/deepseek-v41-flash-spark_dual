@@ -193,13 +193,15 @@ class Penalties:
     `presence_penalty + frequency_penalty * count` from its logit) and default to 0, because a flat
     penalty hurts code, which is legitimately repetitive.
 
-    The cycle breaker is separate and defaults ON. Greedy decoding on this checkpoint can fall into
+    The cycle breaker is separate and opt-in. Greedy decoding on this checkpoint can fall into
     an exact repetition -- a run of one token, or a short block repeated verbatim -- and has no way
     out of it, because the same context keeps producing the same argmax (NOTES 2026-09-11). It fires
     only on an *exact* cycle of period <= `cycle_max_period` repeated `cycle_repeats` times, and
     then bans just the one token that would continue the cycle for that single step, which is enough
-    to leave the attractor. Normal repetitive code never reaches an exact cycle of whole tokens
-    repeated three times over, so nothing else is affected.
+    to leave the attractor. It also bans legitimate repetition: the canonical depth-8 nesting
+    answer repeats [n, '":', ' {"'] and its correct token is first banned at position 13.
+    Enabling this heuristic changes the model's output distribution, including valid JSON/code;
+    it must not silently run on ordinary HTTP requests or quality comparisons.
     """
 
     def __init__(self, presence: float = 0.0, frequency: float = 0.0, cycle_repeats: int = 4,
@@ -210,7 +212,7 @@ class Penalties:
         self.cycle_repeats = int(cycle_repeats)
         self.cycle_max_period = int(cycle_max_period)
         if enabled is None:
-            enabled = os.environ.get("DSV41_CYCLE_BREAK", "1") == "1"
+            enabled = os.environ.get("DSV41_CYCLE_BREAK", "0") == "1"
         self.cycle_enabled = bool(enabled)
         self.no_repeat_ngram = int(no_repeat_ngram if no_repeat_ngram is not None
                                    else os.environ.get("DSV41_NO_REPEAT_NGRAM", "0"))
@@ -449,6 +451,14 @@ class V41Engine:
         self.model_dir = model_dir
         self.device = device
         self.spec = spec
+        # A/B switches for the two numerics arms that have no server flag.  Both change what the
+        # engine computes, so they are in the EP2 boot guard below:
+        #   DSV41_ACT_QUANT=1    -- fake-quantize activations to the reference's fp8-per-32 UE8M0
+        #                           (tools/v41_ref.act_qdq_fp8) instead of running them in bf16.
+        #   DSV41_MOE_FALLBACK=1 -- routed experts dequantized to bf16 instead of the Triton fp4
+        #                           tensor-core kernel. Diagnostic only: dequantization is slow
+        #                           and host-side routing prevents CUDA graph capture.
+        act_quant = act_quant or os.environ.get("DSV41_ACT_QUANT", "0") == "1"
         self.swa_replay = (os.environ.get("DSV41_SWA_REPLAY", "1") != "0") if swa_replay is None else swa_replay
         self.hot_profile = hot_profile or os.environ.get("DSV41_HOT_PROFILE", "mixed")
         self.lock = threading.Lock()
@@ -465,16 +475,26 @@ class V41Engine:
         assert self.expert_format in ("fp4", "cb3"), self.expert_format
         self.sim_cb2_frac = float(sim_cb2_frac or 0.0)
         assert 0.0 <= self.sim_cb2_frac <= 1.0, self.sim_cb2_frac
-        try:
-            import fp4_moe as K
-            fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
-            self.kernel = "triton-fp4"
-            log("using Triton FP4 MoE kernel")
-        except Exception as e:  # noqa: BLE001
+        self.moe_fallback = os.environ.get("DSV41_MOE_FALLBACK", "0") == "1"
+        if self.moe_fallback:
+            # A/B arm: routed experts dequantized to bf16 (engine/moe_fallback.py) instead of the
+            # Triton fp4 tensor-core kernel.  Not a serving default -- the fallback is much slower.
             from engine import moe_fallback as K
             fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
             self.kernel = "dequant-fallback"
-            log(f"Triton kernel unavailable ({e!r}); using the slow dequant fallback")
+            log("DSV41_MOE_FALLBACK=1: routed experts dequantized to bf16; Triton fp4 kernel bypassed")
+        else:
+            try:
+                import fp4_moe as K
+                fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
+                self.kernel = "triton-fp4"
+                log("using Triton FP4 MoE kernel")
+            except Exception as e:  # noqa: BLE001
+                from engine import moe_fallback as K
+                fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
+                self.kernel = "dequant-fallback"
+                log(f"Triton kernel unavailable ({e!r}); using the slow dequant fallback")
+        self.fp4_dot_scaled = bool(getattr(K, "DOT_SCALED", False))
         cb3_cls = None
         if self.expert_format == "cb3":
             import cb3_moe as C3
@@ -487,7 +507,7 @@ class V41Engine:
             self.kernel = "triton-cb3"
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
-        def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.bfloat16, slots_repeat=False,
+        def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
                    null_slot=-1, routing_ids=None, routing_slot_map=None):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
@@ -775,6 +795,14 @@ class V41Engine:
                 # differing would compute different logits with nothing raising.
                 "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
                 "head_fmt": R.head_fmt(),
+                "fp4_dot_scaled": self.fp4_dot_scaled,
+                "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
+                "hc_ops": bool(M_.HC_OPS),
+                "hc_fused": bool(M_.HC_FUSED),
+                "moe_fallback": self.kernel == "dequant-fallback",
+                "act_quant": bool(self.act_quant),
+                "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0"),
+                "no_repeat_ngram": os.environ.get("DSV41_NO_REPEAT_NGRAM", "0"),
                 # Both halves of the engram split decision. row_split says whether the ranks
                 # split rows at all; split_min_rows says at which gather size they start -- and a
                 # rank that splits a gather its peer read whole reaches an all-reduce alone and
@@ -1858,9 +1886,16 @@ class V41Engine:
             # construction, so a difference between them is a desync that nothing else reports.
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
+            "fp4_dot_scaled": self.fp4_dot_scaled,
+            "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
+            "hc_ops": bool(M_.HC_OPS),
+            "hc_fused": bool(M_.HC_FUSED),
+            "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
             "sim_cb2_frac": self.sim_cb2_frac,
             "act_quant": self.act_quant,
+            "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0") == "1",
+            "no_repeat_ngram": int(os.environ.get("DSV41_NO_REPEAT_NGRAM", "0")),
             "swa_replay": self.swa_replay,
             "prefill_skip_null": (self.ep.active and self.kernel == "triton-fp4" and
                                   os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1"),

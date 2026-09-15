@@ -4,10 +4,8 @@ decode blocks (DSpark verification) and cache rollback, batch size 1.
 
 Ported from the reference `inference/model.py`; the tilelang kernels are replaced by torch ops
 and the routed experts by `engine.experts.ExpertStore` (+ the Triton FP4 grouped-MoE kernel in
-`tools/fp4_moe.py`). Deviations from the reference, all towards MORE precision:
-  * activations are not fake-quantized to fp8 (optional flag),
-  * window KV and compressed KV caches are kept in bf16 instead of fp8 / FP4-E4M3,
-  * the indexer's Q/K are not FP4-quantized.
+`tools/fp4_moe.py`). Activation quantization is optional; the window KV and indexer's Q/K remain
+in bf16. Compressed KV values are quantize/dequantized to FP4-E4M3 before being stored in bf16.
 Position semantics are the reference's: a chunk of T tokens at absolute start position S.
 Any (S, T) with T <= 512 works, which is what chunked prefill and 6-token verify blocks need.
 """
@@ -52,6 +50,10 @@ PRUNE_UNIT_REQUEST = os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request"
 # restores fp32 for an A/B.
 SCORE_DTYPE = (torch.bfloat16 if os.environ.get("DSV41_INDEX_SCORE_BF16", "1") == "1"
                else torch.float32)
+# Compressed-KV QDQ reproduces the reference's FP4/E4M3 cache values in BF16 storage.
+# Window KV deliberately stays BF16: the previous act_qdq_fp8 call was an identity under
+# act_quant=False, so it did not establish FP8-cache parity in serving. Do not claim otherwise.
+KV_CACHE_QDQ = os.environ.get("DSV41_KV_CACHE_QDQ", "1") != "0"
 # Stream the prefill indexer's score buffer one query tile at a time (Model._indexer_stream)
 # instead of materializing the whole [chunk, context] matrix. The score never feeds arithmetic --
 # it is masked_fill -> block amax -> topk -- and the query axis is independent, so the same einsum
@@ -408,10 +410,15 @@ class Model:
                                     and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
                                 else None)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
+        # Persistent because fastdecode captures compressed-KV QDQ in a CUDA graph.  Copying the
+        # tiny lookup table from CPU inside capture is illegal even though the arithmetic itself
+        # is graph-safe.
+        self.fp4_grid = R.FP4_GRID.to(self.dev)
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
         self.vision = None       # engine.vision.VisionTower, set by the engine when enabled
         self.image_mask = self.engram_mask = None
         self._want_counts = self._want_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
+        self._req_counts = None  # reset/flush are also called when demand logging is disabled
         self._want_phase = self._miss_phase = None   # same, split prefill vs decode
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
@@ -438,14 +445,20 @@ class Model:
         return R.tiled_rows(lambda t: R.hc_split_sinkhorn(t, hc_scale, hc_base, a.hc_mult,
                                                           a.hc_sinkhorn_iters, a.hc_eps), mixes)
 
-    def _window_positions(self, pos: torch.Tensor):
-        """[T, 128] absolute positions each query may see in its sliding window, -1 if none."""
-        w = self.args.window_size
-        p = pos[:, None] - self._window_offsets[None, :]
+    def _window_positions(self, pos: torch.Tensor, width: int | None = None):
+        """Absolute positions each query may see, oldest first; -1 if none.
+
+        Reference prefill uses ``min(sequence_length, window_size)`` columns.  Padding a short
+        prompt to all 128 columns changes the FP32 attention GEMM's reduction shape enough to
+        perturb its output and downstream router ties, even though the extra columns are masked.
+        Decode deliberately keeps the full ring width, matching the reference decode path.
+        """
+        w = self.args.window_size if width is None else int(width)
+        p = pos[:, None] - self._window_offsets[-w:][None, :]
         return torch.where(p >= 0, p, torch.full_like(p, -1))
 
     def attention(self, x: torch.Tensor, w, L: int, S: int, sh: Shared, ring: torch.Tensor,
-                  freqs: torch.Tensor, mtp_extra=None, win_lo: int = 0):
+                  freqs: torch.Tensor, mtp_extra=None, win_lo: int = 0, prefill: bool = False):
         """x: [T, d] normed input. Returns [T, d]. `ring` is this layer's window KV ring.
 
         `win_lo` is the first position whose window KV this ring actually holds. It is 0 everywhere
@@ -474,7 +487,11 @@ class Model:
         self._tap("kv_new", L, kv)
         if mtp_extra is None:
             # gather the window BEFORE writing (a chunk may overwrite slots older queries still need)
-            wpos = self._window_positions(pos)  # [T, 128]
+            # Only prefill presents the short reference shape (min(seq, window) columns).  Decode
+            # presents the full window ring, as the reference decode and FastDecoder both do;
+            # narrowing it here is what silently moved the eager path off the graph path.
+            win_width = min(a.window_size, S + T) if prefill else None
+            wpos = self._window_positions(pos, win_width)
             ring[pos % RING] = kv
             wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             wmask = wpos >= win_lo if win_lo else wpos >= 0
@@ -503,7 +520,31 @@ class Model:
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
         _t = time.perf_counter() if ATTN_TIMING else _t
-        if _use_fused(mtp_extra, T):
+        compact_window = prefill and mtp_extra is None and S + T <= a.window_size
+        if compact_window:
+            # The reference prefill kernel sees one compact [sequence, d] KV matrix while the
+            # sequence still fits in the window.  Expressing the same values as a padded
+            # [query, 128, d] gather is mathematically equivalent, but selects a different GEMM
+            # reduction shape; the tiny FP32 difference is amplified by wo_a/wo_b and flips MoE
+            # router ties in the first layer.  Keep this exact path bounded to <=128 tokens so
+            # long-prefill performance continues to use the fused/gathered implementation.
+            compact_kv = ring[:S + T]
+            compact_mask = torch.arange(S + T, device=self.dev)[None, :] <= pos[:, None]
+            if w.ratio:
+                n_c = (S + T) // w.ratio
+                compact_kv = torch.cat([compact_kv, sh.ckv[:n_c]], dim=0)
+                compact_mask = torch.cat([
+                    compact_mask,
+                    torch.arange(n_c, device=self.dev)[None, :] <
+                    ((pos + 1) // w.ratio)[:, None],
+                ], dim=1)
+            scores = torch.einsum("thd,nd->thn", q.float(), compact_kv.float()) * a.head_dim ** -0.5
+            scores.masked_fill_(~compact_mask[:, None, :], float("-inf"))
+            mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
+            p = torch.exp(scores - mx)
+            denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
+            o = torch.einsum("thn,nd->thd", p / denom, compact_kv.float()).to(torch.bfloat16)
+        elif _use_fused(mtp_extra, T):
             # Same math as _softmax_attn (sinked softmax, fp32 scores, split-precision PV), fused:
             # no [T, H, N] score tensor, no concatenated key tensor. Measured 3.6x faster than the
             # torch path at T=512 once decode_attn picks SPLIT from the available parallelism --
@@ -514,12 +555,14 @@ class Model:
                               split=1)
         else:
             o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
+        self._tap("attn_core", L, o)
         _t = _aph("softmax_attn", _t)
         o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)
         # grouped output projection: "sgd,grd->sgr" is a GEMM with M = number of tokens, so it too
         # has to run on fixed-size token tiles (it differs most visibly at a 1-token chunk).
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
+        self._tap("attn_wo_a", L, o)
         out = R.qlinear(o.flatten(1), w.wo_b)
         _mark("o_proj")      # wo_a (grouped) + wo_b; was being charged to the moe gap
         self._tap("attn_out", L, out)
@@ -600,6 +643,8 @@ class Model:
                     k = torch.cat([k[:, :-rd], R.apply_rotary(k[:, -rd:], fj)], dim=-1)
                     c.ik[L][j0:j0 + nj] = k
                 lat = torch.cat([latent[:, :-rd], R.apply_rotary(latent[:, -rd:], fj)], dim=-1)
+                if KV_CACHE_QDQ:
+                    lat = R.fp4_qdq(lat, 16, "e4m3", self.fp4_grid)
                 c.ckv[L][j0:j0 + nj] = lat
                 self._tap("latent", L, (j0, lat))
             sh.ckv, sh.ik, sh.ratio = c.ckv[L], c.ik[L], r
@@ -1000,7 +1045,6 @@ class Model:
                 # sits ahead of this wait on the compute stream; conversion/add wait for both.
                 torch.cuda.current_stream(routed.device).wait_stream(self._ep_comm_stream)
                 _mark("ep_combine")
-            routed = routed.to(torch.bfloat16).float()
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
@@ -1015,7 +1059,7 @@ class Model:
              else R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps))
         _mark("hc_attn_mix")
         t0 = time.perf_counter()
-        y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
+        y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo, prefill=prefill)
         self.stats["attn_s"] += time.perf_counter() - t0
         h = (_hc_post_fused(y, residual, attn_post, attn_comb) if HC_OPS
              else R.hc_post(y, residual, attn_post, attn_comb))

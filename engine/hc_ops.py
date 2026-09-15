@@ -43,11 +43,15 @@ def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constex
     j = tl.arange(0, HC)
     post = tl.load(POST + t * HC + j).to(tl.float32)                        # [HC]
     # y[j] = post[j]*x + sum_i comb[i,j]*res[i]
-    acc = post[:, None] * x[None, :]                                        # [HC, BD]
+    # Match v41_ref.hc_post's two-stage expression: einsum builds the residual mix first,
+    # then the projected branch is added.  Starting with post*x reassociates five FP32 terms;
+    # after the BF16 store that is enough to flip downstream router ties.
+    acc = tl.zeros([HC, BD], dtype=tl.float32)
     for i in range(HC):
         res_i = tl.load(RES + (t * HC + i) * D + db, mask=m, other=0.0).to(tl.float32)
         c_ij = tl.load(COMB + (t * HC + i) * HC + j).to(tl.float32)         # [HC] over j
         acc += c_ij[:, None] * res_i[None, :]
+    acc += post[:, None] * x[None, :]
     tl.store(OUT + (t * HC + j[:, None]) * D + db[None, :], acc.to(tl.bfloat16),
              mask=m[None, :])
 
@@ -77,6 +81,10 @@ def _hc_pre_norm_kernel(X, PRE, W, OUT, D, EPS, HC: tl.constexpr, BD: tl.constex
         for i in range(HC):
             acc += tl.load(X + (t * HC + i) * D + db, mask=m, other=0.0).to(tl.float32) * tl.sum(
                 tl.where(j == i, pre, 0.0))
+        # hc_pre returns BF16, then rmsnorm promotes that rounded tensor back to FP32.  Keeping
+        # this intermediate in FP32 is not an accuracy improvement: it changes the checkpoint's
+        # calibrated computation and was the main fused-vs-reference discrepancy.
+        acc = acc.to(tl.bfloat16).to(tl.float32)
         ssq += tl.sum(tl.where(m, acc * acc, 0.0))
         tl.store(OUT + t * D + db, acc, mask=m)          # unnormalised, fp32 scratch
     rs = 1.0 / tl.sqrt(ssq / D + EPS)

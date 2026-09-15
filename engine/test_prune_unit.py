@@ -89,6 +89,13 @@ class PruneUnitRequestTest(unittest.TestCase):
         self.assertEqual(float(s._want_counts.sum()), 0.0)
         self.assertEqual(float(s._req_counts.sum()), 4.0)   # untouched
 
+    def test_disabled_logging_reset_and_flush_are_noops(self):
+        s = types.SimpleNamespace(_req_counts=None, _want_counts=None, _want_mass=None)
+        M.Model.reset_request_demand(s)
+        M.Model.flush_request_demand(s, 50)
+        self.assertIsNone(s._req_counts)
+        self.assertIsNone(s._want_counts)
+
 
 if __name__ == "__main__":
     unittest.main()

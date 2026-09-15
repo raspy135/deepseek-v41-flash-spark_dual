@@ -40,7 +40,8 @@ class ExpertArena:
 
 
 def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: ExpertArena,
-                swiglu_limit: float = 10.0) -> torch.Tensor:
+                swiglu_limit: float = 10.0, out_dtype: torch.dtype = torch.float32,
+                **_kwargs) -> torch.Tensor:
     """Sum of the `slots.shape[1]` routed experts of each token.
 
     The per-expert results are parked in a [T, K, dim] buffer and only then summed over K, so the
@@ -59,4 +60,4 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
         w3 = R.dequant_fp4_packed(arena.w3[s], arena.s3[s])
         t, k = torch.where(slots == s)
         parts.index_copy_(0, t * K + k, R.expert_ffn(x[t], w1, w2, w3, swiglu_limit, weights[t, k, None]).float())
-    return parts.view(T, K, D).sum(dim=1).to(x.dtype)
+    return parts.view(T, K, D).sum(dim=1).to(out_dtype)

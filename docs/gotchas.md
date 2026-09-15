@@ -311,7 +311,114 @@ is already low. That combination always means the ranking is churning, never tha
 work to do; reach for the half-life before `DSV41_PRUNE_SWAP_MIN_GAIN`, because the gain threshold
 only suppresses the symptom.
 
-## Structural corruption in greedy decode is the expert quant, not the engine
+## Structural corruption: test expert arithmetic, not just engine switches
+
+**Correction to 01ed3e2 (2026-09-14):** the earlier conclusion below that the checkpoint's
+MXFP4 scale grid caused nesting corruption was not established by those tests. They all kept
+the custom expert arithmetic. Dequantizing the *same* packed expert weights to BF16 and using
+BF16-output matmuls passed all four nesting probes (1.000 versus 0.750 for the custom kernel
+in the single-box handoff). That fallback is diagnostic only: host-side `unique().tolist()`
+makes it uncapturable in CUDA graphs, and dequantizing each expert per call is much slower.
+
+The fused kernel omitted the BF16 output boundary of the gate/up linear before FP32
+clamp/SwiGLU. It also omitted each down projection's BF16 output boundary; conversely the
+EP2 path rounded the routed aggregate *before* adding the shared expert. These are engine
+differences, not missing expert weights or a different checkpoint. Preserve FP32 accumulation,
+round each linear where the reference rounds, then sum routed and shared results in FP32
+before the final BF16 cast. "More precision" at a different boundary is not reference parity.
+
+The handoff's gate/up correction made software decode (`DOT_SCALED=0`) pass 1.000, while
+`DOT_SCALED=1` remained at 0.750. Do not interpret a pass at one greedy rounding boundary as a
+quality guarantee. The corrected standalone test disables reduced-precision BF16 reduction,
+as the engine already does: at T=512, relative error is 2.88e-4 (software) / 1.40e-4 (scaled),
+not the previously reported ~4.5e-3. Both pass a 1e-3 tolerance; the scaled path having *lower*
+random-tensor error did not predict its nesting score.
+
+Fresh-process margin check, full experts (`PRUNE_KEEP=1`, no adaptive pruning, speculation
+off), same canonical spaced depth-8 answer, one-token decode after prefill:
+
+| expert arithmetic | final `}}}}` logit | competing `}}` logit | target-minus-competitor |
+|---|---:|---:|---:|
+| software decode + BF16 boundaries | 32.00 | 31.75 | +0.25 |
+| dot_scaled + BF16 boundaries | 32.00 | 32.25 | -0.25 |
+| BF16-dequant control | 33.00 | 32.75 | +0.25 |
+
+The control itself is borderline. This verifies a rounding-sensitive decision, **not** a
+comfortable-margin or general-quality fix. `MARGIN=1 SPEC=0 PRUNE_KEEP=1` with
+`tools/nesting_arm.py` reproduces the check; run each arithmetic arm in a fresh process because
+activation-quantization monkeypatching is process-global. The canonical target is not the only
+valid tokenization; use actual generation alongside margins when evaluating a candidate.
+
+Rejected speed-preserving attempt: resetting dot_scaled's accumulator every 128 K and adding
+the partials outside MMA. Depth-8 generation passed via an earlier switch to *compact* JSON,
+but the same spaced-prefix closing margin worsened to -1.0; T=512 MoE time rose from 8.8 to
+10.6 ms. This is exactly why a pass alone is insufficient. Keep the original scaled kernel as
+an opt-in arm; the serving profile selects software decode, without claiming that its +0.25
+margin is robust. Initial layer-0/32-expert microbenchmarks measured T=512 at 15.1 ms software
+versus 8.8 ms scaled; these are kernel timings, not whole-engine prefill throughput.
+
+Second rejected speed-preserving attempt: explicit scaled **prefill** plus software **decode**
+(including prefill dispatch during decoder replay). Full-expert single-node depth-8 generation
+failed with an extra closing brace; the forced closing margin worsened to **-0.75**
+(target 31.50, competitor 32.25). The experimental dispatch was removed, not enabled in serving.
+
+Matched EP2 timing, both with corrected rounding and cycle breaker OFF: arena 88 GB,
+keep=0.59, spec ON, MAX_SEQ=262144, adaptation/demand logging OFF. Three deterministic
+cache-busted 4514-token prompts, 64-token completions per arm; all prompt hashes and generated
+texts matched and every run reported zero prefix-cached tokens. Warm runs (1 and 2):
+
+| arithmetic | prefill tok/s, run 1 / 2 | decode tok/s, run 1 / 2 |
+|---|---:|---:|
+| software (passing configuration) | 348.52 / 491.77 | 30.99 / 30.87 |
+| scaled (comparison arm) | 431.07 / 520.37 | 31.54 / 31.77 |
+
+Software was 19.2% / 5.5% slower in warm prefill and 1.7% / 2.8% slower in decode.
+Run 0 includes cold/JIT/cache effects (software prefill 164.64, scaled 289.15 tok/s) and is
+not a steady-state comparison. Warm results also vary substantially: do not claim a universal
+percentage or "no speed regression." This compares two arithmetic settings of the corrected
+engine, not a matched historical pre-fix build. Command: `bench/prefill_ab.py OUT --runs 3
+--cache-bust --max-tokens 64`. No full quality benchmark was run at keep=1.
+
+Final normal-profile deployment (EP2, keep=0.59, spec ON, arena 88 GB, adaptive settings
+restored) passed the arithmetic floor smoke test: 10/10, 503 tokens, 26.0 decode tok/s.
+`generation_gate.py --only arithmetic --max-tokens 600` checks basic operation, not general
+quality; the full-expert nesting result above is the separate quality evidence.
+
+Single-node regression checks with software decode and these rounding boundaries:
+`tools/test_fp4_moe.py` passes at 1e-3 for both BF16 and FP32 routed output, with bit-identical
+repeated runs and prefixes at call sizes 1, 3, 6, 7, 17, 64, 148, 256, and 300.
+`engine/test_fastdecode.py` passes exact equality for logits, hidden state, and drafts at both
+tested parities (keep=0.25, transient slots=16). `engine/test_spec_lossless.py --max-tokens 64`
+passes both prompts: all 64 tokens identical with speculation off versus on, using
+`results/trace-union/stats/coverage.json`, keep=0.25, and 16 transient slots. These are bounded
+regression checks, not long-output quality certification.
+
+Other retained fixes: HC pre-mix must round to BF16 before RMSNorm, HC post-mix adds the branch
+after the residual mix, and short reference-shaped attention applies only to **prefill**.
+Applying the compact attention path to decode broke FastDecoder/eager agreement (relative
+logit error 0.104, top-1 agreement 0.83); the prefill gate restores the same decode shape.
+The removed window-KV FP8 QDQ call had been an identity with `act_quant=False`: it was not
+evidence of reference FP8-cache parity. Compressed-KV QDQ is separate and remains graph-safe.
+
+### Historical negative tests (before the expert rounding correction)
+
+**HTTP comparison confound found 2026-09-14:** these served nesting failures also had a
+default-on `Penalties` cycle breaker. Direct `eng.generate()` probes did not construct it.
+The breaker bans the correct `n` token at answer position 13 in canonical depth-8 JSON.
+Thus the historical HTTP failures below do not independently establish kernel/checkpoint
+corruption. With corrected software-decode kernels, EP2, full experts, and speculation ON,
+changing **only** `DSV41_CYCLE_BREAK=1` to `0` raised the four-probe nesting score from
+0.458 (1.000 / 0.833 / 0 / 0) to **1.000 (4/4)**. Both nodes used identical image
+`6c5a316bafb4187d86a27471f5c1ca4e69a53ccd0cecae510056f601431e865d`.
+This is a bounded quality check, not a guarantee for arbitrary prompts. The breaker is now
+opt-in, covered by `engine/test_penalties.py`, and exposed in health and the EP boot guard.
+
+Additional eliminated suspects: the single-node depth-8 run still passed with serving's
+MAX_SEQ=262144 and PREFILL_FUSED_ATTN=0 (same +0.25 closing margin); prompt IDs and deployed
+engine source hashes matched. `tools/test_fp4_ep_sum.py` with 30 real layer-0 experts measured
+full versus parity-split FP32 sums at T=1/6/63/512: maximum differences 0 / 2.98e-8 / 2.38e-7 /
+4.77e-7, and identical BF16 results after adding the shared term. This does not prove exact
+full-model EP parity, but no extra arithmetic change was needed for the four served probes.
 
 Symptom, found comparing this engine against MiaAI's EXL3 2.9 bpw build of the same checkpoint on a
 nesting probe (`llm_benchmark/quality_quant2.py --only nesting`): asked to emit `{"n": ...}` nested
@@ -324,8 +431,7 @@ depth=10  {"n": {"n": {... {"n": "n": {...  "nn": 50}}...        dropped quote, 
 ```
 
 Depth 4 is always right, 6 marginal, 8+ broken, and the corruption is character duplication and a
-lost quote -- not a semantic substitution. It reproduced on every engine configuration tried, so no
-switch the engine exposes is the cause:
+lost quote -- not a semantic substitution. It reproduced on every engine configuration then tried:
 
 | hypothesis | test | result |
 |---|---|---|
@@ -340,19 +446,15 @@ switch the engine exposes is the cause:
 | prefix cache | cold (evict), warm, cold again | identical corruption |
 
 The same weights under a per-row codebook requant (EXL3 2.9 bpw, vLLM) answer all four depths
-exactly. So this is a property of the checkpoint's **MXFP4 scale model** -- UE8M0, one power of two
-per 32 K -- on repeated low-margin tokens, not of this engine. The effective precision at 4
-bits/weight is gated by that scale grid, not by the code width, which is why a well-fitted 3-bit
-codebook can win this particular family.
+exactly. That comparison changes both quantization and runtime; it cannot isolate the scale grid
+as the cause. The same-weight BF16-dequant experiment above is the more relevant control.
 
 **Do not generalize it.** The battery's macro is decided by `nesting` + `constraint` +
 `char_count`; `counter`, `json_strict`, `verbatim`, `copy_transform` and `escape_json` saturate at
-1.00 for both models. Accurate JSON does not mean 4-bit loses everywhere against 3-bit: the native
-MXFP4 is competitive on the other families and on held-out teacher-forced loss. The finding is
-"repeated structural output is where the MXFP4 scale model shows", nothing broader.
+1.00 for both models. Neither a four-probe nesting pass nor teacher-forced loss establishes
+whole-model quality parity.
 
-**If you want to fix it**, the fix is a requant and the lever is the scale/error model, not the bit
-width:
+Requantization alternatives investigated at the time (not established fixes for this bug):
 
 * **NVFP4** (E2M1 + E4M3 per 16) is the small change -- only the routed experts differ, and e4m3
   scales carry 3 mantissa bits instead of a power of two. It is **not reachable natively here yet**:
@@ -367,7 +469,7 @@ width:
 * Public "NVFP4" checkpoints are MXFP4→NVFP4 casts of this same checkpoint (`base_model:quantized`),
   so they redistribute the same error; there is no higher-precision source to download.
 
-If you serve the native checkpoint, expect this family to fail and do not spend engine time on it.
+Keep these rejected alternatives as history, not as a reason to rule out engine arithmetic.
 
 ## The dense fp4 and fp8 head buy ~5% decode and cost structure
 

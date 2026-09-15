@@ -10,6 +10,11 @@ import time
 import torch
 from safetensors import safe_open
 
+# Match engine/model.py. Otherwise the supposed BF16 reference may reduce split-K partials
+# in BF16, inflating the T=512 error and hiding missing linear-output rounding in the kernel.
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fp4_moe  # noqa: E402
 from fp4_moe import DIM, ExpertArena, moe_forward, moe_forward_reference  # noqa: E402
@@ -88,7 +93,7 @@ def bench(fn, iters: int = 20, warm: int = 3) -> tuple[float, float]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tol", type=float, default=2e-2)
+    ap.add_argument("--tol", type=float, default=1e-3)
     ap.add_argument("--iters", type=int, default=20)
     args = ap.parse_args()
     device = torch.device("cuda")
@@ -108,11 +113,18 @@ def main():
         x = (torch.randn((T, DIM), generator=gen) * 1.0).to(torch.bfloat16).to(device)
         slots, w = random_routing(T, N_EXPERTS, gen, device)
         y = moe_forward(x, slots, w, arena)
-        y_ref = moe_forward_reference(x, slots, w, arena)
+        y_ref32 = moe_forward_reference(x, slots, w, arena, out_dtype=torch.float32)
+        y_ref = y_ref32.to(torch.bfloat16)
         diff = (y.float() - y_ref.float())
         rel = diff.norm() / y_ref.float().norm()
         print(f"{T:>5} {diff.abs().max().item():>12.4e} {rel.item():>10.4e} {y_ref.float().abs().max().item():>10.3f}")
         ok &= bool(rel.item() < args.tol)
+        # Serving adds the shared expert (and the peer's routed sum) before the final BF16
+        # conversion. Check that API too; validating only the default BF16 result hid the
+        # engine's misplaced aggregate rounding boundary.
+        y32 = moe_forward(x, slots, w, arena, out_dtype=torch.float32)
+        rel32 = float((y32 - y_ref32).norm() / y_ref32.norm())
+        assert y32.dtype == torch.float32 and rel32 < args.tol, (T, rel32)
     assert ok, f"relative error exceeded {args.tol}"
     print("accuracy: PASS")
 
