@@ -242,13 +242,26 @@ class Weights:
         # same weights and the 2.65 GB fp32 copy disappears (= ~140 more expert slots).
         # ... and, with DSV41_HEAD_FMT, in fp8 or fp4 instead: the head is read in full on every
         # decode step, so its stored format is worth as much as a dense projection group's.
-        self.head = R.make_head(get("head.weight").to(device))
+        head = get('head.weight')
+        if os.environ.get('DSV41_TP_HEAD', '0') == '1':
+            from engine.tensor_parallel import VocabParallelHead
+            rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
+            if world != 2 or head.shape[0] % world:
+                raise ValueError('vocabulary TP requires two equal shards')
+            self.head = VocabParallelHead(R.make_head(head.chunk(world, dim=0)[rank].to(device)), world)
+        else:
+            self.head = R.make_head(head.to(device))
+        del head
         self.norm = get("norm.weight").to(device).to(torch.bfloat16)
         self.layers = []
         self.indexers = {}
         self.engram = {}
         for L in range(n_load):
             self.layers.append(R.LayerWeights(get, L, args, device))
+            if os.environ.get('DSV41_TP_ATTN', '0') == '1':
+                from engine.tensor_parallel import shard_attention
+                shard_attention(self.layers[-1], args, int(os.environ.get('RANK', '0')),
+                                int(os.environ.get('WORLD_SIZE', '1')))
             if L in args.index_source_layers:
                 self.indexers[L] = IndexerWeights(get, f"layers.{L}.attn.", L in args.kv_source_layers, device)
             if L in args.engram_layer_ids:
@@ -474,7 +487,7 @@ class Model:
         _mark("attn_begin")
         _t = 0.0
         qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
-        q = R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim)
+        q = R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim)
         q = torch.cat([q[..., :-rd], R.apply_rotary(q[..., -rd:], fq)], dim=-1)
         _t = _aph("q_proj", _t)
         self._tap("q", L, q)
@@ -556,7 +569,7 @@ class Model:
         self._tap("attn_core", L, o)
         _t = _aph("softmax_attn", _t)
         o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
-        o = o.reshape(T, a.o_groups, -1)
+        o = o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)
         # grouped output projection: "sgd,grd->sgr" is a GEMM with M = number of tokens, so it too
         # has to run on fixed-size token tiles (it differs most visibly at a 1-token chunk).
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
@@ -1034,11 +1047,12 @@ class Model:
             # during prefill.
             _mark("moe_kernel")
             tc = time.perf_counter()
-            ep_overlap = (prefill and y.size(0) > 16 and self._ep_comm_stream is not None
+            tp_experts = getattr(store.ep, 'tensor_parallel', False)
+            ep_overlap = (not tp_experts and prefill and y.size(0) > 16 and self._ep_comm_stream is not None
                           and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
             if ep_overlap:
                 ep_work = store.ep.combine_async(routed, self._ep_comm_stream)
-            else:
+            elif not tp_experts:
                 store.ep.combine(routed)
                 _mark("ep_combine")
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
@@ -1047,13 +1061,8 @@ class Model:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-        if TP_DENSE_WORLD > 1:
-            # Each rank holds half the intermediate dim, so this is a PARTIAL sum. It gets its own
-            # all-reduce rather than riding the routed combine: `shared` is added AFTER that
-            # combine precisely so its numerics match the single-box path (see the comment there),
-            # and folding it in would move where the rounding happens.
-            import torch.distributed as _dist
-            _dist.all_reduce(shared, op=_dist.ReduceOp.SUM)
+        # A TP shared expert's RowParallelWeight reduces before BF16 rounding inside
+        # expert_ffn. Unsharded DSpark shared experts must not be reduced a second time.
         _mark("shared_expert")   # the dense FFN every token passes through
         if getattr(store, "null_slot", None) is not None:
             if ep_overlap:

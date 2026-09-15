@@ -1,0 +1,145 @@
+"""Low-volume, frozen-placement EP/TP quality and speed comparison.
+
+No prefix reuse or adaptive DB writes. Use the same checkpoint, demand DB, arena and
+workload order for both modes. Emit metrics and hashes, never captured prompt contents.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--mode', choices=['ep', 'tp', 'tp-experts'], required=True)
+ap.add_argument('--capture', help='optional trusted local token capture for one long-context run')
+ap.add_argument('--arena-gb', type=float, default=88)
+ap.add_argument('--readme-runs', type=int, default=3)
+ap.add_argument('--reduce', choices=['all_reduce', 'scatter', 'auto'], default='all_reduce')
+ap.add_argument('--test-adaptation', action='store_true')
+args = ap.parse_args()
+sys.path.insert(0, '/app')
+os.environ['DSV41_TP_EXPERTS'] = str(int(args.mode != 'ep'))
+os.environ['DSV41_TP_EXPERT_REDUCE'] = args.reduce
+for flag in ('DSV41_TP_ATTN', 'DSV41_TP_DENSE', 'DSV41_TP_HEAD'):
+    os.environ[flag] = str(int(args.mode == 'tp'))
+for flag in ('DSV41_PREFIX_DISK', 'DSV41_PREFIX_CACHE', 'DSV41_PRUNE_SWAP',
+             'DSV41_PRUNE_SWAP_PREFILL', 'DSV41_PREFILL_EP_OVERLAP',
+             'DSV41_PREFILL_TIMING', 'DSV41_PREFILL_MOE_TIMING', 'DSV41_ATTN_TIMING',
+             'DSV41_STEP_TIMING', 'DSV41_GPU_TIMING'):
+    os.environ[flag] = '0'
+
+import torch
+import engine.v41_engine as V
+from server.app import Tok, load_encoding_module, build_chat_prompt
+
+
+def main():
+    V.save_prune_db = lambda *a, **kw: None
+    root = os.environ['MODEL_DIR']
+    e = V.V41Engine(root, max_seq=262144, arena_gb=args.arena_gb,
+                   trace_stats='/app/results/trace-union/stats/coverage.json',
+                   spec=True, prune_keep=.60, transient_slots=16, keep_free_gb=6)
+    enc, tok = load_encoding_module(root), Tok(root)
+    def chat(text):
+        return build_chat_prompt({'messages': [{'role': 'user', 'content': text}]},
+                                 enc, tok, False, 75, e)[1]
+    def run(ids, label, cap=128, grade=None, generation=0):
+        output = []
+        started, first_token_s = time.perf_counter(), None
+        for burst in e.generate(ids, max_tokens=cap, temperature=0, seed=42,
+                                ignore_eos=grade is None):
+            if first_token_s is None:
+                first_token_s = time.perf_counter() - started
+            output.extend(burst)
+        stats = e.last_stats
+        row = dict(mode=args.mode, label=label, tokens=len(ids), output_tokens=len(output),
+                   prefill_s=stats['prefill_s'], prefill_tok_s=stats['prefill_tok_s'],
+                   decode_tok_s=stats['decode_tok_s'], prefix=stats['prefix_cached_tokens'],
+                   accept_len_mean=stats.get('accept_len_mean'),
+                   output_hash=hashlib.sha256(json.dumps(output).encode()).hexdigest(),
+                   first_token_wall_s=round(first_token_s or 0, 4),
+                   request_wall_s=round(time.perf_counter() - started, 4),
+                   allocated_gb=round(torch.cuda.memory_allocated()/1e9, 3))
+        if grade is not None:
+            # The serving adapter truncates at the FIRST stop token in a speculative
+            # burst. Merely filtering EOS IDs retains any tokens emitted after EOS.
+            visible = output[:output.index(e.eos_token_id)] if e.eos_token_id in output else output
+            text = tok.decode(visible).strip()
+            row['tokens_after_eos'] = max(0, len(output) - len(visible) - 1)
+            # Only these synthetic nesting answers may be logged, never capture outputs.
+            row['answer'] = text
+            try:
+                row['passed'] = json.loads(text) == grade
+            except ValueError:
+                row['passed'] = False
+        assert row['prefix'] == 0 and e.expert_generation == generation
+        peers = e.ep.gather_objects(row['output_hash'])
+        assert len(set(peers)) == 1, 'rank outputs diverged'
+        if e.ep.rank == 0:
+            print('TP_ENGINE ' + json.dumps(row), flush=True)
+        return row
+    run(chat('Reply with OK.'), 'warmup', 16)
+    readme = chat('Summarize this repository documentation. Explain its purpose, architecture, '
+                  'setup, and limitations.\n\n' + Path('/app/README.md').read_text())
+    for i in range(args.readme_runs):
+        run(readme, f'readme-{i}')
+    if args.capture:
+        captured_ids, capture_error = None, None
+        if e.ep.rank == 0:
+            try:
+                capture = torch.load(args.capture, map_location='cpu', weights_only=False)
+                if capture.get('vl') is not None or capture.get('kwargs', {}).get('grammar') is not None:
+                    raise ValueError('only text-only captures are supported')
+                captured_ids = list(capture['prompt_ids'])
+                del capture
+            except Exception as exc:
+                capture_error = type(exc).__name__
+        captured_ids, capture_error = e.ep.broadcast_obj((captured_ids, capture_error))
+        if capture_error:
+            raise RuntimeError('capture unavailable: ' + capture_error)
+        run(captured_ids, 'captured-long-context', 64)
+        del captured_ids
+        run(readme, 'readme-after-long')
+    failed_quality = []
+    for depth in (8, 10):
+        reference = '\n'.join(f'def reference_{i}(value): return (value + {i}) % 97 # reference only'
+                              for i in range(300))
+        text = ('Ignore the reference text below when answering the task at the end.\n<reference>\n'
+                + reference + '\n</reference>\n'
+                + f'Output one JSON object nested exactly {depth} levels deep and nothing else. '
+                'Each level has exactly one key "n" whose value is the next level down. '
+                + f'The innermost "n" is the integer {40+depth}. '
+                + f'So depth 2 would be: {{"n": {{"n": {40+depth}}}}}')
+        expected = 40 + depth
+        for _ in range(depth):
+            expected = {'n': expected}
+        row = run(chat(text), f'nesting-{depth}', 256, expected)
+        if not row['passed']:
+            failed_quality.append(depth)
+    assert not failed_quality, f'nesting quality gate failed at depths {failed_quality}'
+    if args.test_adaptation:
+        plan = e.ep.broadcast_obj(e.plan_swaps(max_swaps=2, min_gain=0.0) if e.ep.rank == 0 else None)
+        assert plan, 'no adaptive plan available for the test'
+        e.apply_swaps(plan)
+        for L, old, new, _ in plan:
+            if e.ep.tensor_parallel or e.ep.owns(L, new):
+                assert (L, new) in e.store.lru and (L, old) not in e.store.lru
+                ids_map, slot_map = e.model.prefill_routes[L]
+                assert int(slot_map[ids_map[new]]) == int(e.fast.lut[L, new]) != e.store.null_slot
+        # Reuse the last long-nesting control after changing the actual resident shards.
+        row = run(chat(text), 'nesting-after-adaptation', 256, expected, generation=1)
+        assert row['passed'], 'post-adaptation quality gate failed'
+        if e.ep.rank == 0:
+            print('TP_ADAPTATION_PASSED ' + str(len(plan)), flush=True)
+    if e.ep.rank == 0:
+        print('TP_ENGINE_GATE_PASSED ' + args.mode, flush=True)
+    assert all(e.ep.gather_objects(True))
+    torch.cuda.synchronize()
+    sys.stdout.flush()
+    os._exit(0)
+
+
+if __name__ == '__main__':
+    main()

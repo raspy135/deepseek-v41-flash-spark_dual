@@ -45,6 +45,7 @@ PREFILL_TIMING = os.environ.get("DSV41_PREFILL_TIMING", "0") == "1"
 # rounded down to a MAX_CHUNK boundary. Part of the cross-rank config guard: the restored
 # length decides whether a prefill collective happens at all, so the ranks must agree on it.
 PREFIX_SNAPSHOTS = int(os.environ.get("DSV41_PREFIX_SNAPSHOTS", "0") or "0")
+PREFIX_DISK = os.environ.get("DSV41_PREFIX_DISK", "0") == "1"
 # Adapt the resident experts once more, at the prefill -> decode boundary, instead of only after
 # the response. The demand blend weights observed evidence w = observed/(observed + PRIOR); at
 # PRIOR=2e4 per layer a 30k-token prompt is w=90% against 11% for a 400-token answer, so the
@@ -542,6 +543,8 @@ class V41Engine:
 
         def make_expert_arena(n_slots):
             if cb3_cls is None:
+                if self.ep.tensor_parallel:
+                    return fp4_arena_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
                 return fp4_arena_cls(n_slots, device)
             a = cb3_cls(n_slots, device)
             a.sim = self._cb3_sim
@@ -556,6 +559,12 @@ class V41Engine:
         # the same unified pool, and an arena sized around a not-yet-created PG overcounts what
         # is left (the keep_free floor then quietly eats itself).
         self.ep = DT.EPDistributed(rank, world_size)
+        if self.ep.tensor_parallel:
+            if (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
+                    or os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
+                    or float(os.environ.get('DSV41_PREFILL_REPLICA_GB', '0'))):
+                raise ValueError('expert TP requires native FP4, no replicas, no EP overlap')
+            self.expert_bytes //= self.ep.world
         replica_gb = float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0"))
         self.replica_budget_ms = float(os.environ.get("DSV41_PREFILL_REPLICA_BUDGET_MS", "500"))
         if not np.isfinite(replica_gb) or not 0 <= replica_gb <= 1:
@@ -569,8 +578,11 @@ class V41Engine:
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3"), expert_format
             self.ep.init(device)
-            log(f"EP2 up: rank {self.ep.rank}/{self.ep.world}; this arena holds only experts"
-                f" where expert % {self.ep.world} == {self.ep.rank}, unowned ones map to its null slot")
+            if self.ep.tensor_parallel:
+                log(f'TP2 up: rank {self.ep.rank}; each arena slot holds half an expert')
+            else:
+                log(f"EP2 up: rank {self.ep.rank}/{self.ep.world}; this arena holds only experts"
+                    f" where expert % {self.ep.world} == {self.ep.rank}, unowned ones map to its null slot")
 
         self.W = Weights(model_dir, index, self.args, device, log=log, act_quant=act_quant)
         if R.dense_fp4_groups():
@@ -698,6 +710,8 @@ class V41Engine:
         # DSV41_PREFIX_SNAPSHOTS. The full-prompt snapshot above is the exact-extension fast path;
         # these are the fallback when a changed token stops the prompt from extending it.
         self._prefix_snapshots: dict = {}
+        self.prefix_disk = None
+        self._prefix_route = ''
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
@@ -774,9 +788,9 @@ class V41Engine:
                 log(f"simulated 2-bit codebook on {len(pol2)} of {len(ranked)} kept experts "
                     f"(coldest {self.sim_cb2_frac:.0%} per layer); slot size unchanged")
             owned_counts = require_pruned_residency(
-                ranked, self.ep.world, self.store.lru_slots, prune_keep,
+                ranked, 1 if self.ep.tensor_parallel else self.ep.world, self.store.lru_slots, prune_keep,
                 self.store.transient_slots)
-            n_here = owned_counts[self.ep.rank]
+            n_here = owned_counts[0 if self.ep.tensor_parallel else self.ep.rank]
             if self.ep.active:
                 log(f"EP2 rank {self.ep.rank}: {n_here} of the {len(ranked)} kept experts are owned here")
             self._kept_here = n_here   # the resident test below needs the real count, see there
@@ -810,6 +824,12 @@ class V41Engine:
             cfg = {
                 "expert_format": self.expert_format,
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
+                "tp_experts": self.ep.tensor_parallel,
+                "tp_experts_version": 1,
+                "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
+                "tp_attention": os.environ.get('DSV41_TP_ATTN', '0'),
+                "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
+                "tp_dense_rounding_version": 2,
                 "prune_keep": float(prune_keep or 0.0),
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
                 "spec": bool(self.spec),
@@ -859,6 +879,10 @@ class V41Engine:
                 # many per-layer collectives) this request issues. A rank that keeps a different
                 # number of snapshots can resume at a different boundary; keep it in the guard.
                 "prefix_snapshots": PREFIX_SNAPSHOTS,
+                "prefix_cache": os.environ.get('DSV41_PREFIX_CACHE', '1'),
+                "prefix_disk": PREFIX_DISK,
+                "prefix_disk_version": 1,
+                "prefix_disk_strict": os.environ.get("DSV41_PREFIX_DISK_STRICT", "0"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
             diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}
@@ -984,6 +1008,22 @@ class V41Engine:
             # are clean. No-op when the flag is off.
             self.fast.route_stats_reset()
 
+    def _init_prefix_disk(self):
+        """Lazy initialization after loading; all ranks participate even on local I/O errors."""
+        if not PREFIX_DISK or getattr(self, '_prefix_disk_initialized', False):
+            return
+        self._prefix_disk_initialized = True
+        ok = True
+        try:
+            from engine.prefix_persistence import PersistentPrefixes, routing_signature
+            self._prefix_route = routing_signature(self)
+            self.prefix_disk = PersistentPrefixes(self, log)
+        except Exception as exc:
+            log(f'prefix disk unavailable ({type(exc).__name__}); disabling on both ranks')
+            ok = False
+        if not all(self.ep.gather_objects(ok)):
+            self.prefix_disk = None
+
     def _try_restore(self, pc, prompt: list[int]) -> int:
         """Restore one cached snapshot if it is a prefix of ``prompt``; return its length.
 
@@ -994,6 +1034,9 @@ class V41Engine:
         if (pc is None or getattr(self, "replica_slots", 0)
                 or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay
                 or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
+            return 0
+        disk = getattr(self, 'prefix_disk', None)
+        if disk is not None and disk.strict and pc.get('route') != self._prefix_route:
             return 0
         c = self.caches
         n = len(pc["ids"])
@@ -1054,6 +1097,7 @@ class V41Engine:
             # tensor back here forced a full-stream synchronisation at every cache miss and made
             # queued encoder work appear as a prefix-cache cost.
             "ids": tuple(prefix_ids),
+            "route": getattr(self, '_prefix_route', ''),
             "slots": slots,
             "win": {L: c.win[L][slots].clone()
                     for L in range(self.args.candidate_source_layer + 1)},
@@ -1090,12 +1134,18 @@ class V41Engine:
             torch.manual_seed(seed)
         stop_ids = set() if ignore_eos else (set(stop_ids) | {self.eos_token_id})
         self._reset()
+        self._init_prefix_disk()
         m = self.model
         P = len(prompt)
         assert P + max_tokens + 8 <= self.max_context, f"prompt {P} + max_tokens {max_tokens} > context {self.max_context}"
         ids = torch.tensor(prompt, dtype=torch.long, device=self.device)
         has_vision = bool(getattr(self, "_images", None))
+        _prefix_load_start = time.perf_counter()
         prefix_start = 0 if has_vision else self._restore_prefix(prompt)
+        if (self.prefix_disk is not None and not has_vision and self.swa_replay
+                and not self.replica_slots and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'):
+            prefix_start = self.prefix_disk.restore(prompt, prefix_start)
+        _prefix_load_s = time.perf_counter() - _prefix_load_start
         if has_vision:
             self._prefix_cache = None
         t_start = time.perf_counter()
@@ -1112,7 +1162,7 @@ class V41Engine:
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
                                          _st := {}, grammar, penalties, prefix_start=prefix_start,
-                                         host_ids=prompt)
+                                         host_ids=prompt, prefix_load_s=_prefix_load_s)
         except BaseException:
             # GeneratorExit (stop string / disconnect / server error) or a real exception. The
             # normal exit already told rank 1 to stop via the loop's own control(); only the
@@ -1354,7 +1404,7 @@ class V41Engine:
         if min_gain is None:
             min_gain = float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05"))
         ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
-        world = max(1, self.ep.world)
+        world = 1 if getattr(self.ep, 'tensor_parallel', False) else max(1, self.ep.world)
         out = []
         for L, msk in self.model_prune_mask.items():
             keep = msk.detach().cpu().numpy().astype(bool)
@@ -1402,7 +1452,8 @@ class V41Engine:
         if not swaps:
             return 0
         st = self.store
-        world, rank = max(1, self.ep.world), self.ep.rank
+        world, rank = ((1, 0) if getattr(self.ep, 'tensor_parallel', False)
+                       else (max(1, self.ep.world), self.ep.rank))
         null = int(getattr(st, "null_slot", -1))
 
         # Validate before touching anything: a plan that is wrong is wrong before the first load,
@@ -1447,6 +1498,9 @@ class V41Engine:
         self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
         self._requests_since_plan = 0   # a plan was applied; wait for the next request
         self.expert_generation += 1
+        if getattr(self, 'prefix_disk', None) is not None:
+            from engine.prefix_persistence import routing_signature
+            self._prefix_route = routing_signature(self)
         log(f"adapted {len(swaps)} expert slots to observed demand "
             f"(expert generation {self.expert_generation})")
         return len(swaps)
@@ -1650,10 +1704,10 @@ class V41Engine:
         return ra
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None,
-                     penalties=None, prefix_start: int = 0, host_ids=None):
+                     penalties=None, prefix_start: int = 0, host_ids=None, prefix_load_s=0.0):
 
         m = self.model
-        t_start = time.perf_counter()
+        t_start = time.perf_counter() - prefix_load_s
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
@@ -1696,9 +1750,11 @@ class V41Engine:
             timing = PrefillTiming(self.ep.rank)
             out_st["prefill_timing"] = timing
         hashes_t = None
-        if prefix_start and spans and m.hash_state is not None:
+        if prefix_start and m.hash_state is not None:
             # Hashing the full token sequence preserves n-grams crossing the cached boundary;
-            # only the suffix rows are fetched and forwarded.
+            # only the suffix rows are fetched and forwarded. Do this on a FULL hit too:
+            # after another prompt (or a restart), the Engram compressed-token history is
+            # unrelated/uninitialized even though the restored KV and replay state are valid.
             th = time.perf_counter()
             hashes_t = m.hash_state(ids[None], 0, None if eg_mask is None else eg_mask[None])[0]
             m.stats["engram_s"] += time.perf_counter() - th
@@ -1746,6 +1802,9 @@ class V41Engine:
                 # Save at the prompt boundary, before decoder replay and generation overwrite the
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
                 self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
+                if (self.prefix_disk is not None and P > prefix_start
+                        and self._prefix_cache is not None and self._images is None):
+                    self.prefix_disk.save(host_ids if host_ids is not None else ids.tolist())
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
                     m.dspark_seed(mh, s_rep)
@@ -2033,6 +2092,7 @@ class V41Engine:
             "engine": "v41",
             "ep_world_size": self.ep.world,
             "ep_rank": self.ep.rank,
+            "tp_experts": self.ep.tensor_parallel,
             "arena_gb": self.arena_gb,
             "arena_slots": self.slots,
             "lru_slots": self.store.lru_slots,
@@ -2074,6 +2134,8 @@ class V41Engine:
                                    os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
             "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
             "prefix_snapshots": PREFIX_SNAPSHOTS,
+            "prefix_disk": self.prefix_disk is not None,
+            "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,
             "prefill_replica_slots": self.replica_slots,
             "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),
             "prefill_replica_budget_ms": self.replica_budget_ms,

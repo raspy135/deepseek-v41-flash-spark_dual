@@ -40,7 +40,7 @@ def _fp8_linear_kernel(X, W, S, Y, M, N, K,
         w3 = tl.reshape(w.to(tl.bfloat16), (BLOCK_N, BLOCK_K // 32, 32)) * scale[:, :, None]
         wb = tl.reshape(w3, (BLOCK_N, BLOCK_K))
         acc += tl.dot(x, tl.trans(wb), out_dtype=tl.float32)
-    tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+    tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc, mask=m_mask[:, None] & n_mask[None, :])
 
 
 @triton.jit
@@ -111,8 +111,8 @@ class FP8Weight:
         if dim == 0:
             n = self.N // world
             assert self.N % world == 0 and n % 32 == 0, (self.N, world)
-            return FP8Weight(self.w[rank * n:(rank + 1) * n],
-                             self.s[rank * (n // 32):(rank + 1) * (n // 32)])
+            return FP8Weight(self.w[rank * n:(rank + 1) * n].clone(),
+                             self.s[rank * (n // 32):(rank + 1) * (n // 32)].clone())
         k = self.K // world
         assert self.K % world == 0 and k % 32 == 0, (self.K, world)
         return FP8Weight(self.w[:, rank * k:(rank + 1) * k],
@@ -186,7 +186,7 @@ def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:
     return FP8Weight(codes, scales)
 
 
-def fp8_linear(x: torch.Tensor, W: FP8Weight) -> torch.Tensor:
+def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16) -> torch.Tensor:
     """x bf16 [..., K] -> bf16 [..., N]."""
     shape = x.shape
     x2 = x.reshape(-1, W.K)
@@ -194,7 +194,7 @@ def fp8_linear(x: torch.Tensor, W: FP8Weight) -> torch.Tensor:
         x2 = x2.to(torch.bfloat16)
     x2 = x2.contiguous()
     M = x2.size(0)
-    y = torch.empty(M, W.N, dtype=torch.bfloat16, device=x.device)
+    y = torch.empty(M, W.N, dtype=out_dtype, device=x.device)
     BLOCK_M = 16 if M <= 16 else 64
     BLOCK_N = 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64

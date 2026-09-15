@@ -86,16 +86,21 @@ except Exception:  # pragma: no cover
 class ExpertArena:
     """GPU-resident slots of packed FP4 expert weights (18.8 MB per slot)."""
 
-    def __init__(self, slots: int, device: torch.device | str = "cuda"):
+    def __init__(self, slots: int, device: torch.device | str = "cuda", tp_rank=0, tp_world=1):
         self.slots = slots
         self.device = torch.device(device)
+        if tp_world not in (1, 2) or not 0 <= tp_rank < tp_world:
+            raise ValueError('FP4 expert TP supports world=1 or 2')
+        self.tp_rank, self.tp_world = tp_rank, tp_world
+        self.inter = INTER // tp_world
+        ni, kb2, sg2 = self.inter, self.inter // 2, self.inter // GROUP
         u8 = dict(dtype=torch.uint8, device=self.device)
-        self.w1 = torch.empty((slots, INTER, KB1), **u8)
-        self.s1 = torch.empty((slots, INTER, SG1), **u8)
-        self.w3 = torch.empty((slots, INTER, KB1), **u8)
-        self.s3 = torch.empty((slots, INTER, SG1), **u8)
-        self.w2 = torch.empty((slots, DIM, KB2), **u8)
-        self.s2 = torch.empty((slots, DIM, SG2), **u8)
+        self.w1 = torch.empty((slots, ni, KB1), **u8)
+        self.s1 = torch.empty((slots, ni, SG1), **u8)
+        self.w3 = torch.empty((slots, ni, KB1), **u8)
+        self.s3 = torch.empty((slots, ni, SG1), **u8)
+        self.w2 = torch.empty((slots, DIM, kb2), **u8)
+        self.s2 = torch.empty((slots, DIM, sg2), **u8)
 
     @property
     def bytes_per_slot(self) -> int:
@@ -117,12 +122,13 @@ class ExpertArena:
         from pinned memory synchronises the calling stream once per tensor -- six GPU syncs per
         expert, on the stream the model is computing on, for every miss.
         """
-        self.w1[slot].copy_(self._u8(w1, (INTER, KB1)), non_blocking=non_blocking)
-        self.s1[slot].copy_(self._u8(s1, (INTER, SG1)), non_blocking=non_blocking)
-        self.w3[slot].copy_(self._u8(w3, (INTER, KB1)), non_blocking=non_blocking)
-        self.s3[slot].copy_(self._u8(s3, (INTER, SG1)), non_blocking=non_blocking)
-        self.w2[slot].copy_(self._u8(w2, (DIM, KB2)), non_blocking=non_blocking)
-        self.s2[slot].copy_(self._u8(s2, (DIM, SG2)), non_blocking=non_blocking)
+        lo, hi = self.tp_rank * self.inter, (self.tp_rank + 1) * self.inter
+        self.w1[slot].copy_(self._u8(w1, (INTER, KB1))[lo:hi], non_blocking=non_blocking)
+        self.s1[slot].copy_(self._u8(s1, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
+        self.w3[slot].copy_(self._u8(w3, (INTER, KB1))[lo:hi], non_blocking=non_blocking)
+        self.s3[slot].copy_(self._u8(s3, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
+        self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[:, lo//2:hi//2], non_blocking=non_blocking)
+        self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[:, lo//GROUP:hi//GROUP], non_blocking=non_blocking)
 
     def dequant_slot(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(w1, w2, w3) as bf16 [N, K] logical matrices -- for the reference path / tests."""
@@ -315,9 +321,12 @@ def _moe_down_kernel(
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
+    PARTIAL: tl.constexpr = False,
+    PARTS_WORLD: tl.constexpr = 1,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
+    local_n: tl.constexpr = N // PARTS_WORLD
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -333,7 +342,12 @@ def _moe_down_kernel(
         # The up kernel skipped these pairs. Write their contribution explicitly:
         # parts is uninitialized, and its final reduction includes every pair.
         row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
-        tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], 0.0, mask=mask_m[:, None])
+        if PARTS_WORLD > 1:
+            offsets = ((offs_n[None, :] // local_n * (TOPK * NTOK) + row[:, None])
+                       * local_n + offs_n[None, :] % local_n)
+        else:
+            offsets = row[:, None] * stride_y + offs_n[None, :]
+        tl.store(y_ptr + offsets, 0.0, mask=mask_m[:, None])
         return
     offs_j = tl.arange(0, 64)
     offs_q = tl.arange(0, 4)
@@ -354,8 +368,24 @@ def _moe_down_kernel(
     # Expert.forward's quantized linear returns BF16.  The MoE then accumulates those BF16 expert
     # outputs into its FP32 y buffer.  Keeping each expert's down projection in FP32 until after
     # the top-k sum moves a real checkpoint rounding boundary and compounds across layers.
-    tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc.to(tl.bfloat16),
+    value = acc if PARTIAL else acc.to(tl.bfloat16).to(tl.float32)
+    if PARTS_WORLD > 1:
+        offsets = ((offs_n[None, :] // local_n * (TOPK * NTOK) + row[:, None])
+                   * local_n + offs_n[None, :] % local_n)
+    else:
+        offsets = row[:, None] * stride_y + offs_n[None, :]
+    tl.store(y_ptr + offsets, value,
              mask=mask_m[:, None])
+
+
+@triton.jit
+def _tp_round_reduce(parts, out, TD: tl.constexpr, TOPK: tl.constexpr, B: tl.constexpr):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    total = tl.full((B,), 0, tl.float32)
+    for k in range(TOPK):
+        x = tl.load(parts + k * TD + i, i < TD, 0)
+        total += x.to(tl.bfloat16).to(tl.float32)
+    tl.store(out + i, total, i < TD)
 
 
 # --------------------------------------------------------------------------- routing
@@ -553,6 +583,11 @@ def moe_forward(
     BM = block_m or (64 if (slots_repeat and P <= 64 and not split_decode_null) else _pick_bm(P))
     bn1, nw1, ns1 = up_cfg or (_UP_CFG_SCALED if DOT_SCALED else _UP_CFG)[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
+    # TP's 1152 intermediate columns are not divisible by the EP decode tile of
+    # 256. Kernels intentionally omit N masks, so choose a complete tiling.
+    if arena.w1.shape[1] % bn1:
+        bn1 = 128
+    assert arena.w1.shape[1] % bn1 == 0
     if routing_ids is not None and P > 64:
         assert routing_slot_map is not None and routing_ids.shape == slots.shape
         block_slot, block_pair, NB = build_routing(routing_ids, routing_slot_map.numel(), BM, precount=True)
@@ -596,15 +631,19 @@ def moe_forward(
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
         wgt = wgt.float().contiguous()
 
-    h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
+    inter = arena.w1.shape[1]
+    tp = getattr(arena, 'tp_world', 1) > 1
+    reduce_mode = os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce')
+    scatter = tp and (reduce_mode == 'scatter' or (reduce_mode == 'auto' and P > 64))
+    h = torch.empty((P, inter), dtype=torch.bfloat16, device=dev)
     parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)  # one row per (token, k) pair
     if stage_mark is not None:
         stage_mark('scratch_alloc')
-    _moe_up_kernel[(NB, INTER // bn1)](
+    _moe_up_kernel[(NB, inter // bn1)](
         x, arena.w1, arena.s1, arena.w3, arena.s3, h,
         wgt, block_slot, block_pair,
         x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
+        TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
     )
     if stage_mark is not None:
         stage_mark('up_gemm')
@@ -612,11 +651,32 @@ def moe_forward(
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
-        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw2, num_stages=ns2,
+        TOPK=K, N=DIM, K=inter, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
+        PARTIAL=tp, PARTS_WORLD=arena.tp_world if scatter else 1, num_warps=nw2, num_stages=ns2,
     )
     if stage_mark is not None:
         stage_mark('down_gemm')
-    result = parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
+    if tp:
+        # Reconstruct EACH expert before its BF16 rounding boundary. Summing the
+        # rank-local routed totals would move that boundary and resurrect a quality bug.
+        if scatter:
+            # Reduce each expert only to the rank owning these output columns. Round
+            # and sum locally, then gather the much smaller routed totals. No early
+            # BF16 rounding and no change to expert selection; less network traffic.
+            world, width = arena.tp_world, DIM // arena.tp_world
+            reduced = torch.empty((P, width), dtype=torch.float32, device=dev)
+            torch.distributed.reduce_scatter_tensor(reduced, parts.view(world * P, width))
+            local = torch.empty((T, width), dtype=out_dtype, device=dev)
+            _tp_round_reduce[(triton.cdiv(T * width, 1024),)](reduced, local, T * width, K, 1024)
+            gathered = torch.empty((world * T, width), dtype=out_dtype, device=dev)
+            torch.distributed.all_gather_into_tensor(gathered, local)
+            result = gathered.view(world, T, width).transpose(0, 1).reshape(T, DIM)
+        else:
+            torch.distributed.all_reduce(parts)
+            result = torch.empty((T, DIM), dtype=out_dtype, device=dev)
+            _tp_round_reduce[(triton.cdiv(T * DIM, 1024),)](parts, result, T * DIM, K, 1024)
+    else:
+        result = parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
     if stage_mark is not None:
         stage_mark('reduce')
     return result

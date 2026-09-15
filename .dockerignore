@@ -34,6 +34,13 @@ __pycache__/
 results/*/trace/
 results/*/state/
 results/oneshots/
+# Local prompts, KV caches and mutable demand histories are never image content.
+results/**
+!results/trace-union/stats/coverage.json
+!results/trace-full-20260910/stats/coverage.json
+results/prefix-cache*/
+results/captured_request*.pt
+.triton-cache/
 
 # docs travel with the repo, not with the runtime
 docs/

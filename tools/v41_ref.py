@@ -323,9 +323,11 @@ def tp_dense() -> tuple[int, int]:
 
 def _tp_shard(w, dim: int):
     rank, world = tp_dense()
-    if world <= 1 or not hasattr(w, "shard"):
+    if world <= 1:
         return w
-    return w.shard(dim, rank, world)
+    from engine.tensor_parallel import shard, RowParallelWeight
+    local = shard(w, dim, rank, world)
+    return RowParallelWeight(local) if dim == 1 else local
 
 
 # ----------------------------------------------------------------------------- weights
@@ -516,6 +518,8 @@ def head_logits(x: torch.Tensor, head) -> torch.Tensor:
 
     A quantized head (DSV41_HEAD_FMT) runs its own Triton kernel at decode-sized M and the blocked
     dequant + cuBLAS above it; DSV41_HEAD_PREFILL=kernel runs the kernel at every M instead."""
+    if hasattr(head, 'tp_logits'):
+        return head.tp_logits(x)
     quant = ((FP8Weight is not None and isinstance(head, FP8Weight))
              or (FP4Weight is not None and isinstance(head, FP4Weight)))
     if quant:
@@ -541,6 +545,8 @@ def mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     unnecessary for speculative correctness and substantially slower. Set MM_TILE from
     engine/model.py; 0 keeps plain behaviour for tools/expert_trace.py and the stored trace.
     """
+    if hasattr(w, 'tp_linear'):
+        return w.tp_linear(x)
     if (FP8Weight is not None and isinstance(w, FP8Weight)) or (FP4Weight is not None and isinstance(w, FP4Weight)):
         return dense(x, w)  # quantized-weight kernel; row-invariant by construction, not row-tiled
     B = MM_TILE

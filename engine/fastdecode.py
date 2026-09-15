@@ -227,7 +227,7 @@ class FastDecoder:
         T = x.size(0)
         fq = freqs[pos]
         qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
-        q = self._rope(R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim), fq)
+        q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
         kv = self._rope(R.rmsnorm(R.qlinear(x, w.wkv), w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
@@ -258,7 +258,7 @@ class FastDecoder:
             p = torch.exp(scores - mx)
             denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
             o = torch.einsum("thn,tnd->thd", p / denom, kv_all.float()).to(torch.bfloat16)
-        o = self._rope(o, fq, inverse=True).reshape(T, a.o_groups, -1)
+        o = self._rope(o, fq, inverse=True).reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
 
@@ -415,13 +415,12 @@ class FastDecoder:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit,
                                 out_dtype=torch.float32, slots_repeat=True,
                                 null_slot=store.null_slot)
-            store.ep.combine(out)
+            if not getattr(store.ep, 'tensor_parallel', False):
+                store.ep.combine(out)
         else:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
         # shared expert is replicated and added AFTER the combine, so it is counted once
         _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-        if M.TP_DENSE_WORLD > 1:      # partial: this rank holds half the intermediate dim
-            torch.distributed.all_reduce(_sh, op=torch.distributed.ReduceOp.SUM)
         out += _sh
         h = (_hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb) if _HC_OPS
              else R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb))

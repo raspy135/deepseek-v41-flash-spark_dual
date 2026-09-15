@@ -74,6 +74,9 @@ class EPDistributed:
         self.rank = int(os.environ.get("RANK", 0)) if rank is None else int(rank)
         self.world = int(os.environ.get("WORLD_SIZE", 1)) if world_size is None else int(world_size)
         self.active = self.world > 1
+        self.tensor_parallel = os.environ.get('DSV41_TP_EXPERTS', '0') == '1'
+        if self.tensor_parallel and self.world != 2:
+            raise ValueError('DSV41_TP_EXPERTS requires two ranks')
         if self.active and not _HAVE_DIST:
             raise RuntimeError("WORLD_SIZE > 1 but torch.distributed is unavailable in this torch build")
         if self.active:
@@ -111,13 +114,17 @@ class EPDistributed:
 
     # ------------------------------------------------------------- ownership
     def owns(self, layer: int, expert: int) -> bool:
-        return expert % self.world == self.rank
+        return self.tensor_parallel or expert % self.world == self.rank
 
     def owned_mask(self, expert_ids):
         """numpy or tensor of expert ids -> bool mask of the ones THIS rank computes."""
         if isinstance(expert_ids, torch.Tensor):
+            if self.tensor_parallel:
+                return torch.ones_like(expert_ids, dtype=torch.bool)
             return expert_ids.remainder(self.world) == self.rank
         import numpy as np
+        if self.tensor_parallel:
+            return np.ones_like(np.asarray(expert_ids), dtype=bool)
         return (np.asarray(expert_ids) % self.world) == self.rank
 
     # ------------------------------------------------------------- combine
@@ -170,6 +177,14 @@ class EPDistributed:
         obj = [payload if self.rank == 0 else None]
         dist.broadcast_object_list(obj, src=0)
         return obj[0]
+
+    def gather_objects(self, payload):
+        """All-rank agreement for optional local resources (e.g. persistent prefix files)."""
+        if not self.active:
+            return [payload]
+        gathered = [None] * self.world
+        dist.all_gather_object(gathered, payload)
+        return gathered
 
     # ------------------------------------------------------- request control
     def broadcast_request(self, payload):

@@ -39,7 +39,8 @@ results/*/state/
 *.swp
 *.swo
 *~
-results/captured_request.pt
+results/captured_request*.pt
+results/prefix-cache*/
 
 # The adaptive-expert demand database. The engine rewrites it after every request, so tracking it
 # makes the tree permanently dirty and every commit carries a 244 KB binary diff. A fresh clone
