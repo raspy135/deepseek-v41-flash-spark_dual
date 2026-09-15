@@ -24,6 +24,9 @@ def main():
     ap.add_argument('--base', default='http://127.0.0.1:8000')
     ap.add_argument('--runs', type=int, default=2)
     ap.add_argument('--max-tokens', type=int, default=256)
+    ap.add_argument('--prepend-space', action='store_true',
+                    help='prepend encoded space to the captured IDs without changing the capture')
+    ap.add_argument('--tokenizer', help='local tokenizer.json, required with --prepend-space')
     ap.add_argument('--allow-prefix-cache', action='store_true',
                     help='decode-only follow-up; do not interpret cached prefill as throughput')
     ap.add_argument('--label', required=True)
@@ -32,6 +35,14 @@ def main():
     if cap.get('vl') is not None or cap.get('kwargs', {}).get('grammar') is not None:
         raise ValueError('raw-token replay does not reproduce vision or constrained grammar')
     ids = cap['prompt_ids']
+    if args.prepend_space:
+        if not args.tokenizer:
+            ap.error('--prepend-space requires --tokenizer')
+        from tokenizers import Tokenizer
+        prefix = Tokenizer.from_file(args.tokenizer).encode(' ', add_special_tokens=False).ids
+        if not prefix:
+            raise ValueError('tokenizer did not encode the leading space')
+        ids = prefix + list(ids)
     payload = dict(cap['sampling'])
     payload.update(model='deepseek', prompt=ids, stream=False,
                    max_tokens=args.max_tokens)

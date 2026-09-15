@@ -678,6 +678,7 @@ class V41Engine:
         self._prune_trace = None
         self._token_types = self._images = None   # set per request by the VL path
         self._swap_baseline = 0.0   # recorded demand at the last applied adaptation
+        self._requests_since_plan = 0   # request-unit swap trigger; see maintain_demand()
         # Bumped by every applied adaptation. Both ranks apply the same plan at the same point,
         # so this counts identically on the pair and names the routing regime a piece of cached
         # state was computed under. Reported on /health; see _save_prefix for why a cached prefix
@@ -1211,6 +1212,10 @@ class V41Engine:
             # Before prune_miss_report so the save below and the per-request delta both see it.
             self.model.flush_request_demand(
                 float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7")))
+            # One request has now landed since the last applied plan.  maintain_demand() counts
+            # this in request mode: the demand DB's total mass is flat once converged, so a mass
+            # delta cannot distinguish "a request happened" from "nothing changed".
+            self._requests_since_plan += 1
             pmr = self.model.prune_miss_report() if hasattr(self.model, "prune_miss_report") else None
             if pmr is not None:
                 summary, counts, mass = pmr
@@ -1392,6 +1397,7 @@ class V41Engine:
         if torch.cuda.is_available():
             torch.cuda.synchronize()   # the loads ran on a copy stream; land them before serving
         self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
+        self._requests_since_plan = 0   # a plan was applied; wait for the next request
         self.expert_generation += 1
         log(f"adapted {len(swaps)} expert slots to observed demand "
             f"(expert generation {self.expert_generation})")
@@ -1413,10 +1419,16 @@ class V41Engine:
         total = float(rep[1].sum())
         grown = total - self._swap_baseline
         if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request":
-            # Request-unit mode already aged the database at request end, and `grown` is in
-            # requests -- the slot-tuned MIN_GROWTH (5e5) would never fire. Re-plan once any
-            # request has landed since the last plan.
-            return grown >= float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH_REQ", "1"))
+            # Trigger on REQUESTS SINCE THE LAST APPLIED PLAN, not on `grown`.  The demand DB is
+            # an EWMA (Model.flush_request_demand: db*0.5**(1/H) + one normalized vote), so its
+            # total mass is constant once converged and `grown = total - _swap_baseline` sits at
+            # ~0 -- or goes NEGATIVE after a half-life change, because the persisted DB was built
+            # at the old H.  A mass delta therefore stopped opening this gate for good, and the
+            # miss gate in maintain_inline was never reached (a 14,649-token request at 12.1%
+            # routed-miss produced no swap).  The slot-tuned MIN_GROWTH (5e5) is equally useless
+            # here, so this reuses SWAP_MIN_GROWTH_REQ as "requests needed", defaulting to one.
+            return self._requests_since_plan >= max(
+                1, int(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH_REQ", "1")))
         half = float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7"))
         if half > 0 and grown > 0:
             # decay proportional to the evidence that arrived since the last tick, so the rate is
@@ -1455,7 +1467,23 @@ class V41Engine:
         # unconditional, keyed on PREFILL_SWAP, which the boot-time config guard pins identical.
         # maintain_demand() runs everywhere for the same reason: it ages the history, and aging
         # it on one rank only drifts the two copies apart.
-        due = self.maintain_demand() and new_tokens >= PREFILL_SWAP_MIN
+        # Request-unit mode: fold THIS prompt's demand before planning.  _record_prune_miss writes
+        # the per-request accumulator; only flush_request_demand moves it into the database that
+        # plan_swaps reads.  Without this the boundary plan sees only older requests and cannot act
+        # on the prompt it is adapting for, which is what this method's docstring promises.  Decode
+        # then records into a fresh accumulator and the end-of-request fold adds that vote
+        # separately.
+        #
+        # The trigger is the prompt's own evidence (tokens + its own miss rate, gated below), not
+        # maintain_demand(): the end-of-response tick applies a plan after every request and resets
+        # _requests_since_plan, so a counter test would starve this path on every request but the
+        # first.
+        request_mode = os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request"
+        if request_mode:
+            self.model.flush_request_demand(
+                float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7")))
+        due = ((new_tokens >= PREFILL_SWAP_MIN) if request_mode else
+               (self.maintain_demand() and new_tokens >= PREFILL_SWAP_MIN))
         if due and PREFILL_SWAP_MIN_MISS > 0:
             # This prefill's OWN miss rate, not the lifetime one: the accumulators are cumulative
             # by design, so a lifetime rate stops moving after a few hundred requests and would

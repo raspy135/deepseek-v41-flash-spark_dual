@@ -17,9 +17,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', required=True)
     ap.add_argument('--require-loaded', action='store_true')
+    ap.add_argument('--depths', type=int, nargs='+', default=[8, 10],
+                    help='depths to test; repeat a depth for exact-prompt replays')
     args = ap.parse_args()
     rows = []
-    for depth in (8, 10):
+    for depth in args.depths:
         request('/v1/completions', dict(model='deepseek', prompt='Reply with OK.', max_tokens=1, temperature=0))
         reference = '\n'.join(f'def reference_{i}(value): return (value + {i}) % 97 # reference only'
                               for i in range(300))
