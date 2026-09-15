@@ -150,3 +150,29 @@ disk load 0.093 s and total restored prefill/replay 0.301 s (TTFT 0.374 s). Stag
 includes waiting for queued GPU work and is not an isolated measurement of added cost.
 The known depth-8 baseline failure remained explicitly reported. This is a bounded
 integration pass, not a claim that broader quality regressions have been resolved.
+
+## Deployed pair and API acceptance
+
+Runtime image `sha256:338bcaee58ea0a4f157eae2d804b22255a85b629f3e1ecbe80fbf03561cbc803`
+was built once from `c2a651c` and verified on both nodes. The local serving configuration
+enables all four TP flags, expert reduction `auto`, speculation, adaptation at prefill/end
+boundaries, eight RAM snapshots and 20 GB/node disk caches (historical-mask semantics).
+Arena is 90 GB and keep is 0.61: 9,400 retained experts, 160 more than the 0.60 comparison.
+This spends 2 GB of the measured ~3.7 GB dense-weight savings. The performance table
+above remains the like-for-like **88 GB / 0.60** comparison, not a measurement of this
+slightly larger deployed expert set. Capture, replicas and EP overlap remain off.
+
+Live API validation with automatic adaptation enabled passed the depth-10 nesting task,
+an unrelated prompt, and returning to the saved task (6,082 tokens restored from disk;
+identical output hash). Both nodes performed real adaptive swaps. After restarting
+the serving pair with the same image/config, the first request restored all 6,082 tokens
+from disk in 0.149 s and reproduced the pre-restart answer. Cold graph/replay setup
+made total prefill 2.71 s on that first post-restart request; do not confuse the disk
+load measurement with TTFT. Changing the innermost value in the task then reused the
+4,096-token disk boundary (0.082 s load) and returned the correct changed answer.
+
+Fourteen focused CPU tests passed inside the final runtime image. Host system Python
+does not have Torch installed; run these tests in the image rather than interpreting
+that host import failure as a test failure. Services were left healthy and idle after
+validation. Container names and some distributed logs retain their historical `ep2`
+label; `/health` exposes `tp_experts`, `tp_dense`, `tp_attention`, and `tp_head`.
