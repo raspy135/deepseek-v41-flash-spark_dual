@@ -24,13 +24,13 @@ Clone this repository to the same absolute path on both nodes. The head must be
 able to SSH to the worker without a password prompt.
 
 ```bash
-cp env.example .env
+cp .env.example .env
 ```
 
 Set `MODEL_DIR`, `PEER` (`user@worker-ip`), `MASTER_ADDR` (the head's link IP), and
-`NCCL_SOCKET_IFNAME` (the link interface). Then apply the TP profile below.
-`env.example` still includes an older EP profile; the last assignment to a variable
-wins, so replace its settings or put your overrides at the end of `.env`.
+`NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` (the link interface). The template uses
+the experimental 512K allocation; use the TP profile below for the 256K configuration
+used in the recent quality checks. Keep credentials in `.env`, not the template.
 
 ```bash
 # Run on each node; downloads the full checkpoint to local storage.
