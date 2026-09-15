@@ -59,8 +59,19 @@ MODEL_DIR=/home/ryan/models/DeepSeek-V4.1-Flash DSV41_FP4_DOT_SCALED=0 \
   .venv/bin/python tools/test_fp4_replicas.py
 ```
 
-That GPU test is added but has **not yet been run**. Full-model quality, real I/O time, and net
-prefill benefit still require validation. Short nesting prompts alone do not exercise replicas:
+The GPU test was run and **failed the strict numerical gate at T=2048**. With real layer-0
+weights, relocation preserved final BF16 output at T=1/6/63/512 (FP32 maximum differences
+0 / 0 / 5.96e-8 / 2.38e-7), but a 2.38e-7 FP32 difference crossed a BF16 rounding boundary
+at T=2048. Restoring original routing remained bit-exact in every case. This demonstrates
+regrouping sensitivity, not a measured full-model quality failure. Serving activation and speed
+benchmarking were withheld; replicas remain disabled pending a numerical solution/quality gate.
+
+The initial GPU harness incorrectly placed real replica slots above the null sentinel, producing
+a large false failure in small-batch routing. The harness now matches production: null is last,
+above every real and replica slot. Do not attribute that initial failure to production routing.
+
+Full-model quality, real I/O time, and net prefill benefit still require validation.
+Short nesting prompts alone do not exercise replicas:
 use a passing long-context control with at least two prefill chunks, and inspect `loaded` to
 ensure the path actually activated. Keep the feature off until those checks pass. Do not apply
 it to decode or split weights into TP shards as part of this experiment.

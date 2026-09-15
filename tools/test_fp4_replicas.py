@@ -15,8 +15,10 @@ from fp4_moe import DIM, moe_forward
 
 def main():
     arena = load_arena(38, 'cuda')
-    null = 31
-    replica_slots = [[32, 33, 34], [35, 36, 37]]
+    # Match production: all real and replica slots are below the null sentinel.
+    # Small-batch routing reserves IDs above that sentinel for zero-only pairs.
+    null = 37
+    replica_slots = [[30, 31, 32], [33, 34, 35]]
     moves = [dict(layer=0, expert=0, dst=1, slot=0),
              dict(layer=0, expert=2, dst=1, slot=1),
              dict(layer=0, expert=1, dst=0, slot=0)]
