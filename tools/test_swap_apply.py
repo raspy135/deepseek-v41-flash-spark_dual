@@ -17,7 +17,7 @@ def make(rank, resident, fail_on=None):
     for e in resident: mask[0][e] = True
     eng = types.SimpleNamespace(
         store=st, ep=types.SimpleNamespace(world=WORLD, rank=rank),
-        model_prune_mask=mask, fast=None, _swap_baseline=0.0,
+        model_prune_mask=mask, fast=None, _swap_baseline=0.0, expert_generation=0,
         model=types.SimpleNamespace(prune_miss_report=lambda: ({}, torch.zeros(1), None)))
     return eng, st, mask
 

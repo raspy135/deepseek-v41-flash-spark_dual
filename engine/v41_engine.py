@@ -828,6 +828,7 @@ class V41Engine:
                 "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
                 "prefill_chunk": MAX_CHUNK,
                 "prefill_timing": PREFILL_TIMING,
+                "prefill_swap_routes_version": 1,
                 "prefill_replica_slots": self.replica_slots,
                 "prefill_replica_budget_ms": self.replica_budget_ms,
                 # The prefill indexer's score reduction. The tiled path is meant to select the
@@ -1362,6 +1363,15 @@ class V41Engine:
                 if self.fast is not None and getattr(self.fast, "lut", None) is not None:
                     self.fast.lut[L, e_in] = slot
                     self.fast.lut[L, e_out] = null
+                route = getattr(self.model, "prefill_routes", {}).get(L)
+                if route is not None:
+                    ids, slots = route
+                    # Fixed prefill routing bypasses the decode LUT. Transfer the
+                    # evicted expert's compact ID with its arena slot, otherwise
+                    # promoted experts silently contribute zero after adaptation.
+                    # Shapes/addresses stay fixed; no new kernel specialization.
+                    ids[e_in] = ids[e_out]
+                    ids[e_out] = slots.numel() - 1  # final entry is the null slot
             # unconditional: identical on both ranks, whoever owns the slot
             self.model_prune_mask[L][e_out] = False
             self.model_prune_mask[L][e_in] = True
