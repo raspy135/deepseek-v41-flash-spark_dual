@@ -713,7 +713,14 @@ class FastDecoder:
         graph_key = (parity, index_bucket)
         self.prepare_pending_buffers()
         if not LEAN_STEP or graph_key not in self.graphs:
+            pending = ({L: None if value is None else (value[0].clone(), value[1].clone())
+                        for L, value in self.c.pending.items()}
+                       if self.use_graphs and graph_key not in self.graphs else None)
             self.capture(parity, index_bucket)
+            if pending is not None:
+                # A rollback boundary may alias kvl_buf/sc_buf, which capture's
+                # warm-up overwrites. Keep committed history across a cold graph.
+                self.c.pending.update(pending)
             self.prepare_pending_buffers()  # capture's warm-up/capture runs overwrite the buffers
         t0 = time.perf_counter()
         futs = rows_fn() if rows_fn is not None else None  # {layer: Future} -- reads already in flight
@@ -789,8 +796,8 @@ class FastDecoder:
             self.d_noise.copy_(-torch.log(-torch.log(u)))
         t0 = time.perf_counter()
         _ev_draft = self._ev_begin("draft")
-        if self.use_graphs and self.graphs:
-            self.graphs[next(iter(self.graphs))][3][0 if greedy else 1].replay()
+        if self.use_graphs and self.draft_graphs is not None:
+            self.draft_graphs[0 if greedy else 1].replay()
         else:
             self._draft(greedy)
         if _ev_draft is not None:

@@ -63,6 +63,12 @@ cleanup() {
 }
 trap cleanup EXIT
 rc=0
+# A rank-local assertion must not leave the other rank waiting in a collective
+# for the full 900-second gate timeout before cleanup can run.
+if ! wait -n "$head_pid" "$peer_pid"; then
+    cleanup
+    rc=1
+fi
 wait "$head_pid" || rc=1
 wait "$peer_pid" || rc=1
 exit "$rc"

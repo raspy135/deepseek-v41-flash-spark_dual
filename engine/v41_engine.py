@@ -835,6 +835,7 @@ class V41Engine:
                 "prune_keep": float(prune_keep or 0.0),
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
                 "spec": bool(self.spec),
+                "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
                 # Dense/attention re-quantization and the LM head's stored format. Both are read
@@ -1910,7 +1911,11 @@ class V41Engine:
                             for li, L in enumerate(self.args.engram_layer_ids)}
                     if ph is not None:
                         ph.mark("submit")
-                    logits, mh = self.fast.step(block, pos, lambda: futs)
+                    if getattr(self, "_cooperative_decode", False):
+                        from engine.decode_events import VerifyStep
+                        logits, mh = yield VerifyStep(block, pos, lambda: futs)
+                    else:
+                        logits, mh = self.fast.step(block, pos, lambda: futs)
                     if ph is not None:
                         ph.mark("step")
                 else:
@@ -1938,7 +1943,10 @@ class V41Engine:
                     # every a, including a = 5 -- exactly what the loop below computes. One 7-wide
                     # D2H is the only host sync of the whole step.
                     am = logits.argmax(-1)                                   # [6]
-                    acc = am[:self._tv - 1].eq(drafts).to(torch.int32).cumprod(0)  # 1 while still accepting
+                    # Verify the block actually passed through the backbone.
+                    # A cold graph capture warms the drafter and overwrites its
+                    # static d_out buffer, which `drafts` aliases on this path.
+                    acc = am[:self._tv - 1].eq(block[1:]).to(torch.int32).cumprod(0)
                     self._vout[0] = acc.sum()
                     self._vout[1:].copy_(am)
                     self._vhost.copy_(self._vout)
@@ -2096,6 +2104,7 @@ class V41Engine:
             "ep_world_size": self.ep.world,
             "ep_rank": self.ep.rank,
             "tp_experts": self.ep.tensor_parallel,
+            "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
             "arena_gb": self.arena_gb,
             "arena_slots": self.slots,
             "lru_slots": self.store.lru_slots,

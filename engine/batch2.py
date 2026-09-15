@@ -1,20 +1,21 @@
-"""Lossless two-sequence decode core.
+"""Two-sequence decode core.
 
 This is deliberately below the HTTP scheduler.  Each lane owns an ordinary
 ``FastDecoder`` (and therefore its own KV, compressed-index, Engram and rollback
 state), while the expensive FFN half of every backbone layer is issued once for
-the concatenated 2 x T_VERIFY token rows.  One combined EP all-reduce preserves
-collective ordering across the two Sparks.
+the concatenated 2 x T_VERIFY token rows. Collective ordering is identical on
+both ranks; TP reconstructs expert outputs inside the MoE implementation.
 
-The class is opt-in scaffolding until its full-model equivalence gate passes; the
-single-request serving path does not import or instantiate it.
+The single-request serving path does not import or instantiate this class.
 """
 
 from __future__ import annotations
 
 import torch
+import copy
+import time
 
-from engine.fastdecode import FastDecoder, T_VERIFY, R
+from engine.fastdecode import FastDecoder, T_VERIFY, INDEX_BUCKETS, R
 from engine.model import Caches, HC_OPS as _HC_OPS, Model, _hc_post_fused
 
 
@@ -58,15 +59,18 @@ class Batch2FastDecoder:
                 out_dtype=torch.float32, slots_repeat=True, null_slot=self.store.null_slot,
                 routing_ids=routing_ids, routing_slot_map=slot_map,
             )
-            self.store.ep.combine(out)
-            out = out.to(torch.bfloat16).float()
+            # TP already reconstructs the output inside moe_fn. A second
+            # reduction doubles it. Keep FP32 until after the shared expert,
+            # exactly as FastDecoder._layer_b does.
+            if not getattr(self.store.ep, 'tensor_parallel', False):
+                self.store.ep.combine(out)
         else:
             out = a0.m.moe_fn(
                 y, slots, route_w, self.store.arena, cfg.swiglu_limit,
                 routing_ids=routing_ids, routing_slot_map=slot_map,
             ).float()
 
-        # The shared expert is identical on both ranks and is evaluated once over the 12 rows.
+        # Shared-expert TP collectives are issued once over the combined token rows.
         out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, cfg.swiglu_limit).float()
         for lane, part in zip(self.lanes, out.split(T_VERIFY, dim=0)):
             h = (_hc_post_fused(part.to(torch.bfloat16), lane.h,
@@ -92,6 +96,20 @@ class Batch2FastDecoder:
     def capture(self, key: tuple[int, int, int, int]) -> None:
         if key in self.graphs or not self.use_graphs:
             return
+        # A pair has the Cartesian product of two context buckets/parities.
+        # Bound graph metadata instead of retaining every historical combination.
+        if len(self.graphs) >= 8:
+            torch.cuda.synchronize()
+            self.graphs.pop(next(iter(self.graphs)))
+        counters = {}
+        for lane in self.lanes:
+            values = [getattr(lane.m, name, None) for name in
+                      ('_want_counts', '_want_mass', '_req_counts', '_miss_tot', '_miss_phase')]
+            values.extend(lane.m._want_phase or [])
+            values.extend((lane.rs_hits, lane.rs_uniq))
+            for value in values:
+                if value is not None and id(value) not in counters:
+                    counters[id(value)] = (value, value.clone())
         p0, b0, p1, b1 = key
         states = (
             {"parity": p0, "index_bucket": b0, "ckv": None, "ik": None, "ratio": 0},
@@ -107,6 +125,10 @@ class Batch2FastDecoder:
         with torch.cuda.stream(stream):
             saved = [(lane.h.clone(), lane.pre_mix.clone()) for lane in self.lanes]
             self._segment(0, self.a.n_layers, states)
+            for lane in self.lanes:
+                if lane.draft_graphs is None:
+                    lane._draft(True)
+                    lane._draft(False)
             for lane, (h, pre) in zip(self.lanes, saved):
                 lane.h.copy_(h)
                 lane.pre_mix.copy_(pre)
@@ -126,7 +148,15 @@ class Batch2FastDecoder:
                 self._segment(lo, hi, states)
             segments.append((lo, graph))
         self.graphs[key] = segments
+        for lane in self.lanes:
+            if lane.pool is None:
+                lane.pool = torch.cuda.graph_pool_handle()
+            lane._capture_draft_graphs()
         torch.cuda.synchronize()
+        # Graph warm-up is not user demand. In particular, do not age/adapt the
+        # shared expert set toward extra copies of whichever request captured first.
+        for value, saved_value in counters.values():
+            value.copy_(saved_value)
 
     @staticmethod
     def _load_rows(lane: FastDecoder, rows) -> None:
@@ -154,18 +184,31 @@ class Batch2FastDecoder:
             lane.prepare_pending_buffers()
             lane.h.copy_(lane.W.embed[lane.ids].unsqueeze(1).expand(-1, self.a.hc_mult, -1))
             lane.pre_mix.copy_(lane._premix0)
-            buckets.append(MIN_BUCKET(pos + T_VERIFY, lane.c.max_seq))
+            buckets.append(MIN_BUCKET(pos + T_VERIFY, lane.c.max_seq) if INDEX_BUCKETS else lane.c.max_seq)
 
         key = (positions[0] % 2, buckets[0], positions[1] % 2, buckets[1])
         if key not in self.graphs and self.use_graphs:
+            # rollback() may leave pending as a view into kvl_buf/sc_buf. Capture
+            # executes those buffers, so preserve the committed boundary before
+            # warming a new pair of parity/bucket variants.
+            saved_pending = [{layer: None if value is None else
+                              (value[0].clone(), value[1].clone())
+                              for layer, value in lane.c.pending.items()}
+                             for lane in self.lanes]
             self.capture(key)
-            for lane in self.lanes:
+            for lane, pending in zip(self.lanes, saved_pending):
+                lane.c.pending.update(pending)
                 lane.prepare_pending_buffers()
+                lane.h.copy_(lane.W.embed[lane.ids].unsqueeze(1).expand(-1, self.a.hc_mult, -1))
+                lane.pre_mix.copy_(lane._premix0)
 
         # Initial prototype resolves both row sets before replay.  Boundary-overlapped futures are
         # a scheduler optimization; keeping them out of the equivalence gate makes failures local.
+        started = time.perf_counter()
         for lane, rows in zip(self.lanes, engram_rows):
+            read_started = time.perf_counter()
             self._load_rows(lane, rows)
+            lane.stats['engram_s'] += time.perf_counter() - read_started
         if self.use_graphs:
             for _lo, graph in self.graphs[key]:
                 graph.replay()
@@ -188,6 +231,10 @@ class Batch2FastDecoder:
                                          (lane.kvl_buf[layer][T_VERIFY - 1].clone(),
                                           lane.sc_buf[layer][T_VERIFY - 1].clone()))
             lane.c.len = pos + T_VERIFY
+            lane.stats['steps'] += 1
+            lane.stats['graph_s'] += time.perf_counter() - started
+            if lane.rs_uniq is not None:
+                lane.rs_steps += 1
         return tuple((lane.logits, lane.main_hidden) for lane in self.lanes)
 
 
@@ -197,7 +244,7 @@ def MIN_BUCKET(used_tokens: int, max_seq: int) -> int:
     return _index_bucket(used_tokens, max_seq)
 
 
-def clone_lane(engine, source: FastDecoder | None = None) -> FastDecoder:
+def clone_lane(engine, source: FastDecoder | None = None, *, copy_cache=True) -> FastDecoder:
     """Create an independent mutable lane over an engine's shared immutable weights/arena.
 
     This is intentionally explicit and relatively expensive (~one additional KV cache).  The
@@ -210,11 +257,18 @@ def clone_lane(engine, source: FastDecoder | None = None) -> FastDecoder:
     model.prune_mask = src.m.prune_mask
     model.slot_lut = src.m.slot_lut
     model.prefill_routes = getattr(src.m, "prefill_routes", None)
-    model.hash_state = src.m.hash_state
+    # The hash module caches prior tokens. Sharing it crosses request boundaries
+    # even when KV caches are independent.
+    model.hash_state = copy.deepcopy(src.m.hash_state)
     model.engram_rows = src.m.engram_rows
+    model.engram_prefetch = src.m.engram_prefetch
+    model.vision = src.m.vision
     lane = FastDecoder(model, engine, use_graphs=src.use_graphs)
     lane.lut = src.lut
     lane.lut_version = src.lut_version
+
+    if not copy_cache:
+        return lane
 
     for dst, old in zip(caches.win, src.c.win):
         dst.copy_(old)

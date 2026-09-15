@@ -102,7 +102,8 @@ The main capacity and speed controls:
 | `MAX_SEQ` | Total context allocation, including the answer. More context needs more cache and scratch memory. |
 | `ARENA_GB` / `PRUNE_KEEP` | More resident experts, at the cost of memory. Raise them together only when there is room. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
-| `DSV41_PREFILL_CHUNK=2048` | Prefill chunk size. Larger chunks can reduce dispatch overhead but use more scratch memory. |
+| `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
+| `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
 | `DSV41_PREFILL_FUSED_ATTN=1` | Keep fused prefill attention enabled. |
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
 | `DSV41_VISION=1` | Load image support. Set to `0` for text-only serving. |
@@ -161,13 +162,13 @@ To freeze expert placement for an A/B test, set both swap flags to `0`.
 ## Persistent prefix cache
 
 Matching prompts can resume from a saved prefix instead of processing it again.
-With the default 2K prefill chunks, snapshots retain chunk boundaries as well as
+With the template's 1K prefill chunks, snapshots retain chunk boundaries as well as
 the complete prompt. Disk bundles survive requests and restarts.
 
 | Setting | Value | Purpose |
 | --- | --- | --- |
 | `DSV41_PREFIX_CACHE` | `1` | Enable prefix reuse. |
-| `DSV41_PREFIX_SNAPSHOTS` | `8` | Retain up to eight chunk-boundary snapshots in addition to the prompt boundary. |
+| `DSV41_PREFIX_SNAPSHOTS` | `16` | Retain up to sixteen chunk-boundary snapshots in addition to the prompt boundary. |
 | `DSV41_PREFIX_DISK` | `1` | Save and restore prefixes on disk. |
 | `DSV41_PREFIX_DISK_GB` | `20` | Disk budget per node, with least-recently-used eviction. |
 | `DSV41_PREFIX_DISK_STRICT` | `0` | Reuse historical prefixes even after expert selection changes. Set `1` to require the same selection. |

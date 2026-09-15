@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """OpenAI-compatible HTTP server for the DeepSeek-V4.1-Flash engine.
 
-Standard library only (http.server + json). One request is served at a time
-because the engine is single-sequence; other requests queue on a lock.
+Standard library HTTP server. Requests are serialized by default; the opt-in
+two-lane TP scheduler batches independent speculative verification steps.
 
 Endpoints
     GET  /health
@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -495,6 +496,7 @@ class State:
         self.enc = enc
         self.engine = engine
         self.lock = threading.Lock()
+        self.capture_lock = threading.Lock()
         self.model_name = args.served_model_name
         self.bos_id = tok.token_to_id(enc.bos_token)
         self.eos_id = tok.token_to_id(enc.eos_token)
@@ -523,6 +525,17 @@ class State:
             self.grammars = make_factory(
                 tok, engine.eos_token_id if self.eos_id is None else self.eos_id,
                 enabled=os.environ.get("DSV41_TOOL_GRAMMAR", "0") == "1")  # off until the end-to-end gates on real weights have run; see NOTES 2026-09-11
+        self.scheduler = None
+        concurrency = int(os.environ.get('DSV41_MAX_CONCURRENCY', '1'))
+        if concurrency not in (1, 2):
+            raise ValueError('DSV41_MAX_CONCURRENCY must be 1 or 2')
+        if concurrency == 2:
+            from engine.serving import DecodeRuntime
+            from server.concurrency import Scheduler
+            self.scheduler = Scheduler(self, DecodeRuntime(engine))
+
+    def request_context(self):
+        return nullcontext() if self.scheduler is not None else self.lock
 
     def stop_ids(self) -> Set[int]:
         ids = {self.engine.eos_token_id}
@@ -572,11 +585,12 @@ class State:
                  tools: Optional[List[dict]] = None, vl: Optional[tuple] = None) -> Iterator[Tuple[str, str]]:
         """Drive the engine; yield (kind, text) events; fill ``result`` at the end.
 
-        The caller must hold ``self.lock``.
+        The caller holds ``request_context()``. With concurrency enabled, only
+        the scheduler thread holds the GPU/peer lock.
         """
         # Attach this request's image inputs under the lock, so two requests cannot overwrite
         # each other's; the engine clears them once prefill has consumed them.
-        if vl is not None and hasattr(self.engine, "set_vl_inputs"):
+        if self.scheduler is None and vl is not None and hasattr(self.engine, "set_vl_inputs"):
             self.engine.set_vl_inputs(*vl)
         max_ctx = self.engine.max_context
         # Headroom the engine needs beyond prompt + max_tokens (DSpark verifies a
@@ -615,29 +629,30 @@ class State:
         # share a prefix. It intentionally stores token ids rather than rendered prompt text and
         # disarms itself after DSV41_CAPTURE_NEXT requests, so later user traffic is never
         # accumulated. See _CAPTURE for the filename convention.
-        if _CAPTURE["total"] is None:
-            _raw = os.environ.pop("DSV41_CAPTURE_NEXT", "0") or "0"
-            _CAPTURE["total"] = int(_raw) if _raw.isdigit() else 0
-        if _CAPTURE["done"] < _CAPTURE["total"]:
-            import torch
-            captured = {"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs,
-                        "sampling": dict(sampling), "thinking": thinking}
-            if vl is not None:
-                types, imgs = vl
-                captured["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
-            total, i = _CAPTURE["total"], _CAPTURE["done"]
-            name = "captured_request.pt" if total == 1 else f"captured_request_{i}.pt"
-            path = os.path.join(REPO_ROOT, "results", name)
-            tmp = path + ".tmp"
-            torch.save(captured, tmp)
-            os.replace(tmp, path)
-            _CAPTURE["done"] += 1
-            if _CAPTURE["done"] < total:
-                log.warning("captured model-ready request %d/%d at %s; %d more armed",
-                            _CAPTURE["done"], total, path, total - _CAPTURE["done"])
-            else:
-                log.warning("captured model-ready request %d/%d at %s; capture disarmed",
-                            _CAPTURE["done"], total, path)
+        with self.capture_lock:
+            if _CAPTURE["total"] is None:
+                _raw = os.environ.pop("DSV41_CAPTURE_NEXT", "0") or "0"
+                _CAPTURE["total"] = int(_raw) if _raw.isdigit() else 0
+            if _CAPTURE["done"] < _CAPTURE["total"]:
+                import torch
+                captured = {"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs,
+                            "sampling": dict(sampling), "thinking": thinking}
+                if vl is not None:
+                    types, imgs = vl
+                    captured["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
+                total, i = _CAPTURE["total"], _CAPTURE["done"]
+                name = "captured_request.pt" if total == 1 else f"captured_request_{i}.pt"
+                path = os.path.join(REPO_ROOT, "results", name)
+                tmp = path + ".tmp"
+                torch.save(captured, tmp)
+                os.replace(tmp, path)
+                _CAPTURE["done"] += 1
+                if _CAPTURE["done"] < total:
+                    log.warning("captured model-ready request %d/%d at %s; %d more armed",
+                                _CAPTURE["done"], total, path, total - _CAPTURE["done"])
+                else:
+                    log.warning("captured model-ready request %d/%d at %s; capture disarmed",
+                                _CAPTURE["done"], total, path)
         if self.ep_active:
             # Lockstep contract (engine/dist.py): rank 0 decides, the peer obeys. Three rules:
             #  * seed must be concrete and SHARED -- seed=None would leave each rank drawing its
@@ -674,8 +689,17 @@ class State:
             if vl is not None:
                 types, imgs = vl
                 payload["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
-            self.ep.broadcast_request(payload)
-        if ignore_eos:
+            if self.scheduler is None:
+                self.ep.broadcast_request(payload)
+        if self.scheduler is not None:
+            import queue
+            try:
+                gen = self.scheduler.submit(payload)
+            except queue.Full:
+                raise APIError(503, 'concurrent request queue is full', code='server_busy')
+            except RuntimeError as exc:
+                raise APIError(503, str(exc), code='ep2_desynced')
+        elif ignore_eos:
             try:
                 gen = self.engine.generate(prompt_ids, ignore_eos=True, **{k: v for k, v in gen_kwargs.items() if k != "ignore_eos"})
             except TypeError:  # an engine without the kwarg (MockEngine): empty stop set is enough
@@ -744,7 +768,7 @@ class State:
                 result.finish_reason = "tool_calls"
 
         try:
-            result.stats = dict(self.engine.stats() or {})
+            result.stats = dict(gen.stats if self.scheduler is not None else (self.engine.stats() or {}))
         except Exception as e:  # engine stats must never break a response
             log.warning("engine.stats() failed: %s", e)
             result.stats = {}
@@ -785,7 +809,8 @@ class State:
         # Last step of the response. Both ranks have just finished the same generate, so this is
         # the earliest moment the pair is known synchronised and idle -- no need to wait for a
         # keepalive tick to notice.
-        self.maintain_experts()
+        if self.scheduler is None:
+            self.maintain_experts()
 
     # A completion that calls tools is DSML, and the checkpoint's own parser
     # (corpus/sources/dsv41_encoding.py::parse_message_from_completion_text) is strict about it: a
@@ -1053,7 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
                 obj.update(extra)
             return obj
 
-        with st.lock:
+        with st.request_context():
             if not stream:
                 for _ in st.generate(prompt_ids, sampling, thinking=thinking, detect_tool_calls=True, vl=vl,
                                      result=result, tools=tools):
@@ -1131,7 +1156,7 @@ class Handler(BaseHTTPRequestHandler):
                 o.update(extra)
             return o
 
-        with st.lock:
+        with st.request_context():
             if not stream:
                 for _ in st.generate(prompt_ids, sampling, thinking=False, detect_tool_calls=False, result=result):
                     pass
@@ -1232,6 +1257,10 @@ def run_worker(engine) -> None:
     the launcher's restart story handle it, like everything else in this recipe."""
     import torch.distributed as X  # noqa: F401  (presence was checked by EPDistributed.init)
     ep = engine.ep
+    runtime = None
+    if int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 2:
+        from engine.serving import DecodeRuntime
+        runtime = DecodeRuntime(engine)
     log.info("EP2 rank %d: headless worker, waiting for requests from rank 0", ep.rank)
     n = 0
     try:
@@ -1248,6 +1277,20 @@ def run_worker(engine) -> None:
                 break
             if req is None or req.get("cmd") == "shutdown":
                 break
+            if req.get('cmd') == 'schedule':
+                from engine.decode_events import event_signature
+                try:
+                    if runtime is None:
+                        raise RuntimeError('scheduler command received with concurrency disabled')
+                    event = runtime.execute(req['action'])
+                    tag = event_signature(event)
+                    tags = ep.gather_objects(tag)
+                    if any(t != tag for t in tags):
+                        raise RuntimeError(f'concurrent decode ranks diverged: {tags}')
+                except Exception:
+                    log.exception('concurrent worker failed; pair is desynced, exiting')
+                    os._exit(1)
+                continue
             if req.get("cmd") == "maintain":
                 # Same plan rank 0 is applying, at the same point in the broadcast stream, so the
                 # two arenas and the two routers stay identical. A failure here desyncs the pair
@@ -1370,6 +1413,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     finally:
         hb_stop.set()          # before the shutdown broadcast, or the two race on the same group
         httpd.server_close()
+        if state.scheduler is not None:
+            state.scheduler.stop()
+            state.scheduler.thread.join()
         # EP2: tell rank 1 to go home. run_worker() blocks in broadcast_request between
         # requests, so without this the peer sits there holding its half of the pool until the
         # process-group timeout expires -- and dual-down.sh's memory wait would watch it do it.
