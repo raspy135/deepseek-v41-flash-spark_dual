@@ -37,6 +37,7 @@ def log(*a):
 # any wait for GPU work queued earlier. That is the quantity that explains the gap between
 # engine/profile_fast.py's step+draft and the tok/s the generator actually reaches.
 STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
+PREFILL_TIMING = os.environ.get("DSV41_PREFILL_TIMING", "0") == "1"
 # Adapt the resident experts once more, at the prefill -> decode boundary, instead of only after
 # the response. The demand blend weights observed evidence w = observed/(observed + PRIOR); at
 # PRIOR=2e4 per layer a 30k-token prompt is w=90% against 11% for a 400-token answer, so the
@@ -815,6 +816,8 @@ class V41Engine:
                 # matters as much as the switch: it decides WHETHER the collective happens.
                 "prune_swap_prefill": os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0"),
                 "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
+                "prefill_chunk": MAX_CHUNK,
+                "prefill_timing": PREFILL_TIMING,
                 # The prefill indexer's score reduction. The tiled path is meant to select the
                 # same positions as the monolithic one, but a per-tile topk can break a tie
                 # differently, so a split pair could read different sparse KV with nothing
@@ -1212,6 +1215,13 @@ class V41Engine:
                         "steps_counted": rep["steps"],
                     }
             _ph = M_.phase_report()
+            if _st.get("prefill_timing") is not None:
+                report = _st["prefill_timing"].report()
+                self.last_stats["prefill_chunks"] = report
+                # Both ranks log here; the headless worker does not emit HTTP stats.
+                log("prefill_chunks: " + json.dumps(report))
+                if _ph:
+                    log("prefill_rank_phases: " + json.dumps({"rank": self.ep.rank, "gpu_ms": _ph}))
             if _ph:
                 tot = sum(_ph.values()) or 1.0
                 self.last_stats["attn_phases"] = {
@@ -1548,6 +1558,11 @@ class V41Engine:
         tt = getattr(self, "_token_types", None)
         eg_mask = None if tt is None else ~(tt >= 0)
         spans = self._prefill_spans(P, prefix_start)
+        timing = None
+        if PREFILL_TIMING:
+            from engine.prefill_timing import PrefillTiming
+            timing = PrefillTiming(self.ep.rank)
+            out_st["prefill_timing"] = timing
         hashes_t = None
         if prefix_start and spans and m.hash_state is not None:
             # Hashing the full token sequence preserves n-grams crossing the cached boundary;
@@ -1578,7 +1593,8 @@ class V41Engine:
                 # (layers 0..20, which is everything that writes global KV), and the decoder half is
                 # replayed once over the last `window_size` prompt tokens.
                 for s, e in spans:
-                    _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
+                    with timing.chunk(s, e) if timing is not None else nullcontext():
+                        _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
                 # Save at the prompt boundary, before decoder replay and generation overwrite the
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
                 self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
@@ -1587,11 +1603,12 @@ class V41Engine:
                     m.dspark_seed(mh, s_rep)
             else:
                 for s, e in spans:
-                    chunk = ids[s:e]
-                    last = e >= P
-                    logits, mh = _fwd(s, chunk, need_logits=last)
-                    if self.spec:
-                        m.dspark_seed(mh, s)
+                    with timing.chunk(s, e) if timing is not None else nullcontext():
+                        chunk = ids[s:e]
+                        last = e >= P
+                        logits, mh = _fwd(s, chunk, need_logits=last)
+                        if self.spec:
+                            m.dspark_seed(mh, s)
         # The prompt's demand is now complete and no token has been generated yet: the whole
         # prompt's evidence can be applied before it is used, rather than after the answer is
         # written. Outside the read-ahead context so the swap's NVMe loads do not contend with

@@ -225,7 +225,39 @@ its cached prefill rate is deliberately not reported as prefill throughput.
 Normal-profile nesting after restoration passed 4/4. `tools/test_prefix_invariance.py --tries 1`
 was **inconclusive**: adaptation moved expert generation 8 -> 12 during the comparison. This is
 not a new prefix-parity pass or a demonstrated parity failure. The historical 800–1000 tok/s
-prefill range has not been reproduced on this capture. Do not claim complete speed recovery.
+prefill range had not yet been reproduced at this point. Later warmed runs below reached it,
+but do not establish consistent speed recovery.
+
+Follow-up: the original 14,393-token capture reached 907.64 tok/s after restoring unrestricted
+CPU affinity. A P-core-only trial was not retained: adaptation changed between runs, so the
+668.29 -> 689.48 -> 907.64 sequence does not isolate affinity. A new real 14,396-token capture
+replayed twice at 588.57 and 862.06 tok/s (24.459 and 16.700 s), both with zero prefix reuse and
+2048-token chunks. EP-combine GPU envelopes were 6.993 and 0.516 s; MoE envelopes were 7.352
+and 6.184 s. Adaptation remained enabled (expert generations 3 and 5). These are eight equal
+chunk boundaries in both runs, not evidence that chunk dispatch costs are equal.
+
+`DSV41_PREFILL_TIMING=1` records per-chunk host-call duration, host gaps, GPU stream envelopes
+and GPU gaps on **both** ranks; JSON logs contain positions/timings only, no token IDs or text.
+Events are resolved after generation, never synchronized at chunk boundaries. Host duration
+includes existing blocking operations; GPU envelopes include idle/collective waits, not just
+kernel execution. Do not subtract host and GPU durations as "launch overhead", or subtract
+timestamps across ranks. With `DSV41_ATTN_TIMING=1`, both ranks also log their aggregate phases.
+These diagnostics locate stalls; a CPU/GPU timeline may still be needed to prove dispatch starvation.
+
+Instrumented EP2 replay of the 14,396-token capture (32 output tokens, zero prefix reuse) measured
+667.61 then 762.84 prefill tok/s (21.564 / 18.872 s). Both ranks recorded eight chunks. Host
+gaps between calls were 8–22 microseconds; CUDA-stream gaps were 1–4 microseconds. Thus an
+expensive pause *between* chunks is not supported by these runs. Dispatch stalls *inside* a
+chunk are not ruled out. First-chunk GPU envelopes were ~5.3 then ~3.7 s; most later full chunks
+were 2.2–3.0 s. Rank-0/rank-1 aggregate combine envelopes were 2.316/3.633 s in run one and
+3.014/2.123 s in run two: the greater waiter switched ranks. The first replay also includes
+post-restart warm-up effects; do not treat the difference as an isolated code speedup.
+
+Rejected global schedule change: `tools/tune_fp4_prefill.py --confirm` alternated software-FP4
+down-projection tuples (128,8,3) and (128,4,2) using fixed serving-style routing. FP32 outputs
+were bit-identical. Candidate improved T=512 (~22.1–22.5 vs 23.4–23.8 ms), but not consistently
+T=2048 (~33.3–33.9 vs 32.8–34.2 ms); retain the current default. Wider up tiles (BN=128)
+were substantially slower in the initial sweep. Do not infer whole-engine gains from that sweep.
 
 Capture remains the existing one-shot `DSV41_CAPTURE_NEXT` mechanism in `server/app.py`.
 `bench/replay_capture.py` replays its trusted local token IDs, overrides the old diagnostic
