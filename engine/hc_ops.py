@@ -68,7 +68,7 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
 
 
 @triton.jit
-def _hc_pre_norm_kernel(X, PRE, W, OUT, D, EPS, HC: tl.constexpr, BD: tl.constexpr):
+def _hc_pre_norm_kernel(X, PRE, W, SCRATCH, OUT, D, EPS, HC: tl.constexpr, BD: tl.constexpr):
     """One program per token: weighted sum over the hc streams, then rmsnorm, in one pass."""
     t = tl.program_id(0)
     j = tl.arange(0, HC)
@@ -86,24 +86,31 @@ def _hc_pre_norm_kernel(X, PRE, W, OUT, D, EPS, HC: tl.constexpr, BD: tl.constex
         # calibrated computation and was the main fused-vs-reference discrepancy.
         acc = acc.to(tl.bfloat16).to(tl.float32)
         ssq += tl.sum(tl.where(m, acc * acc, 0.0))
-        tl.store(OUT + t * D + db, acc, mask=m)          # unnormalised, fp32 scratch
+        tl.store(SCRATCH + t * D + db, acc, mask=m)      # unnormalised, fp32 scratch
     rs = 1.0 / tl.sqrt(ssq / D + EPS)
     for d0 in range(0, D, BD):
         db = d0 + tl.arange(0, BD)
         m = db < D
-        y = tl.load(OUT + t * D + db, mask=m, other=0.0) * rs
+        y = tl.load(SCRATCH + t * D + db, mask=m, other=0.0) * rs
         y = y * tl.load(W + db, mask=m, other=0.0).to(tl.float32)
         tl.store(OUT + t * D + db, y, mask=m)
 
 
-def hc_pre_rmsnorm(x: torch.Tensor, pre_mix: torch.Tensor, w: torch.Tensor, eps: float):
+def hc_pre_rmsnorm(x: torch.Tensor, pre_mix: torch.Tensor, w: torch.Tensor, eps: float,
+                   *, direct_store: bool | None = None):
     """hc_pre(x, pre_mix) followed by rmsnorm(., w, eps). x [T, HC, D] -> [T, D] bf16."""
     T, HC, D = x.shape
     scratch = torch.empty(T, D, dtype=torch.float32, device=x.device)
+    # Avoid the final FP32 write/read/cast on prefill-sized calls. The FP32 scratch,
+    # BF16 hc_pre boundary, and reduction order are unchanged. Measured bit-identical
+    # to the old path; small decode batches retain their original allocation/launch path.
+    if direct_store is None:
+        direct_store = T >= 512
+    out = torch.empty(T, D, dtype=torch.bfloat16, device=x.device) if direct_store else scratch
     BD = 1024
     _hc_pre_norm_kernel[(T,)](x.contiguous(), pre_mix.contiguous().float(), w.contiguous().float(),
-                              scratch, D, eps, HC=HC, BD=BD, num_warps=8)
-    return scratch.to(torch.bfloat16)
+                              scratch, out, D, eps, HC=HC, BD=BD, num_warps=8)
+    return out.to(torch.bfloat16)
 
 
 if __name__ == "__main__":

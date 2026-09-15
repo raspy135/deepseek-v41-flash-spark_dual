@@ -263,6 +263,16 @@ probes do not prove long-context chunk-size parity. Adaptive generations changed
 not an isolated causal comparison. Restore chunk=2048, ring=4096 rather than retain a larger
 working set without a demonstrated benefit. The public default remains unchanged.
 
+HC final-output-store cleanup: keep the FP32 normalization scratch and reduction order, but
+store the final result directly to BF16 for T>=512 instead of an FP32 store plus torch cast.
+`python -m engine.test_hc_output_store` compares against the old store/cast path: bit-identical
+at T=1/6/60/64/128/512/2048/2108. Two alternating timing sweeps measured T=2048 at
+0.850/0.844 ms old versus 0.674/0.675 ms direct, T=512 at 0.179/0.192 versus 0.157/0.181 ms.
+Smaller batches retain the old default (T=128 showed no consistent gain). This is only an
+estimated ~0.095 s across 560 full-chunk calls on a 14k-token prompt, not a measured end-to-end
+speedup. It is a minor cleanup, not an explanation or solution for the multi-second regression;
+do not prioritize more restarts/tuning around this sub-millisecond site.
+
 Rejected global schedule change: `tools/tune_fp4_prefill.py --confirm` alternated software-FP4
 down-projection tuples (128,8,3) and (128,4,2) using fixed serving-style routing. FP32 outputs
 were bit-identical. Candidate improved T=512 (~22.1–22.5 vs 23.4–23.8 ms), but not consistently
