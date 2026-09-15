@@ -198,6 +198,49 @@ GPU side: fewer bytes per step, or more accepted tokens per step (`accept_len` i
 
 ## Prefill halved when the fused attention kernel was defaulted off
 
+### Live-profile regression after the nesting investigation (2026-09-14)
+
+The local serving `.env` still had `DSV41_PREFILL_FUSED_ATTN=0`, despite the engine and
+`env.example` defaulting to 1. Restoring it to 1 retains the short (<=128-token) reference-shaped
+prefill branch and the corrected expert rounding; it is not enabling fused **decode** attention.
+
+Replayed an existing local 14,393-token model-ready capture with EP2, native FP4,
+keep=0.59, spec ON, demand logging and adaptation ON. Prompt/completion content was not printed
+or committed. GPU phase timings were enabled. Every full-prefill row reused **zero** prefix tokens:
+
+| configuration | prefill seconds | prefill tok/s | decode tok/s |
+|---|---:|---:|---:|
+| fused prefill OFF | 46.721 | 308.06 | not meaningful: saved request capped output at 2 tokens |
+| fused prefill ON, first replay | 23.380 | 615.61 | 14.92 (239 tokens, acceptance 3.16) |
+| fused prefill ON, subsequent replay after prefix eviction | 24.909 | 577.83 | 17.15 (221 tokens, acceptance 3.17) |
+
+The unfused softmax phase alone cost 14.587 s, versus 1.210 s with fusion. EP-combine event
+time fell from 14.697 to 5.159 s, then varied to 8.238 s; this includes waiting for the peer,
+not just network transfer. Adaptive expert generations changed, and completion lengths differed:
+these are live-profile observations, not an isolated throughput guarantee. The previously cited
+warm 4.5k synthetic-code test with demand logging OFF understated the user's experienced loss.
+An unfused cached-prefix decode-only replay produced 181 tokens at 14.82 tok/s, acceptance 2.97;
+its cached prefill rate is deliberately not reported as prefill throughput.
+
+Normal-profile nesting after restoration passed 4/4. `tools/test_prefix_invariance.py --tries 1`
+was **inconclusive**: adaptation moved expert generation 8 -> 12 during the comparison. This is
+not a new prefix-parity pass or a demonstrated parity failure. The historical 800–1000 tok/s
+prefill range has not been reproduced on this capture. Do not claim complete speed recovery.
+
+Capture remains the existing one-shot `DSV41_CAPTURE_NEXT` mechanism in `server/app.py`.
+`bench/replay_capture.py` replays its trusted local token IDs, overrides the old diagnostic
+output cap, and writes only timings, usage, and content hashes to a mode-0600 result file.
+It rejects vision/grammar captures rather than silently replaying a different workload.
+
+Upstream inspection at `45a0caffc8f080f8fd32d22f4e3d4e9122e25e5f` found that the headline
+24–36 decode tok/s rows used CB3 experts, `DENSE_FP4=attn,wo_a`, an FP8 head, and mostly high-
+acceptance code. Its newer core changes focus on contribution-based expert ranking and routing
+modes, not a replacement fast-decode kernel. Those settings are not a like-for-like native-FP4,
+BF16-dense EP2 comparison. No merge or quantization rollback was performed.
+See [upstream measurements](https://github.com/0xBakeer/deepseek-v41-flash-spark/blob/45a0caffc8f080f8fd32d22f4e3d4e9122e25e5f/RESULTS.md#43-shipped-configuration).
+
+### Earlier investigation
+
 `DSV41_PREFILL_FUSED_ATTN` went from `"1"` to `"0"` in `692d5c1`, three minutes after `8ccf9a3`
 landed the prefix cache. Neither commit has a message. Prefill went 1045–1135 → 544 tok/s on the
 same 4,513-token prompt, and `softmax_attn` went back to dominating attention, which is ~73% of
