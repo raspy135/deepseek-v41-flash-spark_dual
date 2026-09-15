@@ -833,6 +833,8 @@ class V41Engine:
                 "prefill_timing": PREFILL_TIMING,
                 "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
                 "prefill_swap_routes_version": 1,
+                "prefill_ep_overlap": os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0"),
+                "prefill_ep_overlap_join_version": 1,
                 "prefill_replica_slots": self.replica_slots,
                 "prefill_replica_budget_ms": self.replica_budget_ms,
                 # The prefill indexer's score reduction. The tiled path is meant to select the

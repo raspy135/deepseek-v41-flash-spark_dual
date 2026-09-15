@@ -399,11 +399,9 @@ class Model:
         self._positions = torch.arange(caches.max_seq + 8, device=self.dev)
         self._window_offsets = torch.arange(a.window_size - 1, -1, -1, device=self.dev)
         # DSV41_PREFILL_EP_OVERLAP runs the per-layer EP2 all-reduce on this side stream so it
-        # overlaps compute (combine_async / wait_stream below). DEFAULT OFF, and not merely out of
-        # caution: measured 2026-09-13, with it on rank 1 dies with a CUDA device-side assert -- an
-        # out-of-bounds index, surfacing late at prune_miss_report()'s .cpu() because CUDA errors
-        # are asynchronous, so the failing kernel is earlier in this path. It takes the pair down.
-        # Do not flip it back looking for prefill speed without finding that first.
+        # overlaps compute. Default off. The original path waited on this user stream rather
+        # than the Work's internal NCCL stream, racing the routed-output read. finish_combine
+        # now establishes the actual completion dependency; see docs/prefill-ep-overlap.md.
         ep = getattr(store, "ep", None)
         self._ep_comm_stream = (torch.cuda.Stream(device=self.dev)
                                 if (torch.cuda.is_available() and getattr(ep, "active", False)
@@ -1061,7 +1059,7 @@ class Model:
             if ep_overlap:
                 # Queue, rather than host-synchronise, the dependency.  The shared expert already
                 # sits ahead of this wait on the compute stream; conversion/add wait for both.
-                torch.cuda.current_stream(routed.device).wait_stream(self._ep_comm_stream)
+                store.ep.finish_combine(ep_work)
                 _mark("ep_combine")
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
