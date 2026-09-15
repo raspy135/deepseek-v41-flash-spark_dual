@@ -509,7 +509,7 @@ class V41Engine:
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
         def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
-                   null_slot=-1, routing_ids=None, routing_slot_map=None):
+                   null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
             drafter would cost acceptance for nothing.
@@ -525,6 +525,8 @@ class V41Engine:
             extra = {"null_slot": null_slot} if null_slot >= 0 and self.kernel == "triton-fp4" else {}
             if routing_ids is not None and self.kernel == "triton-fp4":
                 extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
+            if stage_mark is not None and self.kernel == "triton-fp4":
+                extra['stage_mark'] = stage_mark
             return fp4_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
                               slots_repeat=slots_repeat, **extra)
 
@@ -828,6 +830,7 @@ class V41Engine:
                 "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
                 "prefill_chunk": MAX_CHUNK,
                 "prefill_timing": PREFILL_TIMING,
+                "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
                 "prefill_swap_routes_version": 1,
                 "prefill_replica_slots": self.replica_slots,
                 "prefill_replica_budget_ms": self.replica_budget_ms,
@@ -951,6 +954,11 @@ class V41Engine:
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
         self.model.reset_request_demand()   # request-unit mode: a fresh accumulator per request
+        self.model.prefill_moe_timing = None
+        if (self.kernel == "triton-fp4" and self.ep.active and
+                os.environ.get("DSV41_PREFILL_MOE_TIMING", "0") == "1"):
+            from engine.prefill_timing import PrefillMoeTiming
+            self.model.prefill_moe_timing = PrefillMoeTiming(self.ep.rank)
         if self.fast is not None:
             self.fast.gpu_timing_reset()
             # DSV41_ROUTE_STATS: per-request counts. Capture's own warm-up runs _layer_a and would
@@ -1239,6 +1247,12 @@ class V41Engine:
                         "steps_counted": rep["steps"],
                     }
             _ph = M_.phase_report()
+            moe_timing = getattr(self.model, "prefill_moe_timing", None)
+            if moe_timing is not None:
+                moe_report = moe_timing.report()
+                self.last_stats["prefill_moe_timing"] = moe_report
+                log("prefill_moe_timing: " + json.dumps(moe_report))
+                self.model.prefill_moe_timing = None
             if self.prefill_replicas is not None:
                 self.last_stats["prefill_replicas"] = dict(self.prefill_replicas.stats)
                 log("prefill_replicas: " + json.dumps({"rank": self.ep.rank, **self.prefill_replicas.stats}))

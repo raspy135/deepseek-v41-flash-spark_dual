@@ -8,6 +8,46 @@ from contextlib import contextmanager
 import time
 
 
+class PrefillMoeTiming:
+    """Per-call subphase envelopes, not kernel-busy or pure CPU execution time.
+
+    No synchronization until report. Neither host minus GPU time nor vice versa
+    is a valid idle-time estimate: the two timelines overlap asynchronously.
+    """
+    def __init__(self, rank, event_factory=None, clock=time.perf_counter):
+        if event_factory is None:
+            import torch
+            event_factory = lambda: torch.cuda.Event(enable_timing=True)
+        self.rank, self.event_factory, self.clock = rank, event_factory, clock
+        self.rows = []
+
+    def start(self, layer, tokens):
+        self.current = {'layer': layer, 'tokens': tokens, 'marks': []}
+        self.rows.append(self.current)
+        self.mark('begin')
+
+    def mark(self, name):
+        event = self.event_factory()
+        event.record()
+        self.current['marks'].append((name, self.clock(), event))
+
+    def report(self):
+        totals, calls = {}, []
+        if self.rows:
+            self.rows[-1]['marks'][-1][2].synchronize()
+        for row in self.rows:
+            stages = {}
+            for (_, h0, g0), (name, h1, g1) in zip(row['marks'], row['marks'][1:]):
+                host, gpu = (h1 - h0) * 1000, g0.elapsed_time(g1)
+                stages[name] = {'host_ms': round(host, 3), 'gpu_envelope_ms': round(gpu, 3)}
+                total = totals.setdefault(name, {'host_ms': 0., 'gpu_envelope_ms': 0.})
+                total['host_ms'] += host
+                total['gpu_envelope_ms'] += gpu
+            calls.append({'layer': row['layer'], 'tokens': row['tokens'], 'stages': stages})
+        return {'rank': self.rank, 'totals': {k: {a: round(b, 3) for a, b in v.items()}
+                for k, v in totals.items()}, 'calls': calls}
+
+
 class PrefillTiming:
     def __init__(self, rank, event_factory=None, clock=time.perf_counter):
         if event_factory is None:

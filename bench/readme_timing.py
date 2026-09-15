@@ -58,7 +58,7 @@ def main():
             if rank:
                 cmd = ['ssh', 'ryan@10.0.0.2', *cmd]
             log = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            keep = ('prefill_chunks:', 'prefill_rank_phases:', 'adapted ', 'routed-miss',
+            keep = ('prefill_chunks:', 'prefill_rank_phases:', 'prefill_moe_timing:', 'adapted ', 'routed-miss',
                     'compilation', 'Compiling')
             lines = [line for line in (log.stdout + log.stderr).splitlines()
                      if any(key in line for key in keep)]

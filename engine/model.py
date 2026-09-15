@@ -933,6 +933,10 @@ class Model:
 
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
+        moe_timer = (getattr(self, "prefill_moe_timing", None)
+                     if prefill and y.size(0) > 16 and n_experts != 128 else None)
+        if moe_timer is not None:
+            moe_timer.start(L, y.size(0))
         self._tap("moe_in", L, y)
         scores = F.softplus(R.mm(y.float(), w.gate_w)).sqrt()
         k = 3 if n_experts == 128 else a.n_activated_experts
@@ -1008,8 +1012,12 @@ class Model:
             if replica_routes is not None:
                 route = replica_routes.get(L)
             route_args = {}
+            if moe_timer is not None:
+                route_args['stage_mark'] = moe_timer.mark
             if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
-                route_args = {"routing_ids": route[0][indices], "routing_slot_map": route[1]}
+                route_args.update(routing_ids=route[0][indices], routing_slot_map=route[1])
+            if moe_timer is not None:
+                moe_timer.mark('router_and_lookup')
             # slots_repeat + null_slot: every non-owned expert of this call shares ONE zero slot.
             # At decode size the router gives those pairs temporary unique keys, then maps them
             # back to the skipped null slot, so real experts retain the tuned BM=16. Without the

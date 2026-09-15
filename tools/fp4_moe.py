@@ -526,6 +526,7 @@ def moe_forward(
     null_slot: int = -1,
     routing_ids: torch.Tensor | None = None,
     routing_slot_map: torch.Tensor | None = None,
+    stage_mark=None,
 ) -> torch.Tensor:
     """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
 
@@ -589,25 +590,36 @@ def moe_forward(
         block_slot, block_pair, NB = build_routing(compact, int(uniq.numel()), BM)
         block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)],
                                  block_slot)
+    if stage_mark is not None:
+        stage_mark('grouping')
     wgt = weights.reshape(-1)
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
         wgt = wgt.float().contiguous()
 
     h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
     parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)  # one row per (token, k) pair
+    if stage_mark is not None:
+        stage_mark('scratch_alloc')
     _moe_up_kernel[(NB, INTER // bn1)](
         x, arena.w1, arena.s1, arena.w3, arena.s3, h,
         wgt, block_slot, block_pair,
         x.stride(0), h.stride(0), float(swiglu_limit),
         TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
     )
+    if stage_mark is not None:
+        stage_mark('up_gemm')
     _moe_down_kernel[(NB, DIM // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
         TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw2, num_stages=ns2,
     )
-    return parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
+    if stage_mark is not None:
+        stage_mark('down_gemm')
+    result = parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
+    if stage_mark is not None:
+        stage_mark('reduce')
+    return result
 
 
 @torch.no_grad()
