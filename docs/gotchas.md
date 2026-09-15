@@ -279,10 +279,13 @@ were bit-identical. Candidate improved T=512 (~22.1–22.5 vs 23.4–23.8 ms), b
 T=2048 (~33.3–33.9 vs 32.8–34.2 ms); retain the current default. Wider up tiles (BN=128)
 were substantially slower in the initial sweep. Do not infer whole-engine gains from that sweep.
 
-Capture remains the existing one-shot `DSV41_CAPTURE_NEXT` mechanism in `server/app.py`.
-`bench/replay_capture.py` replays its trusted local token IDs, overrides the old diagnostic
-output cap, and writes only timings, usage, and content hashes to a mode-0600 result file.
-It rejects vision/grammar captures rather than silently replaying a different workload.
+Capture remains the existing `DSV41_CAPTURE_NEXT` mechanism in `server/app.py`, now taking a
+count: it captures the next N requests and disarms itself (`captured_request.pt` for N=1, else
+`captured_request_0.pt`, `_1.pt`, ...), so two requests that should share a prefix can be diffed
+token-for-token without a second capture mechanism. `bench/replay_capture.py` still replays
+the N=1 filename, overrides the old diagnostic output cap, and writes only timings, usage, and
+content hashes to a mode-0600 result file. It rejects vision/grammar captures rather than
+silently replaying a different workload.
 
 Upstream inspection at `45a0caffc8f080f8fd32d22f4e3d4e9122e25e5f` found that the headline
 24–36 decode tok/s rows used CB3 experts, `DENSE_FP4=attn,wo_a`, an FP8 head, and mostly high-
@@ -596,3 +599,29 @@ bytes, not the dense ones, and "it looks right" is not the quality these near-ti
 
 `dense_fp4` and `head_fmt` are now in the EP2 boot config guard: they are load-time numerics
 choices read from the environment, so a pair split across them would diverge silently.
+
+## A per-request timestamp in the prompt defeats the exact-match prefix cache
+
+Six consecutive requests from a local app on 2026-09-15, captured with the (now count-taking)
+`DSV41_CAPTURE_NEXT`. The two "identical" prompts were token-for-token identical
+(`captured_request_0.pt == captured_request_1.pt`, LCP 14,336), and the server reported
+`prefix=14336/14336 (100%)`, prefill 20.43 s -> 0.35 s. The cache itself works.
+
+The misses were caused by the prompt template embedding `[User current time: 2026-09-15 07:5X]`
+at token index 14,331 -- five tokens from the end of the prompt. The next request on the next
+minute changes that digit, so the prompts share only 14,331 of 14,336 tokens, and
+`_restore_prefix` -- which requires the previous prompt to be an exact prefix of the new one --
+drops all 14,331. Measured `prefix=0/14336` and 16-23 s prefills on the re-sent prompts. The
+continuations within a minute (`_0 -> _1`, `_3 -> _4 -> _5`) still hit, because there the cached
+prompt really is a prefix.
+
+The cheap fix is app-side: a timestamp belongs in the history once, not re-stamped on every
+request, and a growing conversation then extends the cached prompt normally. The engine-side
+one is `DSV41_PREFIX_SNAPSHOTS=N`: keep the N most recent chunk-boundary prefix snapshots and,
+on a full miss, resume at the longest one whose tokens are still a real prefix. With N=8 on the
+pair, the timestamped re-send that used to be `prefix=0/14336` and 20.94 s (684.54 tok/s) came
+back `prefix=12288/14337 (85.7%)` and 4.58 s (3131.84 tok/s): the 14,331-token LCP rounded down
+to the 2,048-token snapshot granularity. It is off by default; each snapshot clones the 128-row
+window and replay tail (~6 MB at window 128 / head_dim 512 / 21 window layers), and it is in the
+EP2 boot config guard because the restored length decides how many prefill collectives a request
+issues. Filled under `DSV41_PREFIX_SNAPSHOTS=8` in the local `.env`.

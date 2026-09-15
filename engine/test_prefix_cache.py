@@ -11,6 +11,7 @@ def _fixture():
     e = object.__new__(V41Engine)
     e.swa_replay = True
     e._prefix_cache = None
+    e._prefix_snapshots = {}
     e.args = SimpleNamespace(window_size=4, candidate_source_layer=1)
     slots = 4096
     c = SimpleNamespace(
@@ -56,3 +57,28 @@ def test_prefix_mismatch_invalidates_snapshot():
     e._save_prefix([1, 2, 3], 3)
     assert e._restore_prefix([1, 9, 3, 4]) == 0
     assert e._prefix_cache is None
+
+
+def test_boundary_snapshot_reuses_shared_prefix():
+    """The motivating case: the full prompt no longer matches, but an earlier chunk boundary does."""
+    e = _fixture()
+    full = [10, 11, 12, 13, 14, 15]
+    e._save_prefix(full, len(full))
+    e._prefix_snapshots[4] = e._snapshot_prefix(full[:4], 4)
+
+    # Same first four tokens, then a changed token -- exactly a re-stamped prompt template.
+    assert e._restore_prefix([10, 11, 12, 13, 99, 98]) == 4
+    assert e.caches.len == 4
+    # The snapshot past the restored boundary is dropped: its compressed KV was just rewritten.
+    assert e._prefix_cache is None
+    assert all(L <= 4 for L in e._prefix_snapshots)
+
+
+def test_boundary_snapshot_does_not_mask_a_shorter_full_prefix():
+    """When the full prompt still matches, it wins -- boundaries are only the fallback."""
+    e = _fixture()
+    full = [10, 11, 12, 13, 14, 15]
+    e._save_prefix(full, len(full))
+    e._prefix_snapshots[4] = e._snapshot_prefix(full[:4], 4)
+    assert e._restore_prefix(full + [16, 17]) == len(full)
+    assert e._prefix_cache is not None

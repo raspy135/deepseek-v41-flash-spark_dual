@@ -262,6 +262,13 @@ def _reject_images(messages: List[dict]) -> None:
 LOG_PROMPT = os.environ.get("DSV41_LOG_PROMPT", "0") == "1"
 LOG_PROMPT_CHARS = int(os.environ.get("DSV41_LOG_PROMPT_CHARS", "2000"))
 
+# Model-ready request capture, for replay and for diffing what two requests actually sent.
+# DSV41_CAPTURE_NEXT=N arms the next N requests and then disarms itself, so later user traffic
+# is never accumulated. N=1 keeps the original filename (results/captured_request.pt) that
+# bench/replay_capture.py expects; N>1 numbers the files (captured_request_0.pt, _1.pt, ...)
+# so prompts that share a prefix can be compared token-for-token.
+_CAPTURE = {"total": None, "done": 0}
+
 
 def _log_prompt(prompt, ids, thinking, effort):
     if not LOG_PROMPT:
@@ -604,21 +611,33 @@ class State:
             gate = self.grammars.for_tools(tools)
         if gate is not None:
             gen_kwargs["grammar"] = gate
-        # One-shot capture of the model-ready load for reproducing shape/data-dependent CUDA
-        # failures.  This intentionally stores token ids rather than rendered prompt text and is
-        # disarmed in-process before writing, so later user traffic is never accumulated.
-        if os.environ.pop("DSV41_CAPTURE_NEXT", "0") == "1":
+        # Capture of the model-ready load for replay and for diffing two requests that should
+        # share a prefix. It intentionally stores token ids rather than rendered prompt text and
+        # disarms itself after DSV41_CAPTURE_NEXT requests, so later user traffic is never
+        # accumulated. See _CAPTURE for the filename convention.
+        if _CAPTURE["total"] is None:
+            _raw = os.environ.pop("DSV41_CAPTURE_NEXT", "0") or "0"
+            _CAPTURE["total"] = int(_raw) if _raw.isdigit() else 0
+        if _CAPTURE["done"] < _CAPTURE["total"]:
             import torch
             captured = {"prompt_ids": list(prompt_ids), "kwargs": gen_kwargs,
                         "sampling": dict(sampling), "thinking": thinking}
             if vl is not None:
                 types, imgs = vl
                 captured["vl"] = {"token_types": types.detach().cpu(), "images": imgs}
-            path = os.path.join(REPO_ROOT, "results", "captured_request.pt")
+            total, i = _CAPTURE["total"], _CAPTURE["done"]
+            name = "captured_request.pt" if total == 1 else f"captured_request_{i}.pt"
+            path = os.path.join(REPO_ROOT, "results", name)
             tmp = path + ".tmp"
             torch.save(captured, tmp)
             os.replace(tmp, path)
-            log.warning("captured one model-ready request at %s; capture is now disarmed", path)
+            _CAPTURE["done"] += 1
+            if _CAPTURE["done"] < total:
+                log.warning("captured model-ready request %d/%d at %s; %d more armed",
+                            _CAPTURE["done"], total, path, total - _CAPTURE["done"])
+            else:
+                log.warning("captured model-ready request %d/%d at %s; capture disarmed",
+                            _CAPTURE["done"], total, path)
         if self.ep_active:
             # Lockstep contract (engine/dist.py): rank 0 decides, the peer obeys. Three rules:
             #  * seed must be concrete and SHARED -- seed=None would leave each rank drawing its

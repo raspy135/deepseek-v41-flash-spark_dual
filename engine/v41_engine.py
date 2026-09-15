@@ -38,6 +38,13 @@ def log(*a):
 # engine/profile_fast.py's step+draft and the tok/s the generator actually reaches.
 STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
 PREFILL_TIMING = os.environ.get("DSV41_PREFILL_TIMING", "0") == "1"
+# How many chunk-boundary prefix snapshots to keep for partial prefix reuse (0 = off, the
+# shipped behavior: only the full-prompt snapshot). See _restore_prefix: this is what lets a
+# prompt that has a changed token in its middle/end -- a per-request timestamp in the prompt
+# template is the motivating case -- still reuse the identical tokens before the change,
+# rounded down to a MAX_CHUNK boundary. Part of the cross-rank config guard: the restored
+# length decides whether a prefill collective happens at all, so the ranks must agree on it.
+PREFIX_SNAPSHOTS = int(os.environ.get("DSV41_PREFIX_SNAPSHOTS", "0") or "0")
 # Adapt the resident experts once more, at the prefill -> decode boundary, instead of only after
 # the response. The demand blend weights observed evidence w = observed/(observed + PRIOR); at
 # PRIOR=2e4 per layer a 30k-token prompt is w=90% against 11% for a 400-token answer, so the
@@ -687,6 +694,10 @@ class V41Engine:
         # One exact prompt-prefix snapshot.  The large compressed KV prefix remains append-only in
         # ``self.caches``; this object only protects the small state decode overwrites.
         self._prefix_cache = None
+        # {prefix_len: snapshot} at chunk boundaries of the current prompt, newest kept up to
+        # DSV41_PREFIX_SNAPSHOTS. The full-prompt snapshot above is the exact-extension fast path;
+        # these are the fallback when a changed token stops the prompt from extending it.
+        self._prefix_snapshots: dict = {}
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
@@ -844,6 +855,10 @@ class V41Engine:
                 # dtype -- bf16 vs fp32 changes the selection the same way.
                 "index_stream": os.environ.get("DSV41_INDEX_STREAM", "0"),
                 "index_score_bf16": os.environ.get("DSV41_INDEX_SCORE_BF16", "1"),
+                # The restored prefix length decides how many prefill chunks (and therefore how
+                # many per-layer collectives) this request issues. A rank that keeps a different
+                # number of snapshots can resume at a different boundary; keep it in the guard.
+                "prefix_snapshots": PREFIX_SNAPSHOTS,
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
             diff = {k: (v, peer_cfg.get(k)) for k, v in cfg.items() if peer_cfg.get(k) != v}
@@ -969,18 +984,16 @@ class V41Engine:
             # are clean. No-op when the flag is off.
             self.fast.route_stats_reset()
 
-    def _restore_prefix(self, prompt: list[int]) -> int:
-        """Restore a cached encoder prefix and return its length, or return zero.
+    def _try_restore(self, pc, prompt: list[int]) -> int:
+        """Restore one cached snapshot if it is a prefix of ``prompt``; return its length.
 
-        Token equality is deliberately the whole admission policy. Vision bypasses this path in
-        ``_generate`` because placeholder-token equality says nothing about the image pixels.
-        A mismatch invalidates the one-entry cache before a full prefill overwrites its backing
-        compressed KV rows.
+        Token equality is deliberately the whole admission policy. On a mismatch nothing is
+        touched, so the caller can try a shorter snapshot instead of giving up. Vision bypasses
+        this path in ``_generate`` because placeholder-token equality says nothing about pixels.
         """
-        pc = self._prefix_cache
-        if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or pc is None
+        if (pc is None or getattr(self, "replica_slots", 0)
+                or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay
                 or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
-            self._prefix_cache = None
             return 0
         c = self.caches
         n = len(pc["ids"])
@@ -995,23 +1008,52 @@ class V41Engine:
         c.len = n
         return n
 
-    def _save_prefix(self, prompt_ids, P: int) -> None:
-        """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
+    def _restore_prefix(self, prompt: list[int]) -> int:
+        """Restore the longest cached prefix ``prompt`` extends, or return zero.
+
+        The full-prompt snapshot is the normal case: the next turn of a conversation extends it
+        token-for-token. On a miss -- the motivating one is a prompt template that embeds the
+        current wall-clock time, so the same conversation re-sent a minute later differs mid-
+        prompt -- the chunk-boundary snapshots (DSV41_PREFIX_SNAPSHOTS) are tried longest-first.
+        A shorter restore is still correct: every token up to that boundary is identical, so the
+        state is too, and the remaining suffix is prefilled normally.
+
+        Restoring to ``n`` invalidates any snapshot past ``n``, because the prefill that follows
+        rewrites the compressed KV rows beyond ``n`` from the new tokens; their backing no longer
+        matches the state those snapshots were taken from.
+        """
+        pc = self._prefix_cache
+        n = self._try_restore(pc, prompt)
+        if n == 0 and self._prefix_snapshots:
+            for L in sorted(self._prefix_snapshots, reverse=True):
+                n = self._try_restore(self._prefix_snapshots[L], prompt)
+                if n:
+                    break
+        if n == 0:
+            self._prefix_cache = None
+            return 0
+        if pc is not None and len(pc["ids"]) > n:
+            self._prefix_cache = None
+        for L in [L for L in self._prefix_snapshots if L > n]:
+            del self._prefix_snapshots[L]
+        return n
+
+    def _snapshot_prefix(self, prefix_ids, P: int):
+        """Clone the small prefix state at position ``P``, or return None when caching is off."""
         if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1"
                 or not self.swa_replay or P <= 0):
-            self._prefix_cache = None
-            return
+            return None
         c, m = self.caches, self.model
         lo = max(0, P - self.args.window_size)
         slots = (m._positions[lo:P] % M_.RING).clone()
         h, pre, topk, cand, _ = m._rep_tail()
         pending = {L: (None if value is None else (value[0].clone(), value[1].clone()))
                    for L, value in c.pending.items()}
-        self._prefix_cache = {
+        return {
             # The serving path already owns these ids as a host list.  Copying the CUDA ``ids``
             # tensor back here forced a full-stream synchronisation at every cache miss and made
             # queued encoder work appear as a prefix-cache cost.
-            "ids": tuple(prompt_ids),
+            "ids": tuple(prefix_ids),
             "slots": slots,
             "win": {L: c.win[L][slots].clone()
                     for L in range(self.args.candidate_source_layer + 1)},
@@ -1019,6 +1061,10 @@ class V41Engine:
             "rep": {"h": h.clone(), "pre_mix": pre.clone(), "topk": topk.clone(),
                     "cand": None if cand is None else cand.clone()},
         }
+
+    def _save_prefix(self, prompt_ids, P: int) -> None:
+        """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
+        self._prefix_cache = self._snapshot_prefix(prompt_ids, P)
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
@@ -1629,6 +1675,9 @@ class V41Engine:
             # short window rather than a crash and so said nothing at all. A restored prefix is a
             # continuation of its own prompt, not a new one.
             m.begin_prompt()
+            # A full prefill means nothing matched: the boundary snapshots described an older
+            # prompt, and the prefill about to start rewrites every compressed KV row anyway.
+            self._prefix_snapshots.clear()
         # Hash the whole prompt once so chunk k+1's engram rows can be read off NVMe while chunk k
         # is still on the GPU. Hashing per chunk is bit-identical (verified), but it leaves the
         # reads with only layer 0 to hide behind, which costs ~1 s of idle GPU per chunk on text
@@ -1675,7 +1724,19 @@ class V41Engine:
                 # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
                 # (layers 0..20, which is everything that writes global KV), and the decoder half is
                 # replayed once over the last `window_size` prompt tokens.
+                _snap_src = None
+                if PREFIX_SNAPSHOTS:
+                    _snap_src = host_ids if host_ids is not None else ids.tolist()
                 for s, e in spans:
+                    # Snapshot the state AT this chunk boundary, before it is overwritten. A later
+                    # request that diverges inside this chunk can then resume here instead of
+                    # prefilling the whole prompt.
+                    if _snap_src is not None and s:
+                        _snap = self._snapshot_prefix(_snap_src[:s], s)
+                        if _snap is not None:
+                            self._prefix_snapshots[s] = _snap
+                            while len(self._prefix_snapshots) > PREFIX_SNAPSHOTS:
+                                del self._prefix_snapshots[min(self._prefix_snapshots)]
                     with timing.chunk(s, e) if timing is not None else nullcontext():
                         _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
                     if replicas is not None and (s, e) == spans[0]:
@@ -2012,6 +2073,7 @@ class V41Engine:
             "prefill_ep_overlap": (self.ep.active and
                                    os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
             "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
+            "prefix_snapshots": PREFIX_SNAPSHOTS,
             "prefill_replica_slots": self.replica_slots,
             "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),
             "prefill_replica_budget_ms": self.replica_budget_ms,
