@@ -253,6 +253,16 @@ were 2.2–3.0 s. Rank-0/rank-1 aggregate combine envelopes were 2.316/3.633 s i
 3.014/2.123 s in run two: the greater waiter switched ranks. The first replay also includes
 post-restart warm-up effects; do not treat the difference as an isolated code speedup.
 
+Doubling chunks to 4096 (with RING=8192 to preserve history) was not retained. Same real input,
+zero prefix reuse, normal adaptive EP2, 32-token output cap: first new-shape run 61.153 s
+(235.41 tok/s), then warmed runs 21.473 and 20.969 s (670.42 / 686.55 tok/s). Four chunks were
+confirmed. New-shape first/last chunks dominated the cold run; do not use it as steady-state
+throughput. Warm performance did not beat the preceding 2048-token profiles (667.61 / 762.84),
+and host MemAvailable fell to ~2.8 GB during the trial. Nesting passed 4/4, but those short
+probes do not prove long-context chunk-size parity. Adaptive generations changed, so this is
+not an isolated causal comparison. Restore chunk=2048, ring=4096 rather than retain a larger
+working set without a demonstrated benefit. The public default remains unchanged.
+
 Rejected global schedule change: `tools/tune_fp4_prefill.py --confirm` alternated software-FP4
 down-projection tuples (128,8,3) and (128,4,2) using fixed serving-style routing. FP32 outputs
 were bit-identical. Candidate improved T=512 (~22.1–22.5 vs 23.4–23.8 ms), but not consistently
