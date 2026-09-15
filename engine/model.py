@@ -958,6 +958,10 @@ class Model:
             # expert pruning experiment: the router may only pick surviving experts (REAP-style drop)
             logits = logits.masked_fill(~pm[L], float("-inf"))
         indices = logits.topk(k, dim=-1)[1]
+        probe = getattr(self, "prefill_replica_counts", None)
+        if prefill and n_experts != 128 and probe is not None:
+            flat = indices.reshape(-1)
+            probe[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
@@ -973,6 +977,9 @@ class Model:
         # refuses to build it under expert parallel for exactly that reason; the assert is the
         # backstop, because the failure mode is silent wrong slots, not an error.
         lut = getattr(self, "slot_lut", None)
+        replica_lut = getattr(self, "prefill_replica_lut", None) if prefill else None
+        if replica_lut is not None and n_experts != 128:
+            lut = replica_lut
         if lut is not None and n_experts != 128:
             # EP2-safe: build_lut fills non-owned entries with the null slot rather than -1, and
             # validates that once at construction -- checking it here would be a device->host sync
@@ -997,6 +1004,9 @@ class Model:
         ep_overlap = False
         if getattr(store, "null_slot", None) is not None:
             route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
+            replica_routes = getattr(self, "prefill_replica_routes", None) if prefill else None
+            if replica_routes is not None:
+                route = replica_routes.get(L)
             route_args = {}
             if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
                 route_args = {"routing_ids": route[0][indices], "routing_slot_map": route[1]}

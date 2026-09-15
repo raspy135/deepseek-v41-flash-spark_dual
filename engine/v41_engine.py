@@ -547,6 +547,16 @@ class V41Engine:
         # the same unified pool, and an arena sized around a not-yet-created PG overcounts what
         # is left (the keep_free floor then quietly eats itself).
         self.ep = DT.EPDistributed(rank, world_size)
+        replica_gb = float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0"))
+        self.replica_budget_ms = float(os.environ.get("DSV41_PREFILL_REPLICA_BUDGET_MS", "500"))
+        if not np.isfinite(replica_gb) or not 0 <= replica_gb <= 1:
+            raise ValueError('experimental prefill replica arena must be between 0 and 1 GB per rank')
+        if not np.isfinite(self.replica_budget_ms) or not 0 < self.replica_budget_ms <= 500:
+            raise ValueError('prefill replica admission budget must be in (0, 500] ms')
+        self.replica_slots = int(replica_gb * 1e9 / self.expert_bytes)
+        replica_bytes = self.replica_slots * self.expert_bytes
+        if self.replica_slots and (world_size != 2 or self.kernel != "triton-fp4" or self.fp4_dot_scaled):
+            raise ValueError('prefill replicas currently require EP2 software-FP4')
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3"), expert_format
             self.ep.init(device)
@@ -578,7 +588,7 @@ class V41Engine:
         if auto:
             arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82)
         if host_avail is not None:
-            cap = (host_avail - keep_free_gb * 1e9) / 1e9
+            cap = (host_avail - keep_free_gb * 1e9 - replica_bytes) / 1e9
             if cap < 10.0:
                 # Refuse rather than squeeze. A cap this low means the host has no memory to give:
                 # another engine is still resident, or the kernel has not finished reclaiming the
@@ -605,7 +615,7 @@ class V41Engine:
             # free -- rather than a pessimistic sum, because refusing a configuration that works is
             # its own failure. The MemoryWatchdog below is the backstop if this estimate is wrong.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
-            need = arena_gb * 1e9 + pack_scratch + keep_free_gb * 1e9
+            need = arena_gb * 1e9 + replica_bytes + pack_scratch + keep_free_gb * 1e9
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
@@ -623,9 +633,9 @@ class V41Engine:
         # the machine (see MemoryWatchdog)
         self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
                                            log=log).start()
-        self.arena = make_expert_arena(slots)
+        self.arena = make_expert_arena(slots + self.replica_slots)
         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
-                                    io_threads=io_threads, ep=self.ep)
+                                    io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
         # load the DSpark experts (all 3 x 128 resident in their own arena)
         for k in range(3):
             for e in range(128):
@@ -818,6 +828,8 @@ class V41Engine:
                 "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
                 "prefill_chunk": MAX_CHUNK,
                 "prefill_timing": PREFILL_TIMING,
+                "prefill_replica_slots": self.replica_slots,
+                "prefill_replica_budget_ms": self.replica_budget_ms,
                 # The prefill indexer's score reduction. The tiled path is meant to select the
                 # same positions as the monolithic one, but a per-tile topk can break a tie
                 # differently, so a split pair could read different sparse KV with nothing
@@ -898,6 +910,14 @@ class V41Engine:
                     self.model.prefill_routes = routes
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
                 % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
+        self.prefill_replicas = None
+        if self.replica_slots:
+            if getattr(self.model, "slot_lut", None) is None or not hasattr(self.model, "prefill_routes"):
+                raise ValueError('prefill replicas require pruned all-resident FP4 routing')
+            from engine.prefill_replicas import PrefillReplicas
+            self.prefill_replicas = PrefillReplicas(self, self.replica_budget_ms)
+            log(f"experimental prefill replicas: {self.replica_slots} dedicated slots/rank, "
+                f"{replica_bytes / 1e9:.3f} extra GB/rank; prefix reuse disabled")
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
         from engine.fastdecode import T_VERIFY as _TV
@@ -946,7 +966,7 @@ class V41Engine:
         compressed KV rows.
         """
         pc = self._prefix_cache
-        if (os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or pc is None
+        if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or pc is None
                 or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
             self._prefix_cache = None
             return 0
@@ -965,7 +985,8 @@ class V41Engine:
 
     def _save_prefix(self, prompt_ids, P: int) -> None:
         """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
-        if os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay or P <= 0:
+        if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1"
+                or not self.swa_replay or P <= 0):
             self._prefix_cache = None
             return
         c, m = self.caches, self.model
@@ -1042,6 +1063,8 @@ class V41Engine:
             self.ep.release_peer()
             raise
         finally:
+            if self.prefill_replicas is not None:
+                self.prefill_replicas.clear()
             n_out = _st.get("n_out", n_out)
             steps = _st.get("steps", steps)
             accepted_hist = _st.get("accepted", accepted_hist)
@@ -1215,6 +1238,9 @@ class V41Engine:
                         "steps_counted": rep["steps"],
                     }
             _ph = M_.phase_report()
+            if self.prefill_replicas is not None:
+                self.last_stats["prefill_replicas"] = dict(self.prefill_replicas.stats)
+                log("prefill_replicas: " + json.dumps({"rank": self.ep.rank, **self.prefill_replicas.stats}))
             if _st.get("prefill_timing") is not None:
                 report = _st["prefill_timing"].report()
                 self.last_stats["prefill_chunks"] = report
@@ -1558,6 +1584,9 @@ class V41Engine:
         tt = getattr(self, "_token_types", None)
         eg_mask = None if tt is None else ~(tt >= 0)
         spans = self._prefill_spans(P, prefix_start)
+        replicas = self.prefill_replicas
+        if replicas is not None:
+            replicas.begin(len(spans) > 1)
         timing = None
         if PREFILL_TIMING:
             from engine.prefill_timing import PrefillTiming
@@ -1595,6 +1624,10 @@ class V41Engine:
                 for s, e in spans:
                     with timing.chunk(s, e) if timing is not None else nullcontext():
                         _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
+                    if replicas is not None and (s, e) == spans[0]:
+                        replicas.finish_probe()
+                if replicas is not None:
+                    replicas.clear()  # decoder replay uses original ownership too
                 # Save at the prompt boundary, before decoder replay and generation overwrite the
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
                 self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
@@ -1609,6 +1642,10 @@ class V41Engine:
                         logits, mh = _fwd(s, chunk, need_logits=last)
                         if self.spec:
                             m.dspark_seed(mh, s)
+                    if replicas is not None and (s, e) == spans[0]:
+                        replicas.finish_probe()
+        if replicas is not None:
+            replicas.clear()  # before adaptation, graph capture, or token generation
         # The prompt's demand is now complete and no token has been generated yet: the whole
         # prompt's evidence can be applied before it is used, rather than after the answer is
         # written. Outside the read-ahead context so the swap's NVMe loads do not contend with
@@ -1920,7 +1957,10 @@ class V41Engine:
                                       os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1"),
             "prefill_ep_overlap": (self.ep.active and
                                    os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
-            "prefix_cache": (self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
+            "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
+            "prefill_replica_slots": self.replica_slots,
+            "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),
+            "prefill_replica_budget_ms": self.replica_budget_ms,
             "prefill_fused_attn": M_.PREFILL_FUSED_ATTN,   # not a second os.environ.get: see model.py
             "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
