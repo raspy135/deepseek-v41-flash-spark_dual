@@ -1341,7 +1341,8 @@ class V41Engine:
                 rep = self.fast.route_stats_report() if self.fast is not None else None
                 if rep:
                     per_layer_mean = rep["mean"]
-                    owned = per_layer_mean / max(1, self.ep.world) if self.ep.active else per_layer_mean
+                    owned = (per_layer_mean / max(1, self.ep.world)
+                             if self.ep.active and not self.ep.tensor_parallel else per_layer_mean)
                     self.last_stats["route_stats"] = {
                         "distinct_experts_per_layer": round(per_layer_mean, 2),
                         "distinct_per_layer_this_rank": round(owned, 2),
@@ -2110,6 +2111,9 @@ class V41Engine:
             # really go back?" -- the flag lives in the launcher's environment, not in .env, and
             # there was otherwise no way to tell the two modes apart from outside the container.
             "tp_dense": "on" if R.tp_dense()[1] > 1 else "off",
+            "tp_attention": os.environ.get('DSV41_TP_ATTN', '0') == '1',
+            "tp_head": os.environ.get('DSV41_TP_HEAD', '0') == '1',
+            "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
             "prefill_swap": "on" if PREFILL_SWAP else "off",
             # How many adaptations have been applied since boot. Identical on both ranks by
             # construction, so a difference between them is a desync that nothing else reports.
@@ -2135,6 +2139,7 @@ class V41Engine:
             "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
             "prefix_snapshots": PREFIX_SNAPSHOTS,
             "prefix_disk": self.prefix_disk is not None,
+            "prefix_disk_configured": PREFIX_DISK,
             "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,
             "prefill_replica_slots": self.replica_slots,
             "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),

@@ -60,7 +60,7 @@ CPU gate: `python -m unittest engine.test_prefix_disk`.
 GPU/restart gate: `tools/test_prefix_persistence_engine.py --phase save|load` on both
 nodes, same code/config, serving stopped. Uses synthetic/public text and output hashes.
 
-## TP architecture (experimental, gates pending)
+## TP architecture (opt-in)
 
 - `DSV41_TP_EXPERTS=1`: both nodes hold the same resident expert IDs, but each holds
   half the packed FP4 intermediate dimension. Scale boundaries stay aligned. Adaptive
@@ -105,4 +105,48 @@ not a matched EP comparison. One driver failed because it tried to read the priv
 capture on both nodes; it now reads on rank 0 and broadcasts IDs through the existing
 node link. The direct-engine nesting grader also differed from serving: it filtered
 all EOS IDs instead of truncating at the first EOS in a speculative burst. The corrected
-grader is pending validation; do not attribute that initial failure to TP without it.
+grader has now been validated: there were no tokens after EOS in this case. Depth 8
+really emitted an extra closing brace. The matched EP and TP trials produced the
+identical token hash at depth 8 (failure) and depth 10 (pass). This is an existing
+quality failure at keep 0.60, not evidence of a TP-specific regression. The integration
+driver only permits continuing past it with `--allow-known-depth8-failure`; it reports
+the failure explicitly and does not label the run a quality pass.
+
+## Matched whole-engine measurements (2026-09-15)
+
+Both modes used keep 0.60, arena 88 GB, speculation enabled, the same demand DB,
+frozen adaptation, and no prefix reuse. The TP mode shards routed/shared experts,
+attention projections and vocabulary head, with expert reduction `auto`.
+
+| Workload | EP prefill seconds | TP prefill seconds | EP / TP decode tok/s |
+| --- | ---: | ---: | ---: |
+| README repeat 1 (7,709 tokens) | 13.541 | 12.210 | 21.31 / 21.75 |
+| README repeat 2 | 8.366 | 11.220 | 21.91 / 21.61 |
+| Private local capture (14,396 tokens, 64 output) | 27.283 | 24.965 | 14.88 / 14.98 |
+| README after long context | 17.239 | 13.577 | 21.28 / 21.70 |
+
+Combined prefill for these four requests: EP 66.429 s, TP 61.972 s (~6.7% less).
+Cold/JIT first requests are excluded from that comparison. Variance is substantial:
+EP's fastest README was faster than TP's fastest README in this pair. These bounded
+measurements support aggregate parity, not a universal speedup or a statistical claim.
+Rank-0 allocated GPU memory fell from 108.520 to 104.808 GB (~3.7 GB saved).
+
+A subsequent TP-only validation run measured README 744/775/881 tok/s, the same
+14,396-token capture 886.71 tok/s (16.235 s) and 15.87 decode tok/s, and README after
+the capture 689 tok/s. That run is not another matched comparison. Prompt content
+and generated private text are not included in these records.
+
+The routed kernel still reads a full expert from the original checkpoint before
+selecting the rank's half. Thus TP reduces resident expert bytes, not checkpoint
+read bytes: warm load read 181 GB per rank in 17 s versus EP's roughly 94 GB in 13 s.
+Sharded checkpoint storage is a possible later optimization, not implemented here.
+
+The two-node TP integration gate subsequently passed two actual adaptive expert swaps,
+route/LUT consistency checks, and depth-10 nesting after those swaps. Saving that
+6,082-token prefix, processing an unrelated prompt, clearing all RAM snapshots and KV,
+then restoring from disk reproduced the saved output hash on both nodes. Bundle size
+was 46,677,793 bytes with three boundaries; staging 0.633 s, background write 0.095 s,
+disk load 0.093 s and total restored prefill/replay 0.301 s (TTFT 0.374 s). Staging
+includes waiting for queued GPU work and is not an isolated measurement of added cost.
+The known depth-8 baseline failure remained explicitly reported. This is a bounded
+integration pass, not a claim that broader quality regressions have been resolved.

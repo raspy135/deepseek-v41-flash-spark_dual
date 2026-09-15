@@ -19,14 +19,20 @@ from engine.prefix_disk import PrefixDisk, cpu_tree, device_tree
 def namespace(engine):
     root = Path(__file__).resolve().parent.parent
     h = hashlib.sha256(b'prefix-persistence-v1')
-    for name in ('engine/model.py', 'engine/fastdecode.py', 'engine/v41_engine.py',
-                 'engine/prefix_persistence.py', 'engine/prefix_disk.py',
-                 'engine/tensor_parallel.py', 'tools/fp8_linear.py',
-                 'tools/v41_ref.py', 'tools/fp4_moe.py'):
-        h.update((root / name).read_bytes())
+    # Include auxiliary attention/HC/Engram kernels, not just the top-level model.
+    # Test/benchmark edits alone should not discard a user's useful prompt history.
+    excluded = ('test_', 'bench_', 'tune_', 'diag_', 'profile_')
+    for directory in ('engine', 'tools'):
+        for path in sorted((root / directory).glob('*.py')):
+            if not path.name.startswith(excluded):
+                h.update(path.relative_to(root).as_posix().encode())
+                h.update(path.read_bytes())
     model = Path(engine.model_dir)
     for name in ('model.safetensors.index.json', 'inference/config.json', 'tokenizer.json'):
         h.update((model / name).read_bytes())
+    for path in sorted((model / 'inference').glob('*.py')):
+        h.update(path.name.encode())
+        h.update(path.read_bytes())
     # No multi-hundred-GB startup scan. Size + nanosecond mtime detect local checkpoint
     # replacements; config/index/tokenizer are content-hashed. Rank-local namespaces may
     # differ (e.g. copied file timestamps); shared bundle UUIDs still identify one run.
@@ -37,7 +43,9 @@ def namespace(engine):
                'DSV41_PRUNE_DB', 'DSV41_PRUNE_UNIT', 'DSV41_PRUNE_HALFLIFE')
     env = {k: v for k, v in os.environ.items()
            if k.startswith('DSV41_') and not k.startswith(ignored)}
-    h.update(json.dumps({'env': env, 'world': engine.ep.world, 'rank': engine.ep.rank,
+    import triton
+    h.update(json.dumps({'env': env, 'torch': torch.__version__, 'triton': triton.__version__,
+                         'world': engine.ep.world, 'rank': engine.ep.rank,
                          'prune_keep': engine.prune_keep, 'act_quant': engine.act_quant,
                          'kernel': engine.kernel, 'max_context': engine.max_context,
                          'strict_routing': os.environ.get('DSV41_PREFIX_DISK_STRICT', '0'),
