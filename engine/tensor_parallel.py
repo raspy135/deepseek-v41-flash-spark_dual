@@ -1,8 +1,10 @@
 """Dense TP primitives. Keep the checkpoint's rounding AFTER each complete linear.
 
-Attention shards heads/groups, not queries or shared compressed KV. Only the output
-projection needs a reduction. The vocabulary head gathers disjoint logits, without sums.
+Attention shards heads/groups, not queries or shared compressed KV. Output projections
+gather inputs and disjoint results by default. The legacy reduction path remains for A/B
+tests. The vocabulary head gathers disjoint logits, without sums.
 """
+import os
 import torch
 import torch.distributed as dist
 
@@ -39,6 +41,33 @@ class RowParallelWeight:
         return partial.to(torch.bfloat16).view(*shape[:-1], self.shape[0])
 
 
+class OutputParallelWeight:
+    """Gather BF16 inputs, compute complete dot products for disjoint output rows.
+
+    Keeps half the weight bytes without reducing separately accumulated K partitions.
+    Both collectives concatenate values; neither introduces a floating-point sum.
+    """
+    def __init__(self, local, world=2):
+        if world != 2 or local.shape[1] % world:
+            raise ValueError('output-parallel linear requires two aligned input shards')
+        self.local, self.world = local, world
+        self.shape = (local.shape[0] * world, local.shape[1] // world)
+
+    def tp_linear(self, x):
+        import v41_ref as R
+        shape = x.shape
+        flat = x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous()
+        rows, width = flat.shape
+        gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
+        dist.all_gather_into_tensor(gathered, flat)
+        full = gathered.view(self.world, rows, width).transpose(0, 1).reshape(rows, self.world * width)
+        local = R.mm(full, self.local).contiguous()
+        output = torch.empty((self.world * rows, local.shape[-1]), dtype=local.dtype, device=local.device)
+        dist.all_gather_into_tensor(output, local)
+        return output.view(self.world, rows, local.shape[-1]).transpose(0, 1).reshape(
+            *shape[:-1], self.shape[0])
+
+
 def shard_attention(weight, args, rank, world):
     from fp8_linear import FP8GroupedWeight
     if world != 2 or not 0 <= rank < world:
@@ -58,7 +87,13 @@ def shard_attention(weight, args, rank, world):
         weight.wo_a = shard(wo, 0, rank, world)
     else:
         raise ValueError('attention TP supports native FP8 or BF16 wo_a only')
-    weight.wo_b = RowParallelWeight(shard(weight.wo_b, 1, rank, world))
+    layout = os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output')
+    if layout == 'output':
+        weight.wo_b = OutputParallelWeight(shard(weight.wo_b, 0, rank, world), world)
+    elif layout == 'intermediate':
+        weight.wo_b = RowParallelWeight(shard(weight.wo_b, 1, rank, world))
+    else:
+        raise ValueError('TP linear layout must be intermediate or output')
 
 
 class VocabParallelHead:

@@ -7,6 +7,7 @@ gate_image=${GATE_IMAGE:?set GATE_IMAGE to an immutable image id available on bo
 gate_log_dir=${GATE_LOG_DIR:?set GATE_LOG_DIR}
 gate_script=${1:?script inside /app/tools}
 gate_host_script=${GATE_HOST_SCRIPT:-0}
+gate_source_root=${GATE_SOURCE_ROOT:-}
 shift
 set -a
 source .env
@@ -26,6 +27,14 @@ while IFS='=' read -r key _; do
 done < <(env | rg '^DSV41_[A-Z0-9_]+=')
 flags+=(-e DSV41_CAPTURE_NEXT=0 -e DSV41_PREFIX_DISK_DIR=/app/results/prefix-cache-gate
         -e DSV41_PREFIX_DISK_GB=20)
+if [[ -n "$gate_source_root" ]]; then
+    # Isolated historical-source comparison; never overwrite either live checkout.
+    for directory in engine tools server; do
+        test -d "$gate_source_root/$directory"
+        ssh -o BatchMode=yes "$PEER" "test -d '$gate_source_root/$directory'"
+        flags+=(-v "$gate_source_root/$directory:/app/$directory:ro")
+    done
+fi
 gate_entry="/app/tools/$gate_script"
 if [[ "$gate_host_script" == 1 ]]; then
     # Overlay only the test driver, never live engine modules. This avoids rebuilding a

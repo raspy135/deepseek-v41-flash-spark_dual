@@ -826,6 +826,8 @@ class V41Engine:
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
                 "tp_experts": self.ep.tensor_parallel,
                 "tp_experts_version": 1,
+                "tp_expert_layout": os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output'),
+                "tp_linear_layout": os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output'),
                 "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
                 "tp_attention": os.environ.get('DSV41_TP_ATTN', '0'),
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
@@ -2114,6 +2116,8 @@ class V41Engine:
             "tp_attention": os.environ.get('DSV41_TP_ATTN', '0') == '1',
             "tp_head": os.environ.get('DSV41_TP_HEAD', '0') == '1',
             "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
+            "tp_expert_layout": os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output'),
+            "tp_linear_layout": os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output'),
             "prefill_swap": "on" if PREFILL_SWAP else "off",
             # How many adaptations have been applied since boot. Identical on both ranks by
             # construction, so a difference between them is a desync that nothing else reports.

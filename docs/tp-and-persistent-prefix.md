@@ -62,6 +62,13 @@ nodes, same code/config, serving stopped. Uses synthetic/public text and output 
 
 ## TP architecture (opt-in)
 
+The original partial-K implementation below was superseded by output-row sharding
+after a short-nesting regression. See [the controlled investigation](nesting-regression-tp.md).
+Current defaults are `DSV41_TP_EXPERT_LAYOUT=output` and
+`DSV41_TP_LINEAR_LAYOUT=output`: gather BF16 intermediates, compute complete down/output
+dot products for half the output rows, then gather disjoint outputs. Resident weight
+bytes stay unchanged. The reduction timings below describe the **previous** layout.
+
 - `DSV41_TP_EXPERTS=1`: both nodes hold the same resident expert IDs, but each holds
   half the packed FP4 intermediate dimension. Scale boundaries stay aligned. Adaptive
   swaps update both shards, with no even/odd ownership restriction.
@@ -108,7 +115,8 @@ all EOS IDs instead of truncating at the first EOS in a speculative burst. The c
 grader has now been validated: there were no tokens after EOS in this case. Depth 8
 really emitted an extra closing brace. The matched EP and TP trials produced the
 identical token hash at depth 8 (failure) and depth 10 (pass). This is an existing
-quality failure at keep 0.60, not evidence of a TP-specific regression. The integration
+quality failure at keep 0.60. This comparison did **not** rule out a TP-specific regression:
+later all-expert controls exposed one (see the investigation above). The integration
 driver only permits continuing past it with `--allow-known-depth8-failure`; it reports
 the failure explicitly and does not label the run a quality pass.
 

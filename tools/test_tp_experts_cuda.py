@@ -13,6 +13,8 @@ from engine.dist import EPDistributed
 
 
 def main():
+    if '--output' in sys.argv:
+        os.environ['DSV41_TP_EXPERT_LAYOUT'] = 'output'
     if '--scatter' in sys.argv:
         os.environ['DSV41_TP_EXPERT_REDUCE'] = 'scatter'
     ep = EPDistributed()
@@ -41,7 +43,7 @@ def main():
             fn()
         torch.cuda.synchronize()
         return (time.perf_counter() - t) * 1000 / count
-    for tokens in (1, 6, 128, 2048):
+    for tokens in (1, 6, 63, 128, 2048):
         torch.manual_seed(42)
         x = torch.randn(tokens, K.DIM, device='cuda', dtype=torch.bfloat16)
         weights = torch.rand(tokens, 6, device='cuda')
@@ -64,6 +66,8 @@ def main():
             rel = float((actual - expected).norm() / expected.norm().clamp_min(1e-20))
             finite = bool(torch.isfinite(actual).all())
             assert finite and rel < .005, (tokens, skew, rel)
+            if '--output' in sys.argv:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             ep_ms, tp_ms = timed(ep_run), timed(tp_run)
             row = dict(tokens=tokens, skew=skew, relative_l2=rel,
                        max_abs=float((actual - expected).abs().max()), ep_ms=ep_ms, tp_ms=tp_ms)

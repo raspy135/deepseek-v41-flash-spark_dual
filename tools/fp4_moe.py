@@ -92,15 +92,22 @@ class ExpertArena:
         if tp_world not in (1, 2) or not 0 <= tp_rank < tp_world:
             raise ValueError('FP4 expert TP supports world=1 or 2')
         self.tp_rank, self.tp_world = tp_rank, tp_world
+        layout = os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output')
+        if layout not in ('intermediate', 'output'):
+            raise ValueError('TP expert layout must be intermediate or output')
+        self.tp_output = tp_world > 1 and layout == 'output'
         self.inter = INTER // tp_world
         ni, kb2, sg2 = self.inter, self.inter // 2, self.inter // GROUP
+        down_n = DIM
+        if self.tp_output:
+            down_n, kb2, sg2 = DIM // tp_world, KB2, SG2
         u8 = dict(dtype=torch.uint8, device=self.device)
         self.w1 = torch.empty((slots, ni, KB1), **u8)
         self.s1 = torch.empty((slots, ni, SG1), **u8)
         self.w3 = torch.empty((slots, ni, KB1), **u8)
         self.s3 = torch.empty((slots, ni, SG1), **u8)
-        self.w2 = torch.empty((slots, DIM, kb2), **u8)
-        self.s2 = torch.empty((slots, DIM, sg2), **u8)
+        self.w2 = torch.empty((slots, down_n, kb2), **u8)
+        self.s2 = torch.empty((slots, down_n, sg2), **u8)
 
     @property
     def bytes_per_slot(self) -> int:
@@ -127,8 +134,14 @@ class ExpertArena:
         self.s1[slot].copy_(self._u8(s1, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
         self.w3[slot].copy_(self._u8(w3, (INTER, KB1))[lo:hi], non_blocking=non_blocking)
         self.s3[slot].copy_(self._u8(s3, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
-        self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[:, lo//2:hi//2], non_blocking=non_blocking)
-        self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[:, lo//GROUP:hi//GROUP], non_blocking=non_blocking)
+        if self.tp_output:
+            row = self.tp_rank * self.w2.shape[1]
+            end = row + self.w2.shape[1]
+            self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[row:end], non_blocking=non_blocking)
+            self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[row:end], non_blocking=non_blocking)
+        else:
+            self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[:, lo//2:hi//2], non_blocking=non_blocking)
+            self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[:, lo//GROUP:hi//GROUP], non_blocking=non_blocking)
 
     def dequant_slot(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(w1, w2, w3) as bf16 [N, K] logical matrices -- for the reference path / tests."""
@@ -633,10 +646,12 @@ def moe_forward(
 
     inter = arena.w1.shape[1]
     tp = getattr(arena, 'tp_world', 1) > 1
+    tp_output = getattr(arena, 'tp_output', False)
     reduce_mode = os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce')
     scatter = tp and (reduce_mode == 'scatter' or (reduce_mode == 'auto' and P > 64))
     h = torch.empty((P, inter), dtype=torch.bfloat16, device=dev)
-    parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)  # one row per (token, k) pair
+    down_n = arena.w2.shape[1]
+    parts = torch.empty((P, down_n), dtype=torch.float32, device=dev)  # one row per (token, k) pair
     if stage_mark is not None:
         stage_mark('scratch_alloc')
     _moe_up_kernel[(NB, inter // bn1)](
@@ -647,16 +662,31 @@ def moe_forward(
     )
     if stage_mark is not None:
         stage_mark('up_gemm')
-    _moe_down_kernel[(NB, DIM // bn2)](
+    down_k = inter
+    if tp_output:
+        # Preserve complete down-projection dot products: gather the BF16 activated
+        # intermediate, then compute disjoint output rows. Splitting K changed a
+        # borderline nesting decision even with FP32 partial reductions before BF16.
+        gathered_h = torch.empty((arena.tp_world * P, inter), dtype=h.dtype, device=dev)
+        torch.distributed.all_gather_into_tensor(gathered_h, h)
+        h = gathered_h.view(arena.tp_world, P, inter).transpose(0, 1).reshape(P, INTER)
+        down_k = INTER
+    _moe_down_kernel[(NB, down_n // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
-        TOPK=K, N=DIM, K=inter, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
-        PARTIAL=tp, PARTS_WORLD=arena.tp_world if scatter else 1, num_warps=nw2, num_stages=ns2,
+        TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
+        PARTIAL=tp and not tp_output, PARTS_WORLD=arena.tp_world if scatter and not tp_output else 1,
+        num_warps=nw2, num_stages=ns2,
     )
     if stage_mark is not None:
         stage_mark('down_gemm')
-    if tp:
+    if tp_output:
+        local = parts.view(K, T, down_n).sum(dim=0).to(out_dtype)
+        gathered = torch.empty((arena.tp_world * T, down_n), dtype=out_dtype, device=dev)
+        torch.distributed.all_gather_into_tensor(gathered, local)
+        result = gathered.view(arena.tp_world, T, down_n).transpose(0, 1).reshape(T, DIM)
+    elif tp:
         # Reconstruct EACH expert before its BF16 rounding boundary. Summing the
         # rank-local routed totals would move that boundary and resurrect a quality bug.
         if scatter:

@@ -12,6 +12,7 @@ from tools.fp4_moe import ExpertArena, INTER, DIM, KB1, SG1, KB2, SG2
 
 
 class TPExpertTests(unittest.TestCase):
+    @patch.dict(os.environ, {'DSV41_TP_EXPERT_LAYOUT': 'intermediate'})
     def test_packed_shards_reassemble_exactly(self):
         shapes = ((INTER, KB1), (INTER, SG1), (DIM, KB2), (DIM, SG2),
                   (INTER, KB1), (INTER, SG1))
@@ -21,6 +22,21 @@ class TPExpertTests(unittest.TestCase):
             a.load_slot(0, *full)
         for name, original, dim in zip(('w1', 's1', 'w2', 's2', 'w3', 's3'), full, (0, 0, 1, 1, 0, 0)):
             combined = torch.cat([getattr(a, name)[0] for a in arenas], dim=dim)
+            self.assertTrue(torch.equal(combined, original), name)
+        self.assertEqual(arenas[0].bytes_per_slot * 2, sum(t.numel() for t in full))
+
+    @patch.dict(os.environ, {'DSV41_TP_EXPERT_LAYOUT': 'output'})
+    def test_output_shards_reassemble_and_preserve_memory_budget(self):
+        shapes = ((INTER, KB1), (INTER, SG1), (DIM, KB2), (DIM, SG2),
+                  (INTER, KB1), (INTER, SG1))
+        full = [torch.randint(0, 256, shape, dtype=torch.uint8) for shape in shapes]
+        arenas = [ExpertArena(1, 'cpu', r, 2) for r in (0, 1)]
+        for a in arenas:
+            a.load_slot(0, *full)
+            self.assertTrue(a.tp_output)
+            self.assertEqual(a.w2.shape[1:], (DIM // 2, KB2))
+        for name, original in zip(('w1', 's1', 'w2', 's2', 'w3', 's3'), full):
+            combined = torch.cat([getattr(a, name)[0] for a in arenas], dim=0)
             self.assertTrue(torch.equal(combined, original), name)
         self.assertEqual(arenas[0].bytes_per_slot * 2, sum(t.numel() for t in full))
 

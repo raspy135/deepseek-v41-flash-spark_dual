@@ -325,7 +325,12 @@ def _tp_shard(w, dim: int):
     rank, world = tp_dense()
     if world <= 1:
         return w
-    from engine.tensor_parallel import shard, RowParallelWeight
+    from engine.tensor_parallel import shard, RowParallelWeight, OutputParallelWeight
+    layout = os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output')
+    if layout not in ('intermediate', 'output'):
+        raise ValueError('TP linear layout must be intermediate or output')
+    if dim == 1 and layout == 'output':
+        return OutputParallelWeight(shard(w, 0, rank, world), world)
     local = shard(w, dim, rank, world)
     return RowParallelWeight(local) if dim == 1 else local
 

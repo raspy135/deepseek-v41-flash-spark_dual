@@ -9,7 +9,7 @@ import torch
 from safetensors import safe_open
 import v41_ref as R
 from fp8_linear import FP8Weight
-from engine.tensor_parallel import shard, RowParallelWeight, VocabParallelHead
+from engine.tensor_parallel import shard, RowParallelWeight, OutputParallelWeight, VocabParallelHead
 from engine.dist import EPDistributed
 
 
@@ -23,8 +23,9 @@ def main():
             return f.get_tensor(name).to('cuda')
     name = 'layers.0.ffn.shared_experts.w2'
     weight = FP8Weight(get(name + '.weight'), get(name + '.scale'))
-    local = RowParallelWeight(shard(weight, 1, ep.rank, ep.world))
-    for n in (1, 6, 128, 2048):
+    local = (OutputParallelWeight(shard(weight, 0, ep.rank, ep.world), ep.world)
+             if '--output' in sys.argv else RowParallelWeight(shard(weight, 1, ep.rank, ep.world)))
+    for n in (1, 6, 63, 128, 2048):
         torch.manual_seed(42)
         x = torch.randn(n, weight.K, device='cuda', dtype=torch.bfloat16)
         expected = R.mm(x, weight).float()
@@ -32,6 +33,13 @@ def main():
         actual = local.tp_linear(xs).float()
         rel = float((actual-expected).norm()/expected.norm())
         assert rel < .005 and torch.isfinite(actual).all(), (n, rel)
+        # M=63 selects a different cuBLAS geometry for the output-row shard: a
+        # small residual difference remains even with complete K dot products.
+        # Keep an explicit tighter bound; do not claim bitwise whole-model TP.
+        if '--output' in sys.argv and n != 63:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if '--output' in sys.argv and n == 63:
+            assert rel < 1e-4, rel
         if ep.rank == 0:
             print('TP_DENSE ' + json.dumps(dict(tokens=n, relative_l2=rel)), flush=True)
         if n == 6:
