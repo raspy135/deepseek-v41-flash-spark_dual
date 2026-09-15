@@ -64,14 +64,48 @@ weights, relocation preserved final BF16 output at T=1/6/63/512 (FP32 maximum di
 0 / 0 / 5.96e-8 / 2.38e-7), but a 2.38e-7 FP32 difference crossed a BF16 rounding boundary
 at T=2048. Restoring original routing remained bit-exact in every case. This demonstrates
 regrouping sensitivity, not a measured full-model quality failure. Serving activation and speed
-benchmarking were withheld; replicas remain disabled pending a numerical solution/quality gate.
+benchmarking were initially withheld. The user subsequently authorized evaluating generated
+quality and speed despite this tiny numerical difference; that measured trial is recorded below.
 
 The initial GPU harness incorrectly placed real replica slots above the null sentinel, producing
 a large false failure in small-batch routing. The harness now matches production: null is last,
 above every real and replica slot. Do not attribute that initial failure to production routing.
 
-Full-model quality, real I/O time, and net prefill benefit still require validation.
-Short nesting prompts alone do not exercise replicas:
+Broader model quality still requires validation. Short nesting prompts alone do not exercise replicas:
 use a passing long-context control with at least two prefill chunks, and inspect `loaded` to
 ensure the path actually activated. Keep the feature off until those checks pass. Do not apply
 it to decode or split weights into TP shards as part of this experiment.
+
+## Serving trial: no net speedup on captured input
+
+The first enabled startup caught an input-validation bug: the constructor's optional world-size
+argument can be None while EPDistributed resolves WORLD_SIZE=2 from the environment. Validation
+now uses `self.ep.world`. Both nodes then ran image
+`cbfc721c7f174cbb17ab1bf04a9ec5b0095e5bca473a176ed866021b3a58e4bd` with replica GB=1,
+budget=500 ms, chunk=2048, ring=4096, normal adaptive keep=.59/spec ON and profiling ON.
+
+`bench/replica_quality.py` supplies 6,082-token synthetic context followed by depth-8 or depth-10
+nesting. Both controls passed off and on. On: 66 then 64 replicas were successfully loaded globally,
+in 285.104 / 236.548 ms (planning, I/O, coordination and table preparation). Both were within
+the budget and activated, so these checks exercised the feature rather than merely testing short
+prompts that bypass it. These two passing controls do not establish broad quality parity.
+
+Saved private 14,396-token real input, output capped at 32 tokens, no prefix reuse:
+
+| mode | prefill seconds | tok/s | replicas loaded, pair total | setup ms |
+|---|---:|---:|---:|---:|
+| off, quiet baseline after build/transfer | 16.849 | 854.39 | 0 | 0 |
+| on, first replay | 18.250 | 788.83 | 47 | 198.217 |
+| on, second replay | 17.488 | 823.19 | 50 | 210.435 |
+
+47/50 replicas represent 0.884/0.940 GB of expert payload globally, not per node. Capacity reserved
+was 53 slots (~0.996 GB) on each node, whether used or not. Each plan loaded all proposed replicas;
+there was no need to consume the full 500 ms. Setup time is not pure disk-copy time.
+
+On the second replay, rank 0/1 expert-routing GPU envelopes were 5.965/6.161 s, and combine/wait
+envelopes 1.578/2.058 s. Assignment-count predictions improved (~139,203 -> 129,024 summed
+per-layer maxima), but end-to-end prefill did not. Adaptive generations/settings changed between
+requests and startup occurred between arms, so this is not an isolated attribution of slowdown.
+Replicas were disabled again rather than retain extra memory without a demonstrated benefit.
+Do not claim memory pressure caused the difference: no OOM occurred during this serving trial,
+and concurrent memory-pressure telemetry was not collected.

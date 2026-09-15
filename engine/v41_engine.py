@@ -555,7 +555,7 @@ class V41Engine:
             raise ValueError('prefill replica admission budget must be in (0, 500] ms')
         self.replica_slots = int(replica_gb * 1e9 / self.expert_bytes)
         replica_bytes = self.replica_slots * self.expert_bytes
-        if self.replica_slots and (world_size != 2 or self.kernel != "triton-fp4" or self.fp4_dot_scaled):
+        if self.replica_slots and (self.ep.world != 2 or self.kernel != "triton-fp4" or self.fp4_dot_scaled):
             raise ValueError('prefill replicas currently require EP2 software-FP4')
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3"), expert_format
