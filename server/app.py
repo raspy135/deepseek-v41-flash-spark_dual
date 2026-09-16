@@ -537,6 +537,32 @@ class State:
     def request_context(self):
         return nullcontext() if self.scheduler is not None else self.lock
 
+    def cache_response(self, prompt_ids, result, *, thinking=False, vision=False):
+        """Called only after a successful response is flushed, still under request_context.
+
+        Concurrency=2 queues work for its GPU owner, only when both lanes are idle.
+        Thinking/tool/stop-string serialization may not preserve raw IDs.
+        """
+        if (os.environ.get('DSV41_PREFIX_RESPONSE', '1') != '1'
+                or self.ep_fault or thinking or vision or result.tool_calls
+                or not result.gen_ids or result.router.stopped
+                or not hasattr(self.engine, 'cache_response')):
+            return
+        if self.scheduler is not None:
+            self.scheduler.cache_response(prompt_ids, result.gen_ids, getattr(result, '_cache_lane', None))
+            return
+        try:
+            if self.ep_active:
+                self.ep.broadcast_request({'cmd': 'cache_response', 'prompt_ids': list(prompt_ids),
+                                           'response_ids': list(result.gen_ids)})
+            self.engine.cache_response(prompt_ids, result.gen_ids)
+        except Exception:
+            # Response is already delivered. Do not try to write an HTTP error, or
+            # continue with a peer potentially stuck inside a replay collective.
+            log.exception('post-response prefix preparation failed')
+            if self.ep_active:
+                os._exit(1)
+
     def stop_ids(self) -> Set[int]:
         ids = {self.engine.eos_token_id}
         if self.eos_id is not None:
@@ -769,6 +795,7 @@ class State:
 
         try:
             result.stats = dict(gen.stats if self.scheduler is not None else (self.engine.stats() or {}))
+            result._cache_lane = getattr(gen, 'lane', None)
         except Exception as e:  # engine stats must never break a response
             log.warning("engine.stats() failed: %s", e)
             result.stats = {}
@@ -1098,9 +1125,12 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": usage_dict(len(prompt_ids), result),
                     "x_engine_stats": result.stats,
                 })
+                self.wfile.flush()
+                st.cache_response(prompt_ids, result, thinking=thinking, vision=vl is not None)
                 return
 
             self._start_sse()
+            completed = False
             try:
                 self._sse(chunk({"role": "assistant", "content": ""}))
                 for kind, text in st.generate(prompt_ids, sampling, thinking=thinking, vl=vl,
@@ -1113,6 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
                 if include_usage:
                     self._sse({"id": rid, "object": "chat.completion.chunk", "created": created,
                                "model": st.model_name, "choices": [], **final_extra})
+                completed = True
             except APIError as e:
                 self._sse(e.body())
             except (BrokenPipeError, ConnectionResetError):
@@ -1124,6 +1155,8 @@ class Handler(BaseHTTPRequestHandler):
                                      "param": None, "code": None}})
             self._sse(b"[DONE]")
             self._end_sse()
+            if completed:
+                st.cache_response(prompt_ids, result, thinking=thinking, vision=vl is not None)
 
     def _completions(self, body: dict) -> None:
         st = self.state
@@ -1163,13 +1196,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, obj(result.router.content, result.finish_reason,
                                          {"usage": usage_dict(len(prompt_ids), result),
                                           "x_engine_stats": result.stats}))
+                self.wfile.flush()
+                st.cache_response(prompt_ids, result)
                 return
             self._start_sse()
+            completed = False
             try:
                 for _, text in st.generate(prompt_ids, sampling, thinking=False, detect_tool_calls=False, result=result):
                     self._sse(obj(text, None))
                 self._sse(obj("", result.finish_reason,
                               {"usage": usage_dict(len(prompt_ids), result), "x_engine_stats": result.stats}))
+                completed = True
             except APIError as e:
                 self._sse(e.body())
             except (BrokenPipeError, ConnectionResetError):
@@ -1181,6 +1218,8 @@ class Handler(BaseHTTPRequestHandler):
                                      "param": None, "code": None}})
             self._sse(b"[DONE]")
             self._end_sse()
+            if completed:
+                st.cache_response(prompt_ids, result)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,6 +1328,15 @@ def run_worker(engine) -> None:
                         raise RuntimeError(f'concurrent decode ranks diverged: {tags}')
                 except Exception:
                     log.exception('concurrent worker failed; pair is desynced, exiting')
+                    os._exit(1)
+                continue
+            if req.get('cmd') == 'cache_response':
+                try:
+                    if runtime is not None:
+                        raise RuntimeError('response cache command requires concurrency=1')
+                    engine.cache_response(req['prompt_ids'], req['response_ids'])
+                except Exception:
+                    log.exception('post-response prefix worker failed; exiting')
                     os._exit(1)
                 continue
             if req.get("cmd") == "maintain":

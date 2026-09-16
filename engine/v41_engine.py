@@ -895,6 +895,7 @@ class V41Engine:
                 # many per-layer collectives) this request issues. A rank that keeps a different
                 # number of snapshots can resume at a different boundary; keep it in the guard.
                 "prefix_snapshots": PREFIX_SNAPSHOTS,
+                "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1'),
                 "prefix_cache": os.environ.get('DSV41_PREFIX_CACHE', '1'),
                 "prefix_disk": PREFIX_DISK,
                 "prefix_disk_version": 1,
@@ -1125,6 +1126,66 @@ class V41Engine:
     def _save_prefix(self, prompt_ids, P: int) -> None:
         """Snapshot the exact encoder state at the prompt boundary before decode mutates it."""
         self._prefix_cache = self._snapshot_prefix(prompt_ids, P)
+
+    @torch.inference_mode()
+    def cache_response(self, prompt, response):
+        """Post-response encoder-only replay; caller owns the server/peer command lock.
+
+        Restore the INPUT boundary, not speculative decode state. Both ranks agree
+        on admission before any model collective. No sampling or adaptation here.
+        """
+        with self.lock:
+            base = self._prefix_cache
+            P, end = len(prompt), len(prompt) + len(response)
+            eligible = (os.environ.get('DSV41_PREFIX_RESPONSE', '1') == '1'
+                        and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'
+                        and self.swa_replay and not self.replica_slots and bool(response)
+                        and end + 8 <= self.max_context and self._images is None
+                        and base is not None and base['ids'] == tuple(prompt)
+                        and (self.prefix_disk is None or not self.prefix_disk.strict
+                             or base.get('route') == self._prefix_route))
+            if not all(self.ep.gather_objects(bool(eligible))):
+                return {'status': 'skipped'}
+            started = time.perf_counter()
+            ids_host = list(prompt) + list(response)
+            restored = self._try_restore(base, ids_host)
+            if not all(self.ep.gather_objects(restored == P)):
+                raise RuntimeError('response prefix restore disagrees across ranks')
+            ids = torch.tensor(ids_host, dtype=torch.long, device=self.device)
+            m = self.model
+            # Rebuild n-gram history, including n-grams crossing the input boundary.
+            hashes = m.hash_state(ids[None], 0)[0] if m.hash_state is not None else None
+            spans = self._prefill_spans(end, P)
+            ra = self._engram_readahead(ids, end, None, spans, hashes_t=hashes)
+            previous = getattr(m, '_prefix_replay_only', False)
+            m._prefix_replay_only = True
+            self._prefix_snapshots[P] = base  # retain input fallback if chat serialization changes
+            try:
+                with ra if ra is not None else nullcontext():
+                    for s, e in spans:
+                        kw = {'hashes': hashes[s:e]} if hashes is not None else {}
+                        if ra is not None:
+                            kw = {'hashes': ra.hashes_t[s:e], 'get_rows': ra.rows_for(s)}
+                        m.forward(ids[s:e], s, prefill=True, encoder_only=True,
+                                  need_logits=False, **kw)
+                        if ra is not None:
+                            ra.done(s)
+                        if e < end and PREFIX_SNAPSHOTS:
+                            self._prefix_snapshots[e] = self._snapshot_prefix(ids_host[:e], e)
+                        while len(self._prefix_snapshots) > max(1, PREFIX_SNAPSHOTS):
+                            oldest = min(n for n in self._prefix_snapshots if n != P)
+                            del self._prefix_snapshots[oldest]
+                self._save_prefix(ids_host, end)
+                if self.prefix_disk is not None:
+                    self.prefix_disk.save(ids_host)
+                torch.cuda.synchronize(self.device)
+            finally:
+                m._prefix_replay_only = previous
+            report = {'status': 'saved', 'input_tokens': P, 'response_tokens': len(response),
+                      'cached_tokens': end, 'seconds': round(time.perf_counter() - started, 4)}
+            self._prefix_response_last = report
+            log('prefix_response: ' + json.dumps(report))
+            return report
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
@@ -2169,6 +2230,8 @@ class V41Engine:
                                    os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
             "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
             "prefix_snapshots": PREFIX_SNAPSHOTS,
+            "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1') == '1',
+            "prefix_response_last": getattr(self, '_prefix_response_last', None),
             "prefix_disk": self.prefix_disk is not None,
             "prefix_disk_configured": PREFIX_DISK,
             "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,

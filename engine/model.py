@@ -833,6 +833,8 @@ class Model:
         `logits` is still UNMASKED here. Everything is fixed-shape (the decode path records from
         inside a captured CUDA graph) and stays on the GPU until a request ends.
         """
+        if getattr(self, '_prefix_replay_only', False):
+            return  # Cache preparation must not count the same request a second time.
         want = logits.topk(k, dim=-1)[1]                       # [T, k] an unpruned router's picks
         self.alloc_prune_miss(logits.size(-1), logits.device)
         flat = want.reshape(-1)

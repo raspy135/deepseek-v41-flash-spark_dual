@@ -145,6 +145,14 @@ class DecodeRuntime:
     def execute(self, action):
         """All actions, including close, must be issued identically on every rank."""
         op = action['op']
+        if op == 'cache_response':
+            if self.generators:
+                raise RuntimeError('response prefix preparation requires both lanes idle')
+            lane = self._activate(action['lane'])
+            # The lane may have been reused since HTTP delivery. cache_response
+            # agrees on matching input snapshots across ranks, otherwise skips.
+            lane.cache_response(action['prompt_ids'], action['response_ids'])
+            return None
         if op == 'start':
             index = action['lane']
             if index in self.generators:

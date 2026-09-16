@@ -14,6 +14,7 @@ class RequestStream:
         self.finished = threading.Event()
         self.stats = {}
         self.exhausted = False
+        self.lane = None
 
     def __iter__(self):
         return self
@@ -46,6 +47,7 @@ class Scheduler:
     def __init__(self, state, runtime):
         self.state, self.runtime = state, runtime
         self.pending = queue.Queue(maxsize=32)
+        self.cache_jobs = queue.Queue(maxsize=2)
         self.failure = None
         self.stopping = threading.Event()
         self.submission_lock = threading.Lock()
@@ -62,6 +64,27 @@ class Scheduler:
 
     def stop(self):
         self.stopping.set()
+
+    def cache_response(self, prompt, response, lane):
+        if lane not in (0, 1) or self.failure or self.stopping.is_set():
+            return
+        try:
+            self.cache_jobs.put_nowait({'op': 'cache_response', 'lane': lane,
+                                       'prompt_ids': list(prompt), 'response_ids': list(response)})
+        except queue.Full:
+            pass  # Optional work must never back-pressure response delivery.
+
+    def _idle_cache(self):
+        # Called only outside the active-request loop. Recheck priority under the
+        # GPU lock; another HTTP thread can enqueue a request while we acquire it.
+        with self.state.lock:
+            if not self.pending.empty() or self.stopping.is_set():
+                return
+            try:
+                action = self.cache_jobs.get_nowait()
+            except queue.Empty:
+                return
+            self._dispatch(action)
 
     def _dispatch(self, action):
         self.state.ep.broadcast_request({'cmd': 'schedule', 'action': action})
@@ -83,6 +106,7 @@ class Scheduler:
                 except queue.Empty:
                     if self.stopping.is_set():
                         return
+                    self._idle_cache()
                     continue
                 with self.state.lock:
                     waiting = [first]
@@ -100,6 +124,7 @@ class Scheduler:
                                 job.finish()
                                 continue
                             lane = next(i for i in range(2) if i not in active)
+                            job.lane = lane
                             active[lane] = job
                             event = self._dispatch({'op': 'start', 'lane': lane, **job.payload})
                             if event is not None and not isinstance(event, VerifyStep):

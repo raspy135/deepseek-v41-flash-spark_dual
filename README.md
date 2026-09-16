@@ -193,6 +193,7 @@ the complete prompt. Disk bundles survive requests and restarts.
 | `DSV41_PREFIX_DISK` | `1` | Save and restore prefixes on disk. |
 | `DSV41_PREFIX_DISK_GB` | `20` | Disk budget per node, with least-recently-used eviction. |
 | `DSV41_PREFIX_DISK_STRICT` | `0` | Reuse historical prefixes even after expert selection changes. Set `1` to require the same selection. |
+| `DSV41_PREFIX_RESPONSE` | `1` | Cache the generated answer after response delivery. Set `0` to disable; see limitations below. |
 
 The default directory is `results/prefix-cache/rank-N`; override its parent with
 `DSV41_PREFIX_DISK_DIR`. Both ranks must have a matching bundle. Code, model, and
@@ -202,6 +203,21 @@ Strict mode gives fewer hits but avoids reusing a prefix computed under a differ
 expert selection. Neither mode is a promise that every cached run is bitwise identical
 to a fresh run. Token IDs and KV data can reveal prompt contents: keep these files local
 and private. Vision requests currently bypass disk persistence.
+
+With `DSV41_PREFIX_RESPONSE=1`, successful plain-text responses are flushed to the
+client first, then the engine restores the input snapshot and prefills only the
+answer tokens. The extended prefix stays in memory and is saved to disk when disk
+caching is enabled. The next matching turn can skip the previous answer as well
+as the previous input. This shifts work into the gap between requests; it does not
+eliminate that work. An immediately arriving request can wait for preparation.
+
+Thinking, tool-call, vision, and stop-string-truncated responses are skipped.
+The next request must preserve the exact token prefix; edited history or different
+chat serialization can prevent a match. The original input boundary is retained
+as a fallback. Strict mode skips extension if adaptation changed the routing mask.
+At concurrency=2, optional preparation is queued until both lanes are idle, and
+already-queued inference requests take priority. Request timing excludes this work;
+the server logs it separately as `prefix_response`. Restart both nodes to enable it.
 
 ## API and diagnostics
 
@@ -266,6 +282,7 @@ sized separately.
 - [TP and persistent prefix implementation](docs/tp-and-persistent-prefix.md)
 - [Draft and embedding TP memory savings](docs/tp-memory.md)
 - [Packed KV storage and measurements](docs/packed-kv.md)
+- [Post-response prefix preparation](docs/response-prefix.md)
 - [Nesting regression: diagnosis, fix, and test results](docs/nesting-regression-tp.md)
 - [Performance experiments and known issues](docs/gotchas.md)
 - [API reference](server/README.md)
