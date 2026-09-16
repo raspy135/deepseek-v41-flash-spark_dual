@@ -57,6 +57,9 @@ LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 # Context-bucketed sparse-index scoring.  The fallback is intentionally retained for controlled
 # A/Bs and emergency rollback; it restores the old full-max-seq graph shapes exactly.
 INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
+# Experimental fork/join of the replicated shared expert and routed TP work.
+# Keep off until full-engine timings establish a gain, not just more GPU activity.
+SHARED_OVERLAP = os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1"
 
 
 # The verify block: one accepted token plus DSV41_BLOCK drafted ones. The checkpoint's DSpark head
@@ -116,6 +119,7 @@ class FastDecoder:
         self.W = model.W
         self.c = model.c
         self.use_graphs = use_graphs
+        self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
         a = self.a
         dev = self.dev
         T = T_VERIFY
@@ -399,9 +403,8 @@ class FastDecoder:
             self.rs_uniq[L] += self.rs_hits.sum()
         self._tap('moe_in', L, y); self._tap('route_idx', L, idx); self._tap('topk', L, self.topk)
 
-    def _layer_b(self, L):
+    def _routed_experts(self):
         a = self.a
-        w = self.W.layers[L]
         store = self.m.store
         if getattr(store, "null_slot", None) is not None:
             # EP2 (engine/dist.py). This path does NOT go through Model.moe, so the two things
@@ -424,8 +427,30 @@ class FastDecoder:
                 store.ep.combine(out)
         else:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
+        return out
+
+    def _layer_b(self, L):
+        a = self.a
+        w = self.W.layers[L]
+        if self.shared_stream is None:
+            out = self._routed_experts()
+            _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        else:
+            # Both branches read y; neither consumes the other's result. Fork AFTER
+            # y is ready and rejoin BEFORE residual update/next layer overwrites it.
+            # The explicit fork/join is also required inside CUDA graph capture.
+            main = torch.cuda.current_stream(self.dev)
+            self.shared_stream.wait_stream(main)
+            with torch.cuda.stream(self.shared_stream):
+                _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+            try:
+                out = self._routed_experts()
+            finally:
+                main.wait_stream(self.shared_stream)
+            # _sh is allocated on the side stream but consumed on main. Keep the
+            # allocator from recycling its storage before the addition completes.
+            _sh.record_stream(main)
         # shared expert is replicated and added AFTER the combine, so it is counted once
-        _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         out += _sh
         h = (_hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb) if _HC_OPS
              else R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb))

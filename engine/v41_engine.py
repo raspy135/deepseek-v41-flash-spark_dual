@@ -862,6 +862,7 @@ class V41Engine:
                 "hc_ops": bool(M_.HC_OPS),
                 "hc_fused": bool(M_.HC_FUSED),
                 "hc_mm_tile": R.HC_MM_TILE,
+                "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
                 "moe_fallback": self.kernel == "dequant-fallback",
                 "act_quant": bool(self.act_quant),
                 "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0"),
@@ -871,6 +872,8 @@ class V41Engine:
                 # rank that splits a gather its peer read whole reaches an all-reduce alone and
                 # hangs the pair until the process-group timeout.
                 "engram_row_split": os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0"),
+                "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0"),
+                "engram_native_threads": os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64"),
                 "engram_split_min": os.environ.get("DSV41_ENGRAM_SPLIT_MIN", "4096"),
                 # A rank that adapts at the prefill boundary while its peer does not ends up
                 # masking a different expert set, so the two replicated routers pick different
@@ -2239,6 +2242,9 @@ class V41Engine:
             "hc_ops": bool(M_.HC_OPS),
             "hc_fused": bool(M_.HC_FUSED),
             "hc_mm_tile": R.HC_MM_TILE,
+            "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
+            "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0") == "1",
+            "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
             "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
             "sim_cb2_frac": self.sim_cb2_frac,
@@ -2277,6 +2283,12 @@ class V41Engine:
         return {**self.config(), **self.last_stats}
 
     def close(self):
+        native = [t.native_gather for t in self.tables.values() if getattr(t, 'native_gather', None) is not None]
+        if native:
+            # No read future may enter the native context after it is destroyed.
+            self.eg_pool.shutdown(wait=True)
+            for gather in native:
+                gather.close()
         for pool in [self.store.pool, self.store.read_pool] + [t.pool for t in self.tables.values()]:
             try:
                 pool.shutdown(wait=False)

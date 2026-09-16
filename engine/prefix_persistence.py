@@ -24,7 +24,7 @@ def namespace(engine):
     # Test/benchmark edits alone should not discard a user's useful prompt history.
     excluded = ('test_', 'bench_', 'tune_', 'diag_', 'profile_')
     for directory in ('engine', 'tools'):
-        for path in sorted((root / directory).glob('*.py')):
+        for path in sorted(p for p in (root / directory).iterdir() if p.suffix in ('.py', '.cpp')):
             if not path.name.startswith(excluded):
                 h.update(path.relative_to(root).as_posix().encode())
                 h.update(path.read_bytes())

@@ -56,6 +56,14 @@ class EngramTable:
         self.gather_threads = int(os.environ.get("DSV41_ENGRAM_GATHER_THREADS", "64"))
         # Rows below which the gather stays on the calling thread (see _gather_rows).
         self.gather_min_parallel = int(os.environ.get("DSV41_ENGRAM_GATHER_MIN", "32"))
+        # Decode-sized gathers only; large prefill batches keep their existing path.
+        self.native_gather = None
+        if os.environ.get('DSV41_ENGRAM_NATIVE', '0') == '1':
+            if not self.mmap_rows:
+                raise ValueError('DSV41_ENGRAM_NATIVE requires the mmap row path')
+            from engine.engram_native import NativeGather
+            self.native_gather = NativeGather(self.w_mm, self.s_mm,
+                workers=int(os.environ.get('DSV41_ENGRAM_NATIVE_THREADS', '64')))
         # EP2 row split: both ranks hash the same tokens, so both were reading the SAME rows off
         # their own NVMe -- the work was duplicated, and it is the prefill bottleneck. With the
         # split each rank reads only `uniq % world == rank` into a zero-filled full array and one
@@ -112,6 +120,8 @@ class EngramTable:
         directly delays the chunk waiting on it. What paid was removing work: splitting the rows
         across ranks halved per-box volume and took prefill 509 -> 1045 tok/s.
         """
+        if self.native_gather is not None and len(ids) <= 384:
+            return self.native_gather.gather(ids)
         out = np.empty((len(ids), 264), np.uint8)
         nt = max(1, self.gather_threads)
         # Task size has to follow the row count. This was `max(1024, len(ids) // nt + 1)`, and the
