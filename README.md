@@ -221,11 +221,26 @@ the server logs it separately as `prefix_response`. Restart both nodes to enable
 
 ## API and diagnostics
 
+The server logs the first decoded output and ongoing decode progress every ten
+seconds as tokens arrive, for both streaming and non-streaming requests. Each
+line includes a request ID; progress shows thinking/answer phase, generated and
+reasoning token counts, elapsed time, and recent tokens/sec. Recent throughput
+excludes the initial prefill wait. These are CPU-side counters, not GPU profiling;
+they do not print prompt or answer text. No periodic updates appear while prefill
+or a stalled decode produces no tokens. This logging does not send client heartbeats
+or change HTTP timeouts.
+
 Use `http://<head>:8000/v1` as the OpenAI base URL and the name in
 `SERVED_MODEL_NAME` as the model. Thinking defaults to off; send
 `"enable_thinking": true` to enable it for a request. `DEFAULT_THINKING` and
 `DEFAULT_EFFORT` set server defaults. See [the API guide](server/README.md) for tools,
 streaming, and effort mappings.
+
+The default output budget is 131,072 tokens (128K), shared by thinking, answer text,
+and tool-call arguments. Override it per request with `max_completion_tokens` or
+`max_tokens` (the former takes precedence). The server clips it to remaining context
+space; this is a ceiling, not a target length. Long responses still require a suitable
+client timeout or streaming.
 
 There is no API authentication. Leave `HOST=127.0.0.1` for local access. For remote
 clients, bind a trusted interface or use an authenticated reverse proxy.

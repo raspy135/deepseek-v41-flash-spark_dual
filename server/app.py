@@ -41,13 +41,15 @@ for _p in (HERE, REPO_ROOT):
 
 from engine_api import Engine, MockEngine  # noqa: E402
 from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
+from server.progress import DecodeProgress  # noqa: E402
 
 log = logging.getLogger("dsv41.server")
 
 THINK_END = "</think>"
 EFFORT_ALIASES = {"low": 50, "medium": 60, "high": 75, "xhigh": 90, "max": 100}
 NO_THINKING_EFFORTS = {"none", "low"}
-DEFAULT_MAX_TOKENS = 4096
+# Shared thinking + answer + tool-call budget; clipped to remaining context per request.
+DEFAULT_MAX_TOKENS = 131072
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.95
 
@@ -733,6 +735,7 @@ class State:
         else:
             gen = self.engine.generate(prompt_ids, **gen_kwargs)
         hit_eos = False
+        progress = DecodeProgress(log, len(prompt_ids), max_tokens, thinking, self.think_end_id)
         try:
             for burst in gen:
                 burst = list(burst)
@@ -744,6 +747,7 @@ class State:
                 if len(burst) > room:
                     burst = burst[:room]
                 result.gen_ids.extend(burst)
+                progress.update(burst)
                 for ev in router.feed(detok.push(burst)):
                     yield ev
                 if hit_eos or router.stopped or len(result.gen_ids) >= max_tokens:
@@ -806,8 +810,9 @@ class State:
             result.stats["tool_grammar"] = st
         dt = time.perf_counter() - t0
         result.stats.setdefault("server_completion_tok_per_s", round(len(result.gen_ids) / dt, 1) if dt > 0 else None)
-        log.info("generation done: prompt=%d completion=%d reasoning=%d finish=%s %.2fs",
-                 len(prompt_ids), len(result.gen_ids), result.reasoning_tokens, result.finish_reason, dt)
+        log.info("generation done: request=%s prompt=%d completion=%d reasoning=%d finish=%s %.2fs",
+                 progress.request_id, len(prompt_ids), len(result.gen_ids), result.reasoning_tokens,
+                 result.finish_reason, dt)
         # The measured numbers used to live only in the response body (x_engine_stats), so watching
         # `docker logs` told you nothing about why a request was slow. This is the repo's own rule --
         # "a tok/s number without the hit rate and the GB that produced it is an anecdote" -- applied

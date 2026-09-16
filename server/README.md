@@ -36,7 +36,7 @@ or `<repo>/models/DeepSeek-V4.1-Flash`, first match wins.
 |---|---|
 | `GET /health` | `{"status":"ok","engine":..,"busy":bool,"max_context":..,"engine_config":{..}}`. `engine_config` is the v41 engine's static configuration -- `arena_gb`, `arena_slots`, `lru_slots`, `transient_slots`, `resident_expert_pct`, `max_seq`, `spec`, `trace_stats`, `kernel`, `act_quant` -- so a benchmark never has to be told what the server was started with. Absent for `--engine mock`. |
 | `GET /v1/models`, `GET /v1/models/{id}` | one model card |
-| `POST /v1/chat/completions` | `messages`, `tools`, `tool_choice` (`none` drops the schemas), `response_format` (`json_schema` is rendered into the system prompt), `stream`, `stream_options.include_usage`, `max_tokens`/`max_completion_tokens` (4096), `temperature` (1.0), `top_p` (0.95), `stop`, `seed`, `ignore_eos`, thinking controls below. `n>1`, images and `logprobs` are rejected with 400. |
+| `POST /v1/chat/completions` | `messages`, `tools`, `tool_choice` (`none` drops the schemas), `response_format` (`json_schema` is rendered into the system prompt), `stream`, `stream_options.include_usage`, `max_tokens`/`max_completion_tokens` (131072), `temperature` (1.0), `top_p` (0.95), `stop`, `seed`, `ignore_eos`, thinking controls below. `n>1`, images and `logprobs` are rejected with 400. |
 | `POST /v1/completions` | raw `prompt` (string, or a list of token ids). Strings get BOS prepended unless `"add_bos": false`. No thinking/tool parsing: the text comes back verbatim. Stream and non-stream. |
 | `POST /v1/debug/prompt` | same body as chat; returns the rendered prompt string, its token ids and the resolved thinking/effort. Handy for the engine author. |
 
