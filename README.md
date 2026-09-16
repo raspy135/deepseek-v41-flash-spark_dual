@@ -121,6 +121,7 @@ The main capacity and speed controls:
 | `DSV41_TP_EMBED=1` | Split input embedding columns across two ranks; saves 0.62 GiB per node. Adds one gather per lookup, without changing stored precision. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
+| `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
 | `DSV41_PREFILL_FUSED_ATTN=1` | Keep fused prefill attention enabled. |
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
@@ -202,7 +203,11 @@ numerical configuration changes can invalidate old entries.
 Strict mode gives fewer hits but avoids reusing a prefix computed under a different
 expert selection. Neither mode is a promise that every cached run is bitwise identical
 to a fresh run. Token IDs and KV data can reveal prompt contents: keep these files local
-and private. Vision requests currently bypass disk persistence.
+and private. Vision prefixes match both token IDs and fingerprints of the processed
+image pixels, layout, and position. Unchanged image history can be reused from RAM
+or disk; a changed image invalidates snapshots after its start, while earlier
+matching boundaries remain eligible. Image preprocessing still runs on each request,
+but cached image spans do not run through the vision tower or prefill again.
 
 With `DSV41_PREFIX_RESPONSE=1`, successful plain-text responses are flushed to the
 client first, then the engine restores the input snapshot and prefills only the

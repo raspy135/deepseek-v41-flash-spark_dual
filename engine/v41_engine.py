@@ -24,6 +24,7 @@ from engine import dist as DT  # noqa: E402
 from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
+from engine.prefix_media import image_fingerprints, media_prefix
 import v41_ref as R  # noqa: E402
 
 
@@ -860,6 +861,7 @@ class V41Engine:
                 "packed_kv": bool(M_.PACKED_KV),
                 "hc_ops": bool(M_.HC_OPS),
                 "hc_fused": bool(M_.HC_FUSED),
+                "hc_mm_tile": R.HC_MM_TILE,
                 "moe_fallback": self.kernel == "dequant-fallback",
                 "act_quant": bool(self.act_quant),
                 "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0"),
@@ -898,7 +900,7 @@ class V41Engine:
                 "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1'),
                 "prefix_cache": os.environ.get('DSV41_PREFIX_CACHE', '1'),
                 "prefix_disk": PREFIX_DISK,
-                "prefix_disk_version": 1,
+                "prefix_disk_version": 2,  # image-aware identity + request-level rank agreement
                 "prefix_disk_strict": os.environ.get("DSV41_PREFIX_DISK_STRICT", "0"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
@@ -1044,13 +1046,15 @@ class V41Engine:
     def _try_restore(self, pc, prompt: list[int]) -> int:
         """Restore one cached snapshot if it is a prefix of ``prompt``; return its length.
 
-        Token equality is deliberately the whole admission policy. On a mismatch nothing is
-        touched, so the caller can try a shorter snapshot instead of giving up. Vision bypasses
-        this path in ``_generate`` because placeholder-token equality says nothing about pixels.
+        Match tokens AND image inputs before touching state. Placeholder-token equality
+        alone says nothing about pixels. Never resume in the middle of an image span.
         """
         if (pc is None or getattr(self, "replica_slots", 0)
                 or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay
                 or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
+            return 0
+        media = media_prefix(getattr(self, '_prefix_media', ()), len(pc['ids']))
+        if media is None or tuple(pc.get('media', ())) != media:
             return 0
         disk = getattr(self, 'prefix_disk', None)
         if disk is not None and disk.strict and pc.get('route') != self._prefix_route:
@@ -1103,6 +1107,9 @@ class V41Engine:
         if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1"
                 or not self.swa_replay or P <= 0):
             return None
+        media = media_prefix(getattr(self, '_prefix_media', ()), P)
+        if media is None:
+            return None
         c, m = self.caches, self.model
         lo = max(0, P - self.args.window_size)
         slots = (m._positions[lo:P] % M_.RING).clone()
@@ -1114,6 +1121,7 @@ class V41Engine:
             # tensor back here forced a full-stream synchronisation at every cache miss and made
             # queued encoder work appear as a prefix-cache cost.
             "ids": tuple(prefix_ids),
+            "media": media,
             "route": getattr(self, '_prefix_route', ''),
             "slots": slots,
             "win": {L: c.win[L][slots].clone()
@@ -1216,15 +1224,30 @@ class V41Engine:
         P = len(prompt)
         assert P + max_tokens + 8 <= self.max_context, f"prompt {P} + max_tokens {max_tokens} > context {self.max_context}"
         ids = torch.tensor(prompt, dtype=torch.long, device=self.device)
-        has_vision = bool(getattr(self, "_images", None))
         _prefix_load_start = time.perf_counter()
-        prefix_start = 0 if has_vision else self._restore_prefix(prompt)
-        if (self.prefix_disk is not None and not has_vision and self.swa_replay
+        # Hash preprocessed pixels/layout once per request. Both ranks agree before
+        # any cached-state restore can change the sequence of model collectives.
+        media, media_error = (), None
+        try:
+            media = image_fingerprints(getattr(self, '_images', None),
+                                       getattr(self, '_token_types', None))
+        except Exception as exc:
+            media_error = type(exc).__name__
+        identities = self.ep.gather_objects((media_error, media))
+        if any(error for error, _ in identities) or any(item != identities[0] for item in identities):
+            raise RuntimeError('image prefix identity invalid or different across ranks')
+        self._prefix_media = media
+        prefix_start = self._restore_prefix(prompt)
+        if (self.prefix_disk is not None and self.swa_replay
                 and not self.replica_slots and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'):
             prefix_start = self.prefix_disk.restore(prompt, prefix_start)
+        else:
+            lengths = self.ep.gather_objects(prefix_start)
+            if any(n != lengths[0] for n in lengths):
+                prefix_start = 0
+                self._prefix_cache = None
+                self._prefix_snapshots.clear()
         _prefix_load_s = time.perf_counter() - _prefix_load_start
-        if has_vision:
-            self._prefix_cache = None
         t_start = time.perf_counter()
         # Every counter the stats epilogue reads is initialised here, because the epilogue runs in a
         # `finally`: the server closes the generator on a stop string or a client disconnect, which
@@ -1881,7 +1904,7 @@ class V41Engine:
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
                 self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
                 if (self.prefix_disk is not None and P > prefix_start
-                        and self._prefix_cache is not None and self._images is None):
+                        and self._prefix_cache is not None):
                     self.prefix_disk.save(host_ids if host_ids is not None else ids.tolist())
                 logits, mh, s_rep = m.decoder_replay(need_logits=True)
                 if self.spec:
@@ -2215,6 +2238,7 @@ class V41Engine:
             "packed_kv": bool(M_.PACKED_KV),
             "hc_ops": bool(M_.HC_OPS),
             "hc_fused": bool(M_.HC_FUSED),
+            "hc_mm_tile": R.HC_MM_TILE,
             "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
             "sim_cb2_frac": self.sim_cb2_frac,

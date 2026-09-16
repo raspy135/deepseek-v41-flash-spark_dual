@@ -19,14 +19,19 @@ import time
 import uuid
 
 import torch
+from engine.prefix_media import media_prefix
 
-VERSION = 1
+VERSION = 2
 
 
-def token_hashes(tokens, lengths):
+def token_hashes(tokens, lengths, media=()):
     wanted = set(lengths)
     h, result = hashlib.sha256(), {}
+    images = {start: (end, digest) for start, end, digest in media}
     for n, token in enumerate(tokens, 1):
+        if n - 1 in images:
+            end, digest = images[n - 1]
+            h.update(b'\x00image\x00' + struct.pack('<qq', n - 1, end) + digest.encode())
         h.update(struct.pack('<q', int(token)))
         if n in wanted:
             result[n] = h.hexdigest()
@@ -107,7 +112,7 @@ class PrefixDisk:
         if uuid.UUID(hex=bundle_id).hex != bundle_id:
             raise ValueError('invalid bundle ID')
         snapshots = payload['snapshots']
-        hashes = token_hashes(payload['ids'], snapshots)
+        hashes = token_hashes(payload['ids'], snapshots, payload.get('media', ()))
         fd, temporary = tempfile.mkstemp(prefix='.writing-', dir=self.root)
         destination = self.root / (bundle_id + '.pt')
         try:
@@ -137,16 +142,17 @@ class PrefixDisk:
         finally:
             Path(temporary).unlink(missing_ok=True)
 
-    def candidates(self, tokens, route=None):
+    def candidates(self, tokens, route=None, media=()):
         with self._db() as db:
             rows = db.execute('''SELECT p.bundle, p.n, p.hash, p.route FROM prefixes p
                 JOIN bundles b ON b.id=p.bundle WHERE b.namespace=? AND p.n<=?
                 ORDER BY p.n DESC, b.used DESC''', (self.namespace, len(tokens))).fetchall()
-        hashes = token_hashes(tokens, (row[1] for row in rows))
+        hashes = token_hashes(tokens, (row[1] for row in rows), media)
         return [(bid, n) for bid, n, digest, stored_route in rows
-                if hashes.get(n) == digest and (route is None or route == stored_route)]
+                if hashes.get(n) == digest and media_prefix(media, n) is not None
+                and (route is None or route == stored_route)]
 
-    def load(self, candidate, tokens):
+    def load(self, candidate, tokens, media=()):
         bid, n = candidate
         with self._db() as db:
             row = db.execute('SELECT checksum, size FROM bundles WHERE id=? AND namespace=?',
@@ -162,7 +168,10 @@ class PrefixDisk:
             if (payload['version'] != VERSION or payload['namespace'] != self.namespace
                     or payload['bundle_id'] != bid or n not in payload['snapshots']
                     or tuple(payload['ids'][:n]) != tuple(tokens[:n])
-                    or tuple(payload['snapshots'][n]['ids']) != tuple(tokens[:n])):
+                    or tuple(payload['snapshots'][n]['ids']) != tuple(tokens[:n])
+                    or media_prefix(media, n) is None
+                    or media_prefix(payload.get('media', ()), n) != media_prefix(media, n)
+                    or tuple(payload['snapshots'][n].get('media', ())) != media_prefix(media, n)):
                 return None
             with self._db() as db:
                 db.execute('UPDATE bundles SET used=? WHERE id=?', (time.time(), bid))

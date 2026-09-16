@@ -16,7 +16,7 @@ residual. With every routed expert resident (`--prune-keep`) the host step is a 
 whole layer could be one graph; that is left for later.
 
 Numerics vs `Model.forward`: operations whose CUDA implementation depends on the activation row
-count use the same fixed 16-row shape as the eager path.  This is required for speculative decode:
+count use the same fixed row shapes as the eager path (16, or 32 for HC by default). This is required for speculative decode:
 the verifier must produce the target model's logits, not merely a close approximation to them.
 `engine/test_fastdecode.py` measures the gap.
 """
@@ -215,7 +215,7 @@ class FastDecoder:
 
     def _hc_mixes(self, x, hc_fn, hc_scale, hc_base):
         # This projection is numerically load-bearing: an M=6 cuBLAS call does not reduce K in
-        # the same order as Model._hc_mixes' zero-padded M=16 call.  The resulting ~1e-4 change in
+        # the same order as Model._hc_mixes' fixed padded call. The resulting ~1e-4 change in
         # the 24 HC coefficients is first visible in the post-attention residual and grows until
         # router top-k choices differ.  Calling the model implementation also keeps the RMS
         # reduction and Sinkhorn path identical instead of maintaining a second approximation.

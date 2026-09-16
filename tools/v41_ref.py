@@ -450,6 +450,9 @@ class EngramWeights:
 
 # ----------------------------------------------------------------------------- ops
 MM_TILE = 0  # 0 = plain GEMMs. >0 = run every activation GEMM in fixed-size row tiles; see mm().
+HC_MM_TILE = int(os.environ.get("DSV41_HC_MM_TILE", "32"))
+if HC_MM_TILE not in (16, 32):
+    raise ValueError("DSV41_HC_MM_TILE must be 16 or 32")
 
 
 # --------------------------------------------------------------------------- the LM head's format
@@ -549,12 +552,21 @@ def mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     prefill and stay as one GEMM; splitting a 2048-row projection into 128 launches is both
     unnecessary for speculative correctness and substantially slower. Set MM_TILE from
     engine/model.py; 0 keeps plain behaviour for tools/expert_trace.py and the stored trace.
+    The small FP32 HC projection uses HC_MM_TILE (default 32) instead; both single-token
+    and speculative calls use that same shape. See docs/decode-fp32-experiments.md.
     """
     if hasattr(w, 'tp_linear'):
         return w.tp_linear(x)
     if (FP8Weight is not None and isinstance(w, FP8Weight)) or (FP4Weight is not None and isinstance(w, FP4Weight)):
         return dense(x, w)  # quantized-weight kernel; row-invariant by construction, not row-tiled
     B = MM_TILE
+    # HC's 24x20480 FP32 projection underutilizes GB10 at M=16. M=32 selects
+    # a faster full-FP32 cuBLAS algorithm, but changes summation order. Always
+    # use the same padded shape for single-token and speculative decode.
+    # Larger prefill calls, router precision and all other projections stay unchanged.
+    if (B > 0 and x.ndim == 2 and x.size(0) <= B and w.dtype == torch.float32
+            and tuple(w.shape) == (24, 20480)):
+        B = HC_MM_TILE
     if B <= 0 or x.ndim != 2 or x.size(0) >= B:
         return F.linear(x, w)
     m = x.size(0)

@@ -671,6 +671,8 @@ def moe_forward(
         torch.distributed.all_gather_into_tensor(gathered_h, h)
         h = gathered_h.view(arena.tp_world, P, inter).transpose(0, 1).reshape(P, INTER)
         down_k = INTER
+    if stage_mark is not None:
+        stage_mark('intermediate_gather')
     _moe_down_kernel[(NB, down_n // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
@@ -686,6 +688,8 @@ def moe_forward(
         gathered = torch.empty((arena.tp_world * T, down_n), dtype=out_dtype, device=dev)
         torch.distributed.all_gather_into_tensor(gathered, local)
         result = gathered.view(arena.tp_world, T, down_n).transpose(0, 1).reshape(T, DIM)
+        if stage_mark is not None:
+            stage_mark('output_reduce_gather')
     elif tp:
         # Reconstruct EACH expert before its BF16 rounding boundary. Summing the
         # rank-local routed totals would move that boundary and resurrect a quality bug.

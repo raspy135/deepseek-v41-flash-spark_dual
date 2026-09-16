@@ -42,7 +42,10 @@ weights are not replaced while preserving all file metadata.
 Default 0 follows the existing RAM cache's historical-prefix semantics: a cached
 prefix is not recomputed merely because adaptation changed the resident experts.
 That is NOT equivalent to fresh computation under the new mask. Strict and historical
-caches occupy separate compatibility namespaces. Vision requests bypass persistence.
+caches occupy separate compatibility namespaces. Vision prefixes also fingerprint the
+processed pixels, image layout, and position; unchanged images can be restored from
+RAM or disk. Changed images reject snapshots after their start. Boundaries inside
+image spans are never eligible. See [vision prefix caching](vision-prefix.md).
 
 Initial GPU trial (before Engram-history repair): 7,696 tokens, 61,450,719-byte bundle,
 0.58 s staging, 0.11 s background write, 0.10 s restore. Immediate full replay matched;

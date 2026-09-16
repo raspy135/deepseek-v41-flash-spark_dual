@@ -14,11 +14,12 @@ import uuid
 import torch
 
 from engine.prefix_disk import PrefixDisk, cpu_tree, device_tree
+from engine.prefix_media import media_prefix
 
 
 def namespace(engine):
     root = Path(__file__).resolve().parent.parent
-    h = hashlib.sha256(b'prefix-persistence-v1')
+    h = hashlib.sha256(b'prefix-persistence-v2')
     # Include auxiliary attention/HC/Engram kernels, not just the top-level model.
     # Test/benchmark edits alone should not discard a user's useful prompt history.
     excluded = ('test_', 'bench_', 'tune_', 'diag_', 'profile_')
@@ -85,7 +86,7 @@ class PersistentPrefixes:
 
     def save(self, prompt):
         e = self.engine
-        # Called unconditionally at the text prompt boundary on both ranks. Each rank
+        # Called unconditionally at the prompt boundary on both ranks. Each rank
         # owns its local file; the UUID identifies the *same* computation on both nodes.
         bid = e.ep.broadcast_obj(uuid.uuid4().hex if e.ep.rank == 0 else None)
         self.join()
@@ -94,10 +95,12 @@ class PersistentPrefixes:
             snapshots = dict(e._prefix_snapshots)
             snapshots[len(prompt)] = e._prefix_cache
             snapshots = {n: s for n, s in snapshots.items() if s is not None
-                         and n <= len(prompt) and tuple(prompt[:n]) == s['ids']}
+                         and n <= len(prompt) and tuple(prompt[:n]) == s['ids']
+                         and tuple(s.get('media', ())) == media_prefix(getattr(e, '_prefix_media', ()), n)}
             c = e.caches
             payload = cpu_tree({
                 'ids': tuple(prompt), 'snapshots': snapshots,
+                'media': getattr(e, '_prefix_media', ()),
                 'ckv': {L: value[:len(prompt) // e.args.compress_ratios[L]]
                         for L, value in c.ckv.items()},
                 'ik': {L: value[:len(prompt) // e.args.compress_ratios[L]]
@@ -119,7 +122,8 @@ class PersistentPrefixes:
         self.join()
         self.stats = {'source': 'memory' if memory_n else 'miss', 'tokens': memory_n}
         try:
-            candidates = self.disk.candidates(prompt, e._prefix_route if self.strict else None)
+            candidates = self.disk.candidates(prompt, e._prefix_route if self.strict else None,
+                                              getattr(e, '_prefix_media', ()))
         except Exception as exc:
             self.log(f'prefix disk lookup failed ({type(exc).__name__}); treating as miss')
             candidates = []
@@ -148,7 +152,7 @@ class PersistentPrefixes:
             return n
         payload = None
         try:
-            payload = self.disk.load(choice, prompt)
+            payload = self.disk.load(choice, prompt, getattr(e, '_prefix_media', ()))
             if payload is not None:
                 self.validate(payload, n)
         except Exception as exc:
