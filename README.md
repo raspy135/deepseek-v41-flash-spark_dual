@@ -224,48 +224,29 @@ At concurrency=2, optional preparation is queued until both lanes are idle, and
 already-queued inference requests take priority. Request timing excludes this work;
 the server logs it separately as `prefix_response`. Restart both nodes to enable it.
 
-## API and diagnostics
-
-The server logs the first decoded output and ongoing decode progress every ten
-seconds as tokens arrive, for both streaming and non-streaming requests. Each
-line includes a request ID; progress shows thinking/answer phase, generated and
-reasoning token counts, elapsed time, and recent tokens/sec. Recent throughput
-excludes the initial prefill wait. These are CPU-side counters, not GPU profiling;
-they do not print prompt or answer text. No periodic updates appear while prefill
-or a stalled decode produces no tokens. This logging does not send client heartbeats
-or change HTTP timeouts.
-
-Use `http://<head>:8000/v1` as the OpenAI base URL and the name in
-`SERVED_MODEL_NAME` as the model. Thinking defaults to off; send
-`"enable_thinking": true` to enable it for a request. `DEFAULT_THINKING` and
-`DEFAULT_EFFORT` set server defaults. See [the API guide](server/README.md) for tools,
-streaming, and effort mappings.
-
-The default output budget is 131,072 tokens (128K), shared by thinking, answer text,
-and tool-call arguments. Override it per request with `max_completion_tokens` or
-`max_tokens` (the former takes precedence). The server clips it to remaining context
-space; this is a ceiling, not a target length. Long responses still require a suitable
-client timeout or streaming.
-
-There is no API authentication. Leave `HOST=127.0.0.1` for local access. For remote
-clients, bind a trusted interface or use an authenticated reverse proxy.
-
-Completions include `x_engine_stats`: prefill/decode rates, prefix hits, draft acceptance,
-and pruning misses. Compare uncached prefill with uncached prefill; a cache-hit rate
-is not the speed of processing new tokens.
-
-For a reproducible input capture, start with `DSV41_CAPTURE_NEXT=1`. The next request
-is saved to `results/captured_request.pt`, then capture disarms. It overwrites that
-filename and includes recoverable prompt data, so use it deliberately and do not commit it.
-Leave detailed timing and route-stat instrumentation off for normal serving.
-
 ## Measurements and limitations
 
 The corrected TP path passed nesting depths 4/6/8/10 twice through the live API with
 speculation and adaptation enabled. The second pass restored prefixes from disk.
 That is a regression check, not a general quality guarantee.
 
-On the development pair, a 7,709-token README prompt with no prefix reuse measured:
+Current bench suite (`bench/bench.py`, fixed output length, warm-up plus three
+measured runs, medians). Configuration: TP2, native FP4, 90 GB arena per node,
+keep 0.61, packed KV, `DSV41_BLOCK=3`, shared-expert overlap and native Engram
+gather enabled:
+
+| workload | prompt tokens | output tokens | prefill tok/s | decode tok/s | accept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code | 62 | 512 | — | 26.3 | 3.10 |
+| random 8K | 8,180 | 512 | 502 | 21.7 | 2.63 |
+| prose | 45 | 512 | — | 16.0 | 1.94 |
+
+The 8K prompt is fresh per run, so that prefill is uncached; the short prompts are
+mostly fixed overhead. Acceptance varies on random text, so these are medians of a
+wide spread.
+
+On the development pair, an earlier 7,709-token README prompt with no prefix reuse
+(before the shared-expert overlap and native Engram gather) measured:
 
 | Run | Prefill tok/s | Decode tok/s |
 | --- | ---: | ---: |
