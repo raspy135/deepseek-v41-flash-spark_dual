@@ -294,15 +294,20 @@ class FastDecoder:
                 k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
                 c.ik[L][jidx] = self._rope(k, fj)
             ckv = self._rope(latent, fj)
-            if M.KV_CACHE_QDQ:
-                ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
-            c.ckv[L][jidx] = ckv
+            if M.PACKED_KV:
+                from engine.packed_kv import write
+                write(c.ckv[L], ckv.contiguous(), jidx)
+            else:
+                if M.KV_CACHE_QDQ:
+                    ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
+                c.ckv[L][jidx] = ckv
             st["ckv"], st["ik"], st["ratio"] = c.ckv[L], c.ik[L], r
         compress_lens = (pos + 1) // r
         if L in self.W.indexers:
             self.topk.copy_(self._indexer(x, qr, L, pos, compress_lens, st))
         idx = self.topk
-        rows = st["ckv"][idx.clamp_min(0)]
+        from engine.packed_kv import gather
+        rows = gather(st["ckv"], idx.clamp_min(0))
         return rows, idx >= 0
 
     def _indexer(self, x, qr, L, pos, compress_lens, st):
@@ -464,11 +469,8 @@ class FastDecoder:
             wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
             slots = (idx.to(torch.int32) + k * 128)
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
-            # NOT all-reduced: MTPWeights loads its own shared experts (engine/model.py) and
-            # _tp_shard never touches them. The DSpark drafter is deliberately not EP-parallel --
-            # it has its own FixedStore arena -- and sharding it would put a collective on a path
-            # that runs five times per step to save 3 blocks' worth of weights. All-reducing an
-            # UNSHARDED output would simply double it.
+            # TP draft arenas gather complete outputs inside moe_fn. Shared experts remain
+            # replicated: another collective here would double their contribution.
             out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
             h = (_hc_post_fused(out.to(torch.bfloat16), residual, ffn_post, ffn_comb) if _HC_OPS
                  else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))

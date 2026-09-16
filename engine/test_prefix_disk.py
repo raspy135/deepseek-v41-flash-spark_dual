@@ -131,6 +131,18 @@ class PrefixDiskTests(unittest.TestCase):
         self.assertEqual(p.restore([1, 2, 3, 4], 0), 0)
         self.assertEqual(p.engine.caches.ckv[0].count_nonzero(), 0)
 
+    def test_packed_words_round_trip_and_bf16_rejected(self):
+        value = payload()
+        value['ckv'][0] = torch.randint(-(2**62), 2**62, (3, 36), dtype=torch.int64)
+        self.save(value)
+        p = self.adapter()
+        self.assertEqual(p.restore([1, 2, 3, 4, 99], 0), 0)
+        p.engine.caches.ckv[0] = torch.zeros(10, 36, dtype=torch.int64)
+        before = p.engine.caches.ckv[0].data_ptr()
+        self.assertEqual(p.restore([1, 2, 3, 4, 99], 0), 4)
+        self.assertEqual(p.engine.caches.ckv[0].data_ptr(), before)
+        self.assertTrue(torch.equal(p.engine.caches.ckv[0][:2], value['ckv'][0][:2]))
+
     def test_invalid_shape_rejected_before_gpu_state_changes(self):
         value = payload()
         value['ckv'][0] = torch.ones(3, 3, dtype=torch.bfloat16)

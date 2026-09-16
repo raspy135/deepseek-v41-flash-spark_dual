@@ -559,6 +559,11 @@ class V41Engine:
         # the same unified pool, and an arena sized around a not-yet-created PG overcounts what
         # is left (the keep_free floor then quietly eats itself).
         self.ep = DT.EPDistributed(rank, world_size)
+        self.tp_draft_experts = os.environ.get('DSV41_TP_DRAFT_EXPERTS', '0') == '1'
+        if self.tp_draft_experts and (not self.ep.tensor_parallel
+                or self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
+                or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
+            raise ValueError('draft TP requires native FP4 TP2 with output layout')
         if self.ep.tensor_parallel:
             if (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
                     or os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
@@ -593,7 +598,10 @@ class V41Engine:
                 f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated after weights")
         self.caches = Caches(self.args, max_seq, device)
         # DSpark experts: all resident
-        self.W.dspark_arena = arena_cls(384, device)
+        self.W.dspark_arena = (fp4_arena_cls(384, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
+                              if self.tp_draft_experts else arena_cls(384, device))
+        if self.tp_draft_experts:
+            log('DSpark experts: TP output shards; shared experts remain replicated')
         self.W.dspark_store = FixedStore(self.W.dspark_arena)
         # main expert arena: size from what is left.
         # On GB10 the GPU and the host share one pool, and `torch.cuda.mem_get_info()` counts the
@@ -821,7 +829,9 @@ class V41Engine:
             # partial where its peer computes a whole, and the first all-reduce then sums
             # mismatched tensors -- no error, just wrong numbers. Checked here because a boot-time
             # refusal is the only cheap moment; at runtime it is invisible without a validator.
+            from engine.fastdecode import T_DRAFT
             cfg = {
+                "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
                 "tp_experts": self.ep.tensor_parallel,
@@ -831,6 +841,8 @@ class V41Engine:
                 "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
                 "tp_attention": os.environ.get('DSV41_TP_ATTN', '0'),
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
+                "tp_embed": os.environ.get('DSV41_TP_EMBED', '0'),
+                "tp_draft_experts": self.tp_draft_experts,
                 "tp_dense_rounding_version": 2,
                 "prune_keep": float(prune_keep or 0.0),
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
@@ -845,6 +857,7 @@ class V41Engine:
                 "head_fmt": R.head_fmt(),
                 "fp4_dot_scaled": self.fp4_dot_scaled,
                 "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
+                "packed_kv": bool(M_.PACKED_KV),
                 "hc_ops": bool(M_.HC_OPS),
                 "hc_fused": bool(M_.HC_FUSED),
                 "moe_fallback": self.kernel == "dequant-fallback",
@@ -2005,7 +2018,9 @@ class V41Engine:
                 a = 0
                 new = []
                 bonus = None
-                for i in range(5):
+                # DSV41_BLOCK can differ from the checkpoint's default five.
+                # Use the actual draft tensor for both fast and eager paths.
+                for i in range(len(drafts)):
                     pt = sample_probs(logits[i], temperature, top_p)
                     d = int(drafts[i])
                     if temperature <= 0:
@@ -2028,7 +2043,7 @@ class V41Engine:
                             bonus = int(torch.multinomial(resid / resid.sum(), 1))
                         break
                 if bonus is None and not (new and new[-1] in stop_ids):
-                    pt = sample_probs(logits[a] if a < 5 else logits[5], temperature, top_p)
+                    pt = sample_probs(logits[a], temperature, top_p)
                     bonus = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
                 if _ev_sample is not None:
                     _ev_sample.record()
@@ -2124,6 +2139,8 @@ class V41Engine:
             "tp_dense": "on" if R.tp_dense()[1] > 1 else "off",
             "tp_attention": os.environ.get('DSV41_TP_ATTN', '0') == '1',
             "tp_head": os.environ.get('DSV41_TP_HEAD', '0') == '1',
+            "tp_embed": os.environ.get('DSV41_TP_EMBED', '0') == '1',
+            "tp_draft_experts": self.tp_draft_experts,
             "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
             "tp_expert_layout": os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output'),
             "tp_linear_layout": os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output'),
@@ -2134,6 +2151,7 @@ class V41Engine:
             "head_fmt": R.head_fmt(),
             "fp4_dot_scaled": self.fp4_dot_scaled,
             "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
+            "packed_kv": bool(M_.PACKED_KV),
             "hc_ops": bool(M_.HC_OPS),
             "hc_fused": bool(M_.HC_FUSED),
             "moe_fallback": self.kernel == "dequant-fallback",

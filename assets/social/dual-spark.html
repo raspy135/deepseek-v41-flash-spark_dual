@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek V4.1 on two Sparks</title>
+<style>
+  :root { color-scheme: light; --paper: #f2f1eb; --ink: #20241f; --quiet: #666b62; --line: #cecec4; --green: #b7df54; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); }
+  body { font-family: Arial, Helvetica, sans-serif; }
+  /* Fixed 1600 × 900 artwork, scaled to the browser without changing its composition. */
+  .viewport { width: 100%; overflow: hidden; }
+  .poster { width: 1600px; height: 900px; padding: 64px 76px 48px; transform-origin: top left; color: var(--ink); background: var(--paper); position: relative; }
+  header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--ink); padding-bottom: 27px; }
+  .eyebrow { font: 19px/1.2 'Courier New', monospace; text-transform: uppercase; letter-spacing: 1.4px; }
+  .tag { display: flex; align-items: center; gap: 12px; font-size: 20px; }
+  .tag i { width: 12px; height: 12px; background: var(--ink); display: block; }
+  main { display: grid; grid-template-columns: 850px 1fr; gap: 40px; padding-top: 66px; }
+  h1 { margin: 0; font-size: 96px; line-height: 1.06; letter-spacing: -5.5px; font-weight: 600; }
+  h1 span { display: block; color: var(--quiet); font-size: 82px; letter-spacing: -4px; margin-top: 5px; }
+  .capabilities { display: grid; grid-template-columns: 390px 350px; gap: 16px; margin-top: 34px; }
+  .capability { padding: 17px 21px 18px; border: 1px solid var(--ink); }
+  .capability.native { background: var(--green); border-color: var(--green); }
+  .capability strong { display: block; font-size: 36px; line-height: 1.1; letter-spacing: -1.2px; font-weight: 600; }
+  .capability span { display: block; margin-top: 8px; font: 16px/1.2 'Courier New', monospace; letter-spacing: .5px; text-transform: uppercase; }
+  .feature { margin-top: 35px; }
+  .feature-label { display: inline-block; font: 16px/1.2 'Courier New', monospace; letter-spacing: .5px; color: var(--quiet); }
+  h2 { font-size: 52px; line-height: 1.06; letter-spacing: -2px; font-weight: 500; margin: 12px 0 13px; }
+  .description { font-size: 23px; line-height: 1.35; margin: 0; color: var(--quiet); }
+  .diagram { padding-top: 8px; }
+  .diagram-heading { display: flex; justify-content: space-between; align-items: center; font: 16px/1.2 'Courier New', monospace; letter-spacing: .5px; margin-bottom: 24px; color: var(--quiet); }
+  .status { display: flex; gap: 8px; align-items: center; }
+  .status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--ink); }
+  .node { border: 1.5px solid var(--ink); padding: 22px 24px 21px; background: #e9e9e0; }
+  .node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .node-name { font-size: 20px; font-weight: 600; letter-spacing: -.4px; }
+  .node-index { font: 15px/1 'Courier New', monospace; color: var(--quiet); }
+  .experts { display: grid; grid-template-columns: repeat(10, 1fr); gap: 5px; }
+  .expert { height: 22px; background: #d2d4c9; display: flex; }
+  .expert::before, .expert::after { content: ''; width: 50%; }
+  .node-a .expert.selected::before, .node-b .expert.selected::after { background: var(--green); }
+  .node-a .expert.selected::after, .node-b .expert.selected::before { background: #42483b; }
+  .node-footer { margin-top: 18px; display: flex; align-items: center; justify-content: space-between; }
+  .vents { display: flex; gap: 4px; }
+  .vents i { display: block; width: 17px; height: 3px; background: #8a8f80; }
+  .power { width: 7px; height: 7px; border: 1px solid #626956; border-radius: 50%; }
+  .interconnect { display: flex; align-items: center; justify-content: center; height: 68px; gap: 14px; color: var(--quiet); font: 14px/1 'Courier New', monospace; }
+  .wire { height: 68px; width: 1px; background: var(--ink); position: relative; }
+  .wire::after { content: ''; position: absolute; top: 31px; left: -3px; width: 7px; height: 7px; border-radius: 50%; background: var(--ink); }
+  .legend { display: flex; gap: 10px; align-items: center; font-size: 17px; color: var(--quiet); margin-top: 22px; }
+  .legend-mark { width: 24px; height: 12px; background: var(--green); }
+  footer { position: absolute; left: 76px; right: 76px; bottom: 45px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); padding-top: 23px; }
+  .footer-copy { font-size: 19px; color: var(--quiet); letter-spacing: -.2px; }
+  .footer-copy span { padding: 0 15px; color: #95998d; }
+  .footer-label { font: 16px/1 'Courier New', monospace; letter-spacing: 1px; }
+  @media print { @page { size: 1600px 900px; margin: 0; } .poster { transform: none !important; } }
+</style>
+</head>
+<body>
+<div class="viewport">
+<article class="poster" aria-label="DeepSeek V4.1 on two DGX Sparks: native MXFP4 checkpoint, vision enabled, tensor parallelism and adaptive expert loading">
+  <header>
+    <div class="eyebrow">Local inference / Dual DGX Spark</div>
+    <div class="tag"><i aria-hidden="true"></i>Text + image inference</div>
+  </header>
+  <main>
+    <section>
+      <h1>DeepSeek V4.1<span>on two Sparks.</span></h1>
+      <div class="capabilities">
+        <div class="capability native"><strong>Native MXFP4</strong><span>Original checkpoint</span></div>
+        <div class="capability"><strong>Vision enabled</strong><span>Text + image input</span></div>
+      </div>
+      <div class="feature">
+        <div class="feature-label">WEIGHTS FOLLOW DEMAND</div>
+        <h2>Adaptive<br>expert loading.</h2>
+        <p class="description">Resident experts change with your workload.</p>
+      </div>
+    </section>
+    <section class="diagram" aria-label="Schematic: both nodes hold complementary halves of the same selected experts. Green indicates the local weight shard, not a measured occupancy percentage.">
+      <div class="diagram-heading"><span>ONE MODEL / TWO NODES</span><span class="status">TP = 2</span></div>
+      <div class="node node-a">
+        <div class="node-header"><span class="node-name">DGX Spark</span><span class="node-index">NODE 01</span></div>
+        <div class="experts" aria-hidden="true"></div>
+        <div class="node-footer" aria-hidden="true"><div class="vents"><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="power"></div></div>
+      </div>
+      <div class="interconnect" aria-hidden="true"><span class="wire"></span><span>SHARED WORK</span><span class="wire"></span></div>
+      <div class="node node-b">
+        <div class="node-header"><span class="node-name">DGX Spark</span><span class="node-index">NODE 02</span></div>
+        <div class="experts" aria-hidden="true"></div>
+        <div class="node-footer" aria-hidden="true"><div class="vents"><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="power"></div></div>
+      </div>
+      <div class="legend"><span class="legend-mark" aria-hidden="true"></span>Same expert set. Split across both nodes.</div>
+    </section>
+  </main>
+  <footer>
+    <div class="footer-copy">Tensor parallelism<span>/</span>Persistent prefix cache</div>
+    <div class="footer-label">PYTORCH / TRITON</div>
+  </footer>
+</article>
+</div>
+<script>
+  // Illustrative selection only; both nodes use the same pattern.
+  const selected = new Set([0,1,3,4,5,8,10,12,13,14,17,18,19,20,21,24,25,27,29]);
+  document.querySelectorAll('.experts').forEach(grid => {
+    for (let i = 0; i < 30; i++) {
+      const tile = document.createElement('span');
+      tile.className = 'expert' + (selected.has(i) ? ' selected' : '');
+      grid.append(tile);
+    }
+  });
+  function fit() {
+    const scale = Math.min(1, window.innerWidth / 1600);
+    document.querySelector('.poster').style.transform = `scale(${scale})`;
+    document.querySelector('.viewport').style.height = `${900 * scale}px`;
+  }
+  fit();
+  window.addEventListener('resize', fit);
+</script>
+</body>
+</html>

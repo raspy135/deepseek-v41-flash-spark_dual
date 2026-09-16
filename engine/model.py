@@ -54,6 +54,7 @@ SCORE_DTYPE = (torch.bfloat16 if os.environ.get("DSV41_INDEX_SCORE_BF16", "1") =
 # Window KV deliberately stays BF16: the previous act_qdq_fp8 call was an identity under
 # act_quant=False, so it did not establish FP8-cache parity in serving. Do not claim otherwise.
 KV_CACHE_QDQ = os.environ.get("DSV41_KV_CACHE_QDQ", "1") != "0"
+PACKED_KV = os.environ.get("DSV41_PACKED_KV", "0") == "1"
 # Stream the prefill indexer's score buffer one query tile at a time (Model._indexer_stream)
 # instead of materializing the whole [chunk, context] matrix. The score never feeds arithmetic --
 # it is masked_fill -> block amax -> topk -- and the query axis is independent, so the same einsum
@@ -235,7 +236,15 @@ class Weights:
             return handles[f].get_tensor(name)
 
         t0 = time.time()
-        self.embed = get("embed.weight").to(device).to(torch.bfloat16)
+        if os.environ.get('DSV41_TP_EMBED', '0') == '1':
+            from engine.tensor_parallel import FeatureParallelEmbedding, shard
+            rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
+            if world != 2 or not 0 <= rank < world:
+                raise ValueError('embedding TP requires two ranks')
+            self.embed = FeatureParallelEmbedding(
+                shard(get('embed.weight'), 1, rank, world).to(device).to(torch.bfloat16), world)
+        else:
+            self.embed = get("embed.weight").to(device).to(torch.bfloat16)
         # bf16 (the stored dtype) unless DSV41_HEAD_FP32=1. The reference keeps the LM head in fp32
         # ("so the logits come out in fp32 directly"); the fast decode path already ran a bf16 copy
         # (fp32 accumulate, logits rounded to bf16), so with a bf16 head here the two paths use the
@@ -350,10 +359,14 @@ class Caches:
         self.ckv = {}
         self.ik = {}
         self.pending = {}  # ratio-2 sources: (kv fp32 [512], score fp32 [512]) of an unpaired position, or None
+        if PACKED_KV and (not KV_CACHE_QDQ or d % 128):
+            raise ValueError('packed KV requires FP4 QDQ and head_dim divisible by 128')
         for L in args.kv_source_layers:
             r = args.compress_ratios[L]
             n = max_seq // r + 1
-            self.ckv[L] = torch.zeros(n, d, dtype=torch.bfloat16, device=device)
+            self.ckv[L] = torch.zeros(n, d * 9 // 128 if PACKED_KV else d,
+                                     dtype=torch.int64 if PACKED_KV else torch.bfloat16,
+                                     device=device)
             self.ik[L] = torch.zeros(n, args.index_head_dim, dtype=torch.bfloat16, device=device)
             self.pending[L] = None
         self.len = 0  # number of valid positions
@@ -543,7 +556,9 @@ class Model:
             compact_mask = torch.arange(S + T, device=self.dev)[None, :] <= pos[:, None]
             if w.ratio:
                 n_c = (S + T) // w.ratio
-                compact_kv = torch.cat([compact_kv, sh.ckv[:n_c]], dim=0)
+                from engine.packed_kv import gather
+                compact_kv = torch.cat([compact_kv, gather(
+                    sh.ckv, torch.arange(n_c, device=self.dev))], dim=0)
                 compact_mask = torch.cat([
                     compact_mask,
                     torch.arange(n_c, device=self.dev)[None, :] <
@@ -654,10 +669,18 @@ class Model:
                     k = torch.cat([k[:, :-rd], R.apply_rotary(k[:, -rd:], fj)], dim=-1)
                     c.ik[L][j0:j0 + nj] = k
                 lat = torch.cat([latent[:, :-rd], R.apply_rotary(latent[:, -rd:], fj)], dim=-1)
-                if KV_CACHE_QDQ:
-                    lat = R.fp4_qdq(lat, 16, "e4m3", self.fp4_grid)
-                c.ckv[L][j0:j0 + nj] = lat
-                self._tap("latent", L, (j0, lat))
+                if PACKED_KV:
+                    from engine.packed_kv import write
+                    write(c.ckv[L], lat.contiguous(), j0)
+                else:
+                    if KV_CACHE_QDQ:
+                        lat = R.fp4_qdq(lat, 16, "e4m3", self.fp4_grid)
+                    c.ckv[L][j0:j0 + nj] = lat
+                if self.tap is not None:
+                    if PACKED_KV:
+                        from engine.packed_kv import gather
+                        lat = gather(c.ckv[L], torch.arange(j0, j0 + nj, device=self.dev))
+                    self._tap("latent", L, (j0, lat))
             sh.ckv, sh.ik, sh.ratio = c.ckv[L], c.ik[L], r
         assert sh.ratio == r, (L, sh.ratio, r)
         compress_lens = (pos + 1) // r  # visible compressed positions per query
@@ -666,7 +689,8 @@ class Model:
             sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
         idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
         self._tap("topk", L, idx); self._tap("n_c", L, n_c)
-        rows = sh.ckv[idx.clamp_min(0)]
+        from engine.packed_kv import gather
+        rows = gather(sh.ckv, idx.clamp_min(0))
         return rows, idx >= 0
 
     def _indexer(self, x, qr, L, pos, compress_lens, n_c, sh: Shared):

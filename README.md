@@ -6,7 +6,7 @@ loading, and persistent prefix caches. Routed experts use the checkpoint's nativ
 MXFP4 weights, without another quantization step.
 
 The model does not fit entirely in two Sparks. The usual configuration keeps about
-61% of routed experts resident and changes that selection as demand changes.
+63% of routed experts resident and changes that selection as demand changes.
 Pruning is a quality/speed tradeoff: adaptation improves coverage, but does not make
 a pruned request equivalent to running every expert.
 
@@ -29,8 +29,8 @@ cp .env.example .env
 
 Set `MODEL_DIR`, `PEER` (`user@worker-ip`), `MASTER_ADDR` (the head's link IP), and
 `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` (the link interface). The template uses
-the experimental 512K allocation; use the TP profile below for the 256K configuration
-used in the recent quality checks. Keep credentials in `.env`, not the template.
+the current 768K allocation and TP profile below. Full-length 768K quality has not
+been validated. Keep credentials in `.env`, not the template.
 
 ```bash
 # Run on each node; downloads the full checkpoint to local storage.
@@ -64,22 +64,28 @@ Stop the pair with `bash scripts/dual-down.sh`.
 
 ## TP profile
 
-These are the settings used for the recent TP quality checks, not the engine's
-fallback defaults. Arena sizes are decimal GB **per node**.
+These are the current serving settings, also in `.env.example`, not the engine's
+fallback defaults. Arena sizes are decimal GB **per node**. Older quality and speed
+checks below retain their original configurations.
 
 ```dotenv
-MAX_SEQ=262144
-ARENA_GB=90
-PRUNE_KEEP=0.61
+MAX_SEQ=786432
+ARENA_GB=92
+PRUNE_KEEP=0.63
 EXPERT_FORMAT=fp4
 TRANSIENT_SLOTS=16
 KEEP_FREE_GB=6
 SPEC=1
+DSV41_BLOCK=3
+DSV41_PACKED_KV=1
+DSV41_VISION=1
 
 DSV41_TP_EXPERTS=1
 DSV41_TP_DENSE=1
 DSV41_TP_ATTN=1
 DSV41_TP_HEAD=1
+DSV41_TP_DRAFT_EXPERTS=1
+DSV41_TP_EMBED=1
 DSV41_TP_EXPERT_LAYOUT=output
 DSV41_TP_LINEAR_LAYOUT=output
 
@@ -89,8 +95,9 @@ DSV41_HEAD_FMT=bf16
 DSV41_ACT_QUANT=0
 ```
 
-TP splits resident expert weights, shared experts, attention projections, and the
-vocabulary head across the pair. KV caches and some other weights remain replicated.
+TP splits resident expert weights, draft expert weights, the input embedding,
+main-model shared experts, attention projections, and the vocabulary head across
+the pair. KV caches and some other weights remain replicated.
 The `output` layouts preserve complete down-projection dot products; the older
 `intermediate` layouts regressed nesting quality. Leave the precision settings above
 alone unless you are testing a numerical change.
@@ -100,7 +107,10 @@ The main capacity and speed controls:
 | Setting | What to change it for |
 | --- | --- |
 | `MAX_SEQ` | Total context allocation, including the answer. More context needs more cache and scratch memory. |
+| `DSV41_PACKED_KV=1` | Pack FP4 history in 64-bit words. Saves about 0.67 GiB per request lane at 384K context; window caches and index keys stay BF16. Restart both nodes when changing it. |
 | `ARENA_GB` / `PRUNE_KEEP` | More resident experts, at the cost of memory. Raise them together only when there is room. |
+| `DSV41_TP_DRAFT_EXPERTS=1` | Split draft expert weights across TP2; saves 3.36 GiB per node. Requires native FP4 and the `output` expert layout. Adds draft collectives. |
+| `DSV41_TP_EMBED=1` | Split input embedding columns across two ranks; saves 0.62 GiB per node. Adds one gather per lookup, without changing stored precision. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
@@ -108,8 +118,11 @@ The main capacity and speed controls:
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
 | `DSV41_VISION=1` | Load image support. Set to `0` for text-only serving. |
 
-At keep `0.61`, the engine selects 9,400 of 15,360 routed experts. Each TP shard is
-9.40032 MB, so their weights occupy about 88.36 GB per node, within the 90 GB arena.
+At keep `0.63`, the engine selects 9,680 of 15,360 routed experts: 242 per layer.
+Each TP shard is 9.40032 MB, so their weights occupy about 91.00 GB per node,
+within the 92 GB arena. That is 440 more resident experts than the previous
+88 GB / keep `0.60` profile. Sharding the draft experts and embedding frees
+3.98 GiB per node; 4 decimal GB of that saving now goes to the larger arena.
 The remaining memory must cover dense weights, the drafter, caches, and scratch.
 The engine refuses a pruned configuration whose selected experts cannot all fit.
 
@@ -119,17 +132,17 @@ before attempting a long benchmark.
 
 ### Context length
 
-The profile allocates 256K tokens; that is not a claim that full-length quality has
-been validated. `MAX_SEQ=524288` is a candidate for 512K. The checkpoint declares a
-1M-token maximum, but allocating the cache is not enough to establish correctness or
-speed at that length. A starting 512K budget is `ARENA_GB=88` with `PRUNE_KEEP=0.60`;
-it still needs a full-length test.
+The profile allocates 768K tokens (`786432`), with packed history caches. A
+14,435-token request completed with this allocation and the 92 GB arena; that
+does not validate full-length quality or peak memory use at 768K. The checkpoint
+declares a 1M-token maximum, but allocation alone does not establish correctness
+or speed at that length. Lower `MAX_SEQ` if you do not need the extra context.
 
 Command-line overrides leave `.env` unchanged. Stop the existing pair before restarting:
 
 ```bash
 bash scripts/dual-down.sh
-MAX_SEQ=524288 ARENA_GB=88 PRUNE_KEEP=0.60 bash scripts/dual-up.sh
+MAX_SEQ=524288 bash scripts/dual-up.sh
 ```
 
 ## Adaptive expert loading
@@ -221,14 +234,30 @@ frozen expert placement, 128 output tokens. These are three runs, not a matched
 EP comparison. Other workloads and longer contexts can behave differently.
 The measured prompt used the previous README, not this shortened version.
 
+The newer draft/embedding sharding check used a frozen keep `0.60` mask, 88 GB
+arena, packed KV, K=3, and a 768K allocation. On a 14,435-token prompt with 128
+output tokens, all six runs (three per mode) produced identical output and mean
+draft acceptance of 2.78. Allocation fell from 98.04 to 94.06 GiB per node.
+Final warmed runs measured 19.55 versus 19.45 decode tok/s and 17.124 versus
+17.321 seconds of prefill. This short test does not establish a speedup or noise
+range. The subsequent 92 GB / keep `0.63` profile passed a single cold-request
+smoke test, not a matched throughput comparison. See [the measurements](docs/tp-memory.md).
+
+Packed KV is also a memory tradeoff: the controlled 384K-allocation test showed
+about 3.5% longer prefill and 3.6% longer decode than the BF16-storage recheck.
+See [packed KV measurements](docs/packed-kv.md) for the workload and full results.
+
 The single-node engine path still exists (`WORLD_SIZE=1`, all TP flags off), but
 the maintained launcher is for two nodes. Recent single-node serving has not been
 revalidated; its adaptive-swap path currently needs a null-slot fix. EP2 also remains
-available by disabling the four TP flags, with memory and pruning sized separately.
+available by disabling all six `DSV41_TP_*` enable flags, with memory and pruning
+sized separately.
 
 ## Further reading
 
 - [TP and persistent prefix implementation](docs/tp-and-persistent-prefix.md)
+- [Draft and embedding TP memory savings](docs/tp-memory.md)
+- [Packed KV storage and measurements](docs/packed-kv.md)
 - [Nesting regression: diagnosis, fix, and test results](docs/nesting-regression-tp.md)
 - [Performance experiments and known issues](docs/gotchas.md)
 - [API reference](server/README.md)

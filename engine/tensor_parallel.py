@@ -96,6 +96,29 @@ def shard_attention(weight, args, rank, world):
         raise ValueError('TP linear layout must be intermediate or output')
 
 
+class FeatureParallelEmbedding:
+    """Keep disjoint feature columns; concatenate lookups without rounding or sums.
+
+    All ranks must index the same IDs, including draft and CUDA-graph paths.
+    The caller slices on CPU before uploading to avoid a full GPU allocation.
+    """
+    def __init__(self, local, world):
+        if world != 2 or local.ndim != 2:
+            raise ValueError('embedding TP requires two feature shards')
+        self.local, self.world = local, world
+        self.shape = (local.shape[0], local.shape[1] * world)
+        self.device, self.dtype = local.device, local.dtype
+
+    def __getitem__(self, ids):
+        local = self.local[ids].contiguous()
+        flat = local.reshape(-1, local.shape[-1])
+        rows, width = flat.shape
+        gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
+        dist.all_gather_into_tensor(gathered, flat)
+        return gathered.view(self.world, rows, width).transpose(0, 1).reshape(
+            *local.shape[:-1], self.shape[1])
+
+
 class VocabParallelHead:
     def __init__(self, local, world):
         self.local, self.world = local, world
