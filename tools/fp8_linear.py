@@ -93,6 +93,7 @@ class FP8Weight:
         self.N, self.K = self.w.shape
         assert self.s.shape == ((self.N + 31) // 32, (self.K + 31) // 32), (self.s.shape, self.w.shape)
         assert self.K % 32 == 0
+        self._bf16_cache = None
 
     @property
     def shape(self):
@@ -144,6 +145,20 @@ class FP8Weight:
             w = torch.cat([w, w.new_zeros(pad, self.K)])
         out = (w.to(torch.bfloat16).view(n32, 32, k32, 32) * s[:, None, :, None]).view(n32 * 32, self.K)
         return out[: self.N] if pad else out
+
+    def dequant_cached(self) -> torch.Tensor:
+        """dequant(), memoized on the weight object (see v41_ref.DENSE_DEQUANT_CACHE).
+
+        dequant() is exact and deterministic, so the cached tensor is bit-identical to a fresh
+        call; this only stops the same bytes being expanded again for every chunk of every
+        request. FP8Weight objects are built once per layer at load, so the cache persists for
+        the process.
+        """
+        t = self._bf16_cache
+        if t is None:
+            t = self.dequant()
+            self._bf16_cache = t
+        return t
 
 
 def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:

@@ -451,6 +451,13 @@ class EngramWeights:
 # ----------------------------------------------------------------------------- ops
 MM_TILE = 0  # 0 = plain GEMMs. >0 = run every activation GEMM in fixed-size row tiles; see mm().
 HC_MM_TILE = int(os.environ.get("DSV41_HC_MM_TILE", "32"))
+# Memoize FP8Weight.dequant() on the weight object. The dequant is exact and deterministic, so a
+# cached bf16 copy is bit-identical to recomputing it, and it is otherwise re-run for every dense
+# projection of every layer of every prefill chunk (measured 40-58% of each such call). Gated off
+# by default: on the 90 GB / keep 0.61 TP profile it held ~10 GiB resident (MemAvailable 15.1 ->
+# 5.1 GiB), which is below the configured KEEP_FREE_GB floor, and its prefill benefit was within
+# the run-to-run spread of chunk 2048 alone. Only enable when the box has the headroom.
+DENSE_DEQUANT_CACHE = os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1"
 if HC_MM_TILE not in (16, 32):
     raise ValueError("DSV41_HC_MM_TILE must be 16 or 32")
 
@@ -625,7 +632,8 @@ def dense(x: torch.Tensor, w) -> torch.Tensor:
     if FP8Weight is not None and isinstance(w, FP8Weight):
         if x.numel() // x.shape[-1] <= 16:
             return fp8_linear(x, w)
-        return F.linear(x.to(torch.bfloat16), w.dequant())
+        return F.linear(x.to(torch.bfloat16),
+                        w.dequant_cached() if DENSE_DEQUANT_CACHE else w.dequant())
     return F.linear(x, w)
 
 

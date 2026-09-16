@@ -856,6 +856,7 @@ class V41Engine:
                 # differing would compute different logits with nothing raising.
                 "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
                 "head_fmt": R.head_fmt(),
+                "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
                 "fp4_dot_scaled": self.fp4_dot_scaled,
                 "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
                 "packed_kv": bool(M_.PACKED_KV),
@@ -2236,6 +2237,7 @@ class V41Engine:
             # construction, so a difference between them is a desync that nothing else reports.
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
+            "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
             "fp4_dot_scaled": self.fp4_dot_scaled,
             "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
             "packed_kv": bool(M_.PACKED_KV),
