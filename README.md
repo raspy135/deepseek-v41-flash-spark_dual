@@ -231,14 +231,14 @@ speculation and adaptation enabled. The second pass restored prefixes from disk.
 That is a regression check, not a general quality guarantee.
 
 Current bench suite (`bench/bench.py`, fixed output length, warm-up plus three
-measured runs, medians). Configuration: TP2, native FP4, 90 GB arena per node,
-keep 0.61, packed KV, `DSV41_BLOCK=3`, shared-expert overlap and native Engram
+measured runs, medians). Configuration: TP2, native FP4, 90.1 GB arena per node,
+keep 0.62, packed KV, `DSV41_BLOCK=3`, shared-expert overlap and native Engram
 gather enabled:
 
 | workload | prompt tokens | output tokens | prefill tok/s | decode tok/s | accept |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | code | 62 | 512 | — | 26.3 | 3.10 |
-| random 8K | 8,180 | 512 | 502 | 21.7 | 2.63 |
+| random 8K | 8,180 | 512 | 611 | 23.9 | 2.97 |
 | prose | 45 | 512 | — | 16.0 | 1.94 |
 
 The 8K prompt is fresh per run, so that prefill is uncached; the short prompts are
