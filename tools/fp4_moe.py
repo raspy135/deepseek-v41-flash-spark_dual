@@ -552,7 +552,10 @@ def _pick_bm(P: int) -> int:
 #   prefill T=2048  BM=64 (64, 4, 3)  1.09x
 _UP_CFG = {16: (256, 4, 1), 32: (128, 4, 1), 64: (64, 4, 1)}
 _UP_CFG_SCALED = {16: (32, 4, 4), 32: (128, 4, 3), 64: (64, 4, 3)}
-_DOWN_CFG = {16: (128, 8, 3), 32: (128, 4, 3), 64: (128, 8, 3)}
+# BM=64 is only selected when P > 1024, i.e. prefill chunks (decode is BM=16, mid-size is BM=32),
+# so the 64 entry is prefill-only. tools/tune_fp4_prefill.py at T=512/2048 measured (128,4,2)
+# ~7% faster than the old (128,8,3) on this board, bit-identical to it. Decode rows unchanged.
+_DOWN_CFG = {16: (128, 8, 3), 32: (128, 4, 3), 64: (128, 4, 2)}
 
 
 def moe_forward(
