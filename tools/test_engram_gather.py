@@ -21,6 +21,8 @@ a = R.Args.from_json(os.path.join(MD, "config.json"))
 idx = json.load(open(os.path.join(MD, "model.safetensors.index.json")))
 t = EngramTable(MD, idx, a.engram_layer_ids[0], "cpu")
 print(f"layer {a.engram_layer_ids[0]}: {t.n_rows:,} rows, {t.gather_threads} gather threads")
+native = t.native_gather
+t.native_gather = None  # Check the legacy fallback's parallelism even when native is enabled.
 
 rng = np.random.default_rng(0)
 
@@ -51,6 +53,7 @@ print("  n=    8 -> serial, as intended")
 t.pool = real
 
 # --- and the rows are the same bytes the pread path returns -----------------------------------
+t.native_gather = native
 for n in (1, 5, 144, 700):
     ids = np.sort(rng.integers(0, t.n_rows, size=n, dtype=np.int64))
     got, want = t._gather_rows(ids), t._read_rows(ids)
@@ -117,4 +120,4 @@ if torch.cuda.is_available():
 else:
     print("pinned check skipped: no CUDA")
 
-print("\nENGRAM GATHER IS PARALLEL AT DECODE SIZE AND BYTE-IDENTICAL")
+print("\nENGRAM FALLBACK IS PARALLEL AT DECODE SIZE; SELECTED PATH IS BYTE-IDENTICAL")
