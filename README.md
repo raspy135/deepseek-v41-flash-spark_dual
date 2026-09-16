@@ -13,6 +13,14 @@ a pruned request equivalent to running every expert.
 The server provides an OpenAI-compatible API, streaming, tool calls, thinking mode,
 vision, and DSpark speculative decoding. It processes one request at a time.
 
+## Technical highlights
+
+- **Native MXFP4 checkpoint.** Uses the original routed-expert weights without requantizing them to another format.
+- **Vision enabled.** Supports text and image inputs, not just text-only inference.
+- **Adaptive expert loading.** Resident experts change with your workload, using observed routing demand to decide which weights to keep in memory.
+- **One model, two DGX Sparks.** Tensor parallelism splits the same selected experts across both nodes, alongside attention and other model weights.
+- **Persistent prefix cache.** Saves prompt prefixes to local disk for reuse across requests and server restarts.
+
 ## Setup
 
 You need two DGX Sparks, a working RoCE link, Docker with NVIDIA GPU support, and
