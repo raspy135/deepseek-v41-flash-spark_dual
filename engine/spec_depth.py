@@ -15,8 +15,12 @@ The rule compares expected tokens per second, never acceptance alone:
     drafts is "saturated"; each would have gained on average `extra` more tokens at the deep
     depth, learned from deep-depth steps that got at least `lo` accepted. Switch up when that
     estimate, at the deep step time, beats the real rate.
-  * Step times are measured per depth on this process (EWMA of the loop's wall time, which is
-    what the user waits for), seeded from the measured ratio until both are known.
+  * Step times are measured per depth on this process: the median of the last STEP_SAMPLES
+    loop wall times (what the user waits for), the minimum until MIN_SAMPLES exist, and the
+    measured ratio for a depth not yet seen. Steps that captured a CUDA graph are not timed
+    (the engine passes None). An EWMA seeded by its first sample was used first and failed
+    in serving: the first request after a restart timed its graph captures, depth 3 read as
+    ~190 ms/step instead of ~105, and the policy went to 5 on prose and never came back.
   * A decision happens at most once per `interval` emitted tokens, and needs a `margin` win.
 
 Rank 0 decides; the engine broadcasts the depth with the per-step control flag, so both ranks
@@ -25,6 +29,8 @@ always verify the same width (EPDistributed.control). Rank 1 never consults its 
 from __future__ import annotations
 
 import os
+import statistics
+from collections import deque
 
 
 class DepthPolicy:
@@ -44,6 +50,7 @@ class DepthPolicy:
         # correctly dropping to `lo`, the stale estimate pulled the policy straight back up.)
         self.extra_prior = float(extra if extra is not None else 1.5)
         self.step_s = {self.lo: None, self.hi: None}
+        self._samples = {self.lo: deque(maxlen=self.STEP_SAMPLES), self.hi: deque(maxlen=self.STEP_SAMPLES)}
         self.pinned = None          # tests/benchmarks: force one depth
         self.reset_request()
 
@@ -59,6 +66,8 @@ class DepthPolicy:
         self._clear_window()
 
     EXTRA_WEIGHT = 5
+    STEP_SAMPLES = 32
+    MIN_SAMPLES = 3
 
     @property
     def extra(self) -> float:
@@ -78,10 +87,11 @@ class DepthPolicy:
         (fewer at a stop or max_tokens); `step_s` is its wall time, or None if unknown."""
         self.steps[depth] = self.steps.get(depth, 0) + 1
         if step_s is not None and step_s > 0:
-            prev = self.step_s[depth]
-            # A cold graph capture or a scheduling hiccup is not the step's cost.
-            if prev is None or step_s < 4 * prev:
-                self.step_s[depth] = step_s if prev is None else 0.9 * prev + 0.1 * step_s
+            q = self._samples[depth]
+            q.append(step_s)
+            # A median ignores the occasional slow step; with too few samples for that, the
+            # minimum is the safe side (a slow first step is an overhead, never a speedup).
+            self.step_s[depth] = statistics.median(q) if len(q) >= self.MIN_SAMPLES else min(q)
         if depth != self.depth:
             return   # a step queued before the last switch; not evidence about the current depth
         self.n += 1

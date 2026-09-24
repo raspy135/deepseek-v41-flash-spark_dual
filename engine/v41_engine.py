@@ -1268,6 +1268,11 @@ class V41Engine:
             yield from self._generate(list(prompt_ids), max_tokens, temperature, top_p, set(stop_token_ids or ()),
                                       seed, ignore_eos, grammar, penalties)
 
+    def _policy_step_s(self, t_iter: float, n_graphs: int):
+        """Wall time of this decode step for DepthPolicy, or None if it captured a graph."""
+        now = len(self.fast.graphs) + (self.fast.draft_graphs is not None)
+        return None if now != n_graphs else time.perf_counter() - t_iter
+
     def _generate(self, prompt, max_tokens, temperature, top_p, stop_ids, seed, ignore_eos=False, grammar=None,
                   penalties=None):
         if seed is not None:
@@ -2026,6 +2031,10 @@ class V41Engine:
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
                               pol.decide() if pol is not None and self.ep.rank == 0 else 0):
             t_iter = time.perf_counter()
+            # A step that captures a CUDA graph (first use of a width/parity/bucket, or the
+            # drafter) costs seconds; timing it would skew the policy's step-time estimate.
+            n_graphs = (len(self.fast.graphs) + (self.fast.draft_graphs is not None)
+                        if pol is not None else 0)
             depth = self.ep.control_value if pol is not None else self._tv - 1
             if pol is not None and self.ep.rank == 0:
                 sw = pol.pop_switch()
@@ -2168,7 +2177,7 @@ class V41Engine:
                         if any(t in stop_ids for t in emitted):
                             break
                     if pol is not None and self.ep.rank == 0:
-                        pol.observe(depth, a, len(emitted), time.perf_counter() - t_iter)
+                        pol.observe(depth, a, len(emitted), self._policy_step_s(t_iter, n_graphs))
                     steps += 1
                     out_st["steps"] = steps
                     if ph is not None:
@@ -2244,7 +2253,7 @@ class V41Engine:
                     if any(t in stop_ids for t in emitted):
                         break
                 if pol is not None and self.ep.rank == 0:
-                    pol.observe(depth, a, len(emitted), time.perf_counter() - t_iter)
+                    pol.observe(depth, a, len(emitted), self._policy_step_s(t_iter, n_graphs))
                 steps += 1
                 out_st["steps"] = steps
                 if ph is not None:

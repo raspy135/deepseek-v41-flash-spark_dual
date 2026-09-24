@@ -90,9 +90,30 @@ class DepthPolicyTest(unittest.TestCase):
 
     def test_outlier_step_time_ignored(self):
         pol = DepthPolicy((3, 5), start=3, interval=10)
+        pol.observe(3, 1, 2, 5.0)                # a slow FIRST step (e.g. an untagged capture)
+        self.assertAlmostEqual(pol.step_s[3], 5.0)
         pol.observe(3, 1, 2, 0.1)
-        pol.observe(3, 1, 2, 5.0)                # a cold graph capture
-        self.assertAlmostEqual(pol.step_s[3], 0.1)
+        self.assertAlmostEqual(pol.step_s[3], 0.1)   # min while under MIN_SAMPLES
+        for _ in range(5):
+            pol.observe(3, 1, 2, 0.1)
+        pol.observe(3, 1, 2, 4.0)
+        self.assertAlmostEqual(pol.step_s[3], 0.1)   # median once there are enough
+
+    def test_slow_start_does_not_trap_deep(self):
+        # The 2026-09-23 serving failure: prose, the first shallow steps slow (graph captures,
+        # 2 s), then 0.105 s; deep steps 0.124 s. The policy may probe depth 5, but must come
+        # back to 3 within a couple of windows and stay there.
+        pol = DepthPolicy((3, 5), start=3, interval=60)
+        seq, i = [], 0
+        for _ in range(400):
+            d = pol.decide()
+            a = [0, 3, 1, 3, 0, 3, 2, 3][i % 8] if d == 3 else [0, 3, 1, 4, 0, 3, 2, 3][i % 8]
+            t = (2.0 if i < 3 else 0.105) if d == 3 else 0.124
+            pol.observe(d, a, a + 1, t)
+            seq.append(d)
+            i += 1
+        self.assertEqual(seq[-1], 3)
+        self.assertLessEqual(sum(1 for d in seq[-200:] if d == 5), 60)
 
     def test_pinned_and_reset(self):
         pol = DepthPolicy((3, 5), start=3, interval=10)
