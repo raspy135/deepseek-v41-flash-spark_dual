@@ -20,6 +20,7 @@ vision, and DSpark speculative decoding. It processes one request at a time.
 - **Adaptive expert loading.** Resident experts change with your workload, using observed routing demand to decide which weights to keep in memory.
 - **One model, two DGX Sparks.** Tensor parallelism splits the same selected experts across both nodes, alongside attention and other model weights.
 - **Persistent prefix cache.** Saves prompt prefixes to local disk for reuse across requests and server restarts.
+- **Adaptive speculative depth.** Drafts 5 tokens ahead while the drafter keeps being right (code, markup) and falls back to 3 on prose, per request. Output is unchanged; only speed moves.
 
 ## Setup
 
@@ -84,7 +85,7 @@ EXPERT_FORMAT=fp4
 TRANSIENT_SLOTS=16
 KEEP_FREE_GB=6
 SPEC=1
-DSV41_BLOCK=3
+DSV41_BLOCK_DYNAMIC=3,5
 DSV41_PACKED_KV=1
 DSV41_VISION=1
 
@@ -122,11 +123,13 @@ The main capacity and speed controls:
 | `DSV41_TP_DRAFT_EXPERTS=1` | Split draft expert weights across TP2; saves 3.36 GiB per node. Requires native FP4 and the `output` expert layout. Adds draft collectives. |
 | `DSV41_TP_EMBED=1` | Split input embedding columns across two ranks; saves 0.62 GiB per node. Adds one gather per lookup, without changing stored precision. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
+| `DSV41_BLOCK_DYNAMIC=3,5` | Choose the draft depth per request: 5 while acceptance is high, 3 otherwise. For a fixed depth, remove it and set `DSV41_BLOCK=3` (never both). Needs `DSV41_MAX_CONCURRENCY=1`. See [measurements](docs/decode-dynamic-depth.md). |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
 | `DSV41_PREFILL_FUSED_ATTN=1` | Keep fused prefill attention enabled. |
 | `DSV41_FP4_CUDA=1` | Default native CUDA-core FP4 decode for supported BM=16 shapes. Set `0` to use Triton throughout (also required with `DSV41_FP4_DOT_SCALED=1`). See [measurements](docs/gotchas.md#a-native-cuda-spelling-is-not-automatically-faster-than-triton). |
+| Decode projections | On by default: `DSV41_DECODE_MERGED_PROJ`, `DSV41_FP8_DECODE_BLOCK_N=auto`, `DSV41_PRUNE_MISS_FUSED`. Bit-exact; about 4% less time per verify step. Roll back with `0` (`128` for the tile) on both nodes. See [measurements](docs/decode-projection-fusion.md). |
 | `DSV41_FP4_CUDA_RELAXED=1` | Default faster CUDA reduction order. Preserves BF16 output boundaries but changes numerics. Set `0` for the original CUDA summation order; restart both ranks together. |
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
 | `DSV41_VISION=1` | Load image support. Set to `0` for text-only serving. |
@@ -230,6 +233,45 @@ the server logs it separately as `prefix_response`. Restart both nodes to enable
 
 ## Measurements and limitations
 
+### Decode, 2026-09-23
+
+Direct-engine runs through the two-node test gate (not `bench/bench.py`, no HTTP).
+Setup: TP2, native FP4 with CUDA decode, shared-expert overlap, native Engram gather,
+90 GB arena, keep 0.61, frozen expert ranking, prefix caches off, greedy, up to 512
+output tokens. The arena and keep differ from the profile above, so compare within
+this section, not with older rows. All columns come from one process: the "fixed"
+columns are the dynamic build pinned to one depth (it still drafts 5). Every greedy
+output was token-identical across depths on both nodes.
+
+| workload | fixed depth 3 | fixed depth 5 | **dynamic 3,5** | tokens per step at 3 → 5 |
+| --- | ---: | ---: | ---: | --- |
+| Python module | 35.5 tok/s | 44.5 | **43.1** | 3.87 → 5.65 |
+| HTML page | 31.0 | 35.0 | **34.3** | 3.36 → 4.29 |
+| Prose explanation | 20.4 | 18.2 | **20.6** | 2.18 → 2.31 |
+| Short story | 19.1 | 16.8 | **19.1** | 1.99 → 2.07 |
+| Story, temperature 0.7 | 18.1 | — | 19.4 | both ran at depth 3; the gap is noise |
+
+- **Why dynamic wins:** depth 5 makes each verify step about 16% slower (~106 → ~124
+  ms), and pays that back only where the drafter is right. Dynamic depth switched to 5
+  after the first ~60 tokens on code and HTML, and stayed at 3 on prose, costing
+  nothing there. Separate fixed-depth runs in 3, 5, 5, 3 order, made before the
+  projection defaults below were switched on, agreed within 4%.
+- **Depth 1:** the step fell to 88 ms, but it lost on every workload (story 17.6,
+  Python 22.4 tok/s).
+- **Memory:** peak allocation 103.15 GB with both depths, versus 103.14 GB with one.
+- **Not yet measured:** thinking-mode traces, long contexts, and requests that
+  alternate between code and prose.
+
+The decode projection defaults (merged `wq_a`‖`wkv` and shared `w1`‖`w3`, occupancy-sized
+FP8 tiles, fused prune-miss accounting) were A/B-tested in the same process. Logits,
+hidden states and all generated tokens were bit-identical. Four alternating batches of
+fixed verify steps took 91.3–91.7 ms without them and 87.3–87.9 ms with them, about
+3.8 ms (4.1%) less per step, on a 512-token HTML generation. Details:
+[decode projection fusion](docs/decode-projection-fusion.md) and
+[dynamic depth](docs/decode-dynamic-depth.md).
+
+### Earlier measurements
+
 The corrected TP path passed nesting depths 4/6/8/10 twice through the live API with
 speculation and adaptation enabled. The second pass restored prefixes from disk.
 That is a regression check, not a general quality guarantee.
@@ -306,6 +348,8 @@ sized separately.
 - [Post-response prefix preparation](docs/response-prefix.md)
 - [Nesting regression: diagnosis, fix, and test results](docs/nesting-regression-tp.md)
 - [Performance experiments and known issues](docs/gotchas.md)
+- [Dynamic speculative depth](docs/decode-dynamic-depth.md)
+- [Decode projection fusion and tiling](docs/decode-projection-fusion.md)
 - [API reference](server/README.md)
 - [Benchmark harness](bench/README.md)
 - [Historical results](RESULTS.md) and [design notes](NOTES.md) — include upstream single-node measurements, not just this fork

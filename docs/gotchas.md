@@ -860,3 +860,19 @@ to the 2,048-token snapshot granularity. It is off by default; each snapshot clo
 window and replay tail (~6 MB at window 128 / head_dim 512 / 21 window layers), and it is in the
 EP2 boot config guard because the restored length decides how many prefill collectives a request
 issues. Filled under `DSV41_PREFIX_SNAPSHOTS=8` in the local `.env`.
+
+## A gate that forwards nothing still passes, and serving does not quantize activations
+
+Two traps from 2026-09-23 ([decode projection fusion](decode-projection-fusion.md)):
+
+* **Check the gate's reported config, not `.env`.** `run_two_node_gate.sh` builds its
+  `-e DSV41_*` flags from `env`. When the filter command (`rg`) existed only as an interactive
+  shell function, nothing was forwarded. Both ranks booted on code defaults (EP2,
+  `DSV41_BLOCK=5`), agreed with each other, and passed. The boot guard compares ranks with each
+  other, not with `.env`. The gate now uses `grep` and refuses to start when nothing is
+  forwarded. Still read `tp_experts` / `draft_tokens` from the result's `config` before
+  believing a number.
+* **`qlinear` costs no quantization in serving.** With `act_quant=False` (the default),
+  `R.act_qdq_fp8` is replaced by a bf16 cast. Removing its ~13 kernels saved 15–20 µs per call
+  in a microbenchmark and exactly nothing in the engine. Count a cost only on the path serving
+  actually takes.
