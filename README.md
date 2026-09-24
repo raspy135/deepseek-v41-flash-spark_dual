@@ -99,6 +99,8 @@ DSV41_TP_LINEAR_LAYOUT=output
 
 DSV41_DENSE_FP4=off
 DSV41_FP4_DOT_SCALED=0
+DSV41_FP4_CUDA=1
+DSV41_FP4_CUDA_RELAXED=1
 DSV41_HEAD_FMT=bf16
 DSV41_ACT_QUANT=0
 ```
@@ -124,6 +126,8 @@ The main capacity and speed controls:
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
 | `DSV41_PREFILL_FUSED_ATTN=1` | Keep fused prefill attention enabled. |
+| `DSV41_FP4_CUDA=1` | Default native CUDA-core FP4 decode for supported BM=16 shapes. Set `0` to use Triton throughout (also required with `DSV41_FP4_DOT_SCALED=1`). See [measurements](docs/gotchas.md#a-native-cuda-spelling-is-not-automatically-faster-than-triton). |
+| `DSV41_FP4_CUDA_RELAXED=1` | Default faster CUDA reduction order. Preserves BF16 output boundaries but changes numerics. Set `0` for the original CUDA summation order; restart both ranks together. |
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
 | `DSV41_VISION=1` | Load image support. Set to `0` for text-only serving. |
 
@@ -230,8 +234,24 @@ The corrected TP path passed nesting depths 4/6/8/10 twice through the live API 
 speculation and adaptation enabled. The second pass restored prefixes from disk.
 That is a regression check, not a general quality guarantee.
 
-Current bench suite (`bench/bench.py`, fixed output length, warm-up plus three
-measured runs, medians). Configuration: TP2, native FP4, 90.1 GB arena per node,
+Latest native-CUDA decode recheck (`bench/bench.py`, fixed 512-token output, one
+warm-up plus three measured runs) on 2026-09-22:
+
+| workload | prompt tokens | output tokens | decode tok/s | accept | expert hit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code | 62 | 512 | 24.23 | 2.97 | 100% |
+
+Configuration: TP2, native FP4, native CUDA BM=16 decode with relaxed reduction,
+90.1 GB arena per node, keep 0.61, packed KV, speculation enabled. The three
+measured runs were 24.23, 25.12, and 23.37 tok/s; acceptance varied from 2.81 to
+3.04. The immediately preceding run on an older Triton-only container measured
+24.41 tok/s, but rebuilding changed more than the MoE kernel, so this is not a
+controlled CUDA-versus-Triton comparison. Raw rows are in
+[`results/readme-cuda-rebuilt.json`](results/readme-cuda-rebuilt.json) and
+[`results/readme-cuda.json`](results/readme-cuda.json).
+
+The earlier broader bench suite used the same harness (fixed output length,
+warm-up plus three measured runs, medians). Configuration: TP2, native FP4, 90.1 GB arena per node,
 keep 0.62, packed KV, `DSV41_BLOCK=3`, shared-expert overlap and native Engram
 gather enabled:
 

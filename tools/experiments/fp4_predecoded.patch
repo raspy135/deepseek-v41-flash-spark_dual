@@ -1,0 +1,75 @@
+--- fp4_moe_cuda.cu
++++ predecoded.cu
+@@ -42,22 +42,11 @@
+ #define FP4_RELAXED_REDUCE 1
+ #endif
+ 
+-__device__ __forceinline__ void decode_e2m1x2(uint8_t packed, float &even, float &odd) {
+-    uint32_t bits;
+-    uint32_t src = packed;
+-    // sm_121a requires the cvt source to be a real .b8 register.  The low output half is the
+-    // low-nibble (even-K) value and the high output half is the high-nibble (odd-K) value.
+-    asm volatile(
+-        "{\n\t"
+-        ".reg .b8 b0, b1, b2, b3;\n\t"
+-        "mov.b32 {b0, b1, b2, b3}, %1;\n\t"
+-        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
+-        "}"
+-        : "=r"(bits) : "r"(src));
+-    __half_raw lo{static_cast<uint16_t>(bits)};
+-    __half_raw hi{static_cast<uint16_t>(bits >> 16)};
+-    even = __half2float(static_cast<__half>(lo));
+-    odd = __half2float(static_cast<__half>(hi));
++__device__ __forceinline__ void load_weight4(
++    const uint8_t *p, float &x0, float &x1, float &x2, float &x3) {
++    const __half2 *v = reinterpret_cast<const __half2 *>(p);
++    const float2 a = __half22float2(v[0]), b = __half22float2(v[1]);
++    x0 = a.x; x1 = a.y; x2 = b.x; x3 = b.y;
+ }
+ 
+ __device__ __forceinline__ float ue8m0(uint8_t scale) {
+@@ -126,8 +115,8 @@
+                         + (row_in_warp << kWarpsShift) + warp;
+         if (out_n >= n) continue;
+         const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+-        const uint8_t *w1_row = w1 + row * kb;
+-        const uint8_t *w3_row = w3 + row * kb;
++        const uint8_t *w1_row = w1 + row * kb * 4;
++        const uint8_t *w3_row = w3 + row * kb * 4;
+         const uint8_t *s1_row = s1 + row * sg;
+         const uint8_t *s3_row = s3 + row * sg;
+ 
+@@ -142,13 +131,9 @@
+             // One warp load is 32 x uint16 = 64 contiguous bytes = 128 logical K values.
+             for (int q = 0; q < q_count; ++q) {
+                 const int byte_k = (q << 6) + (lane << 1);
+-                const uint16_t p1 = *reinterpret_cast<const uint16_t *>(w1_row + byte_k);
+-                const uint16_t p3 = *reinterpret_cast<const uint16_t *>(w3_row + byte_k);
+                 float w1e0, w1o0, w1e1, w1o1, w3e0, w3o0, w3e1, w3o1;
+-                decode_e2m1x2(static_cast<uint8_t>(p1), w1e0, w1o0);
+-                decode_e2m1x2(static_cast<uint8_t>(p1 >> 8), w1e1, w1o1);
+-                decode_e2m1x2(static_cast<uint8_t>(p3), w3e0, w3o0);
+-                decode_e2m1x2(static_cast<uint8_t>(p3 >> 8), w3e1, w3o1);
++                load_weight4(w1_row + byte_k * 4, w1e0, w1o0, w1e1, w1o1);
++                load_weight4(w3_row + byte_k * 4, w3e0, w3o0, w3e1, w3o1);
+                 const float scale1 = ue8m0(s1_row[(q << 2) + subgroup]);
+                 const float scale3 = ue8m0(s3_row[(q << 2) + subgroup]);
+                 const int xk = (q << 7) + (lane << 2);
+@@ -224,15 +209,13 @@
+             if (pair < 0) break;
+             float acc = 0.0f;
+             if (slot_i != null_slot) {
+-                const uint8_t *w2_row = w2 + row * kb;
++                const uint8_t *w2_row = w2 + row * kb * 4;
+                 const uint8_t *s2_row = s2 + row * sg;
+                 const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pair) * stride_h;
+                 for (int q = 0; q < q_count; ++q) {
+                     const int byte_k = (q << 6) + (lane << 1);
+-                    const uint16_t packed = *reinterpret_cast<const uint16_t *>(w2_row + byte_k);
+                     float we0, wo0, we1, wo1;
+-                    decode_e2m1x2(static_cast<uint8_t>(packed), we0, wo0);
+-                    decode_e2m1x2(static_cast<uint8_t>(packed >> 8), we1, wo1);
++                    load_weight4(w2_row + byte_k * 4, we0, wo0, we1, wo1);
+                     const float scale = ue8m0(s2_row[(q << 2) + subgroup]);
+                     const int hk = (q << 7) + (lane << 2);
+                     float pe = 0.0f, po = 0.0f;

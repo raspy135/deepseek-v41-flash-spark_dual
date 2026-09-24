@@ -182,6 +182,27 @@ def test_prompt_rendering_matches_encoding_readme():
     assert r["prompt_ids"][-2:] == [128804, 128822]
 
 
+def test_developer_role_is_folded_into_system():
+    """Newer OpenAI clients send role="developer"; V4.1 has no such role and the encoder
+    raises on it. It has to render identically to system, and a tools list riding on it has
+    to attach to that message rather than spawn a second empty system one."""
+    def render(role, tools=None):
+        body = {"messages": [{"role": role, "content": "You are a helpful assistant."},
+                             {"role": "user", "content": "What is 2+2?"}],
+                "reasoning_effort": "high"}
+        if tools:
+            body["tools"] = tools
+        status, r = post("/v1/debug/prompt", body)
+        assert status == 200, r
+        return r
+
+    system, developer = render("system"), render("developer")
+    assert developer["prompt"] == system["prompt"] and developer["prompt_ids"] == system["prompt_ids"]
+    system_tools, developer_tools = render("system", TOOLS), render("developer", TOOLS)
+    assert developer_tools["prompt"] == system_tools["prompt"]
+    assert developer_tools["prompt_ids"] == system_tools["prompt_ids"]
+
+
 def test_chat_nonstream_thinking_off_default():
     status, r = chat()
     assert status == 200, r

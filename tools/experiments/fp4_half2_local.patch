@@ -1,0 +1,129 @@
+--- fp4_moe_cuda.cu
++++ candidate.cu
+@@ -42,36 +42,25 @@
+ #define FP4_RELAXED_REDUCE 1
+ #endif
+ 
+-__device__ __forceinline__ void decode_e2m1x2(uint8_t packed, float &even, float &odd) {
++__device__ __forceinline__ __half2 decode_half2(uint8_t packed) {
+     uint32_t bits;
+-    uint32_t src = packed;
+-    // sm_121a requires the cvt source to be a real .b8 register.  The low output half is the
+-    // low-nibble (even-K) value and the high output half is the high-nibble (odd-K) value.
+-    asm volatile(
+-        "{\n\t"
+-        ".reg .b8 b0, b1, b2, b3;\n\t"
+-        "mov.b32 {b0, b1, b2, b3}, %1;\n\t"
+-        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
+-        "}"
+-        : "=r"(bits) : "r"(src));
+-    __half_raw lo{static_cast<uint16_t>(bits)};
+-    __half_raw hi{static_cast<uint16_t>(bits >> 16)};
+-    even = __half2float(static_cast<__half>(lo));
+-    odd = __half2float(static_cast<__half>(hi));
++    asm volatile("{ .reg .b8 b0,b1,b2,b3;\n\t"
++                 "mov.b32 {b0,b1,b2,b3}, %1;\n\t"
++                 "cvt.rn.f16x2.e2m1x2 %0, b0; }"
++                 : "=r"(bits) : "r"(static_cast<uint32_t>(packed)));
++    const __half2_raw v{static_cast<uint16_t>(bits), static_cast<uint16_t>(bits >> 16)};
++    return static_cast<__half2>(v);
+ }
+ 
+ __device__ __forceinline__ float ue8m0(uint8_t scale) {
+     return __uint_as_float(static_cast<uint32_t>(scale) << 23);
+ }
+ 
+-__device__ __forceinline__ void load_activation4(
+-    const __nv_bfloat16 *p, float &x0, float &x1, float &x2, float &x3) {
+-    // Model strides and lane offsets are multiples of four BF16 elements (8-byte aligned).
++__device__ __forceinline__ void load_activation_half2(
++    const __nv_bfloat16 *p, __half2 &a, __half2 &b) {
+     const uint2 bits = *reinterpret_cast<const uint2 *>(p);
+-    x0 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x & 0xffff))));
+-    x1 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x >> 16))));
+-    x2 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y & 0xffff))));
+-    x3 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y >> 16))));
++    a = __floats2half2_rn(__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u));
++    b = __floats2half2_rn(__uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u));
+ }
+ 
+ __device__ __forceinline__ float subgroup8_sum(float v) {
+@@ -81,6 +70,11 @@
+     return v;
+ }
+ 
++__device__ __forceinline__ float packed_group_sum(__half2 v) {
++    const float2 f = __half22float2(v);
++    return subgroup8_sum(f.x + f.y);
++}
++
+ __device__ __forceinline__ float ordered_quad_sum(float v) {
+     // The four subgroup leaders hold the per-32-K partials.  Add them in K order, matching
+     // _quad_dot rather than allowing the compiler to tree-reduce across scale boundaries.
+@@ -144,31 +138,19 @@
+                 const int byte_k = (q << 6) + (lane << 1);
+                 const uint16_t p1 = *reinterpret_cast<const uint16_t *>(w1_row + byte_k);
+                 const uint16_t p3 = *reinterpret_cast<const uint16_t *>(w3_row + byte_k);
+-                float w1e0, w1o0, w1e1, w1o1, w3e0, w3o0, w3e1, w3o1;
+-                decode_e2m1x2(static_cast<uint8_t>(p1), w1e0, w1o0);
+-                decode_e2m1x2(static_cast<uint8_t>(p1 >> 8), w1e1, w1o1);
+-                decode_e2m1x2(static_cast<uint8_t>(p3), w3e0, w3o0);
+-                decode_e2m1x2(static_cast<uint8_t>(p3 >> 8), w3e1, w3o1);
++                const __half2 w1a = decode_half2(static_cast<uint8_t>(p1));
++                const __half2 w1b = decode_half2(static_cast<uint8_t>(p1 >> 8));
++                const __half2 w3a = decode_half2(static_cast<uint8_t>(p3));
++                const __half2 w3b = decode_half2(static_cast<uint8_t>(p3 >> 8));
+                 const float scale1 = ue8m0(s1_row[(q << 2) + subgroup]);
+                 const float scale3 = ue8m0(s3_row[(q << 2) + subgroup]);
+                 const int xk = (q << 7) + (lane << 2);
+ 
+-                float pge = 0.0f, pgo = 0.0f, pue = 0.0f, puo = 0.0f;
+-                const __nv_bfloat16 *xp = x_row + xk;
+-                float x0, x1, x2, x3;
+-                load_activation4(xp, x0, x1, x2, x3);
+-                pge = fmaf(x0, w1e0, pge); pge = fmaf(x2, w1e1, pge);
+-                pgo = fmaf(x1, w1o0, pgo); pgo = fmaf(x3, w1o1, pgo);
+-                pue = fmaf(x0, w3e0, pue); pue = fmaf(x2, w3e1, pue);
+-                puo = fmaf(x1, w3o0, puo); puo = fmaf(x3, w3o1, puo);
+-                float pg, pu;
+-                if constexpr (FP4_RELAXED_REDUCE) {
+-                    pg = subgroup8_sum(pge + pgo);
+-                    pu = subgroup8_sum(pue + puo);
+-                } else {
+-                    pg = subgroup8_sum(pge) + subgroup8_sum(pgo);
+-                    pu = subgroup8_sum(pue) + subgroup8_sum(puo);
+-                }
++                __half2 a, b;
++                load_activation_half2(x_row + xk, a, b);
++                const __half2 gate_pair = __hfma2(b, w1b, __hmul2(a, w1a));
++                const __half2 up_pair = __hfma2(b, w3b, __hmul2(a, w3a));
++                float pg = packed_group_sum(gate_pair), pu = packed_group_sum(up_pair);
+                 if (subgroup_lane == 0) { pg *= scale1; pu *= scale3; }
+                 if constexpr (FP4_RELAXED_REDUCE) {
+                     // Keep each scale subgroup's sum across K; combine the four only once at the end.
+@@ -230,20 +212,13 @@
+                 for (int q = 0; q < q_count; ++q) {
+                     const int byte_k = (q << 6) + (lane << 1);
+                     const uint16_t packed = *reinterpret_cast<const uint16_t *>(w2_row + byte_k);
+-                    float we0, wo0, we1, wo1;
+-                    decode_e2m1x2(static_cast<uint8_t>(packed), we0, wo0);
+-                    decode_e2m1x2(static_cast<uint8_t>(packed >> 8), we1, wo1);
++                    const __half2 wa = decode_half2(static_cast<uint8_t>(packed));
++                    const __half2 wb = decode_half2(static_cast<uint8_t>(packed >> 8));
+                     const float scale = ue8m0(s2_row[(q << 2) + subgroup]);
+                     const int hk = (q << 7) + (lane << 2);
+-                    float pe = 0.0f, po = 0.0f;
+-                    const __nv_bfloat16 *hp = h_row + hk;
+-                    float x0, x1, x2, x3;
+-                    load_activation4(hp, x0, x1, x2, x3);
+-                    pe = fmaf(x0, we0, pe); pe = fmaf(x2, we1, pe);
+-                    po = fmaf(x1, wo0, po); po = fmaf(x3, wo1, po);
+-                    float p;
+-                    if constexpr (FP4_RELAXED_REDUCE) p = subgroup8_sum(pe + po);
+-                    else p = subgroup8_sum(pe) + subgroup8_sum(po);
++                    __half2 a, b;
++                    load_activation_half2(h_row + hk, a, b);
++                    float p = packed_group_sum(__hfma2(b, wb, __hmul2(a, wa)));
+                     if (subgroup_lane == 0) p *= scale;
+                     if constexpr (FP4_RELAXED_REDUCE) acc += p;
+                     else {

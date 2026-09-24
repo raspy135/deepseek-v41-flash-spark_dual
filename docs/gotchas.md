@@ -121,6 +121,241 @@ part; the 64-byte-wide tiles the kernel uses reach 193–197 GB/s effective at d
 against a ~210 GB/s practical copy ceiling on a nominally 273 GB/s box. If you retune
 `BM`/`BN`, watch the effective bandwidth, not the occupancy.
 
+## A native CUDA spelling is not automatically faster than Triton
+
+`tools/fp4_moe_cuda.cu` is a CUDA C++ decode implementation of the same packed-FP4
+operation (`DSV41_FP4_CUDA=1`). It uses the hardware E2M1 conversion, coalesced 64-byte row loads,
+the same per-32 UE8M0 boundary, BF16 linear-output rounding, a one-kernel stable router, and is
+CUDA-graph capturable. After the tuning below, native CUDA with relaxed reduction was selected as
+the default on 2026-09-22. The initial negative measurements are retained here as history.
+
+Real layer-0 weights, 32 experts, FP32 routed output, 20 order-balanced A/B/B/A measurements on
+GB10 (another resident process made the absolute bandwidth lower than an isolated run):
+
+| tokens / distinct experts | Triton | native CUDA | Triton/native |
+|---|---:|---:|---:|
+| 1 / 6 | 0.774 ms | 0.847 ms | 1.09x |
+| 6 / 30 | 5.453 ms | 9.365 ms | 1.72x |
+| 8 / 32 | 5.613 ms | 9.594 ms | 1.71x |
+
+The T=6 relative output error against Triton was `7.73e-7` (`2.29e-6` at T=8), and graph replay
+passed. A rows-per-warp sweep over 1, 2, 4, 8 and 16 made one row the least-slow arm; none won.
+Triton's tensor-core tile reuses each activation across many output rows, while the CUDA-core
+row kernel saves padded-pair math but pays scalar reductions and repeated activation traffic.
+These eager timings also include host launch
+gaps and different router implementations, so they do not isolate the source of the difference.
+
+A later source-level pass made power-of-two index arithmetic explicit, hoisted weight/scale row
+bases, and moved the up kernel's `pair / topk` out of the dot-product loop into packed router
+metadata. With the competing worker stopped, two fresh runs of 100 order-balanced measurements
+showed a real crossover rather than a general win:
+
+| tokens / distinct experts | Triton range | native CUDA range | result |
+|---|---:|---:|---:|
+| 1 / 6 | 0.801-0.803 ms | 0.745-0.746 ms | CUDA 1.074-1.077x faster |
+| 6 / 30 | 3.028-3.034 ms | 3.775-3.960 ms | CUDA 1.245-1.305x slower |
+| 8 / 32 | 3.245-3.300 ms | 4.418-4.661 ms | CUDA 1.339-1.436x slower |
+
+The output errors remained zero at T=1, `7.73e-7` at T=6, and `2.29e-6` at T=8. This is enough
+to retain the CUDA arm for single-token investigation, but not to enable it globally: decode call
+size varies, and the larger calls still lose. At that stage `DSV41_FP4_CUDA=0` remained the default;
+the subsequent CUDA-core tuning below supersedes that decision.
+
+### CUDA-core tuning with graph replay (2026-09-22)
+
+The next review moved the routed-pair loop outside K, keeping only one pair's accumulators and
+activation base pointer live. The previous version kept sixteen pairs' state and checked sixteen
+validity branches per K tile, despite the usual 1-2 pairs per expert. The new version rereads weights
+for each pair, but the smaller register footprint wins on these sparse decode routes. Activation
+loads are now one aligned 64-bit load per lane instead of four scalar BF16 loads. The ordered
+four-subgroup reduction drops its redundant lane-0 broadcast. These changes preserve the old CUDA
+arithmetic order. Up register usage initially fell from 64 to 40 with the pair-loop change.
+
+Use graph replay to exclude host launch gaps. The earlier 7.5% T=1 eager win was **not** proof
+that source-level shifts/hoisting accelerated the kernel: the pre-tuning CUDA version was slower
+than Triton at T=1 under graph replay (0.725 vs 0.697 ms in the first four-arm comparison).
+
+Two 100-repetition, alternating-order graph runs on GB10 with the serving worker stopped, real
+layer-0 weights in a 32-expert arena, top-k=6, FP32 routed output:
+
+| tokens / distinct experts | Triton (ms) | previous CUDA (ms) | tuned CUDA (ms) | relaxed CUDA (ms) |
+|---|---:|---:|---:|---:|
+| 1 / 6 | 0.697-0.702 | 0.725-0.726 | 0.556-0.559 | 0.534-0.537 |
+| 6 / 30 | 2.875-2.890 | 3.679-3.763 | 2.799-2.803 | 2.685-2.727 |
+| 8 / 32 | 3.108-3.150 | 4.659-4.866 | 3.099-3.126 | 2.896-2.967 |
+
+The tuned original-order mode was bit-identical to the previous CUDA output in all three cases. The
+`DSV41_FP4_CUDA_RELAXED=1` combines even/odd partials before subgroup reduction and accumulates
+each subgroup across K before the final warp reduction. It retains FP32 accumulators and the BF16
+linear-output boundaries, but changes summation order: relative errors against Triton were
+`4.59e-8`, `2.54e-5`, and `2.17e-4` respectively. These are kernel errors, not language-quality
+measurements. Following these results, `DSV41_FP4_CUDA=1` and `DSV41_FP4_CUDA_RELAXED=1` were
+selected as defaults at the user's request. Explicit `DSV41_FP4_CUDA=0` restores Triton;
+`DSV41_FP4_CUDA_RELAXED=0` retains native CUDA with the original summation order. Prefill and
+unsupported shapes still use Triton. Full-engine timing and generation-quality gates remain
+outstanding; changing the defaults does not expand the measured validation scope.
+The relaxed flag and CUDA source digest are included in the EP2 boot-time agreement guard.
+
+Rejected candidates, compared against the vector-load, eight-warp version in graph replay:
+
+* Whole activation-row staging into 10 KiB shared memory per CTA: 0.606/3.034/3.541 ms versus
+  0.560/2.783/3.110 ms at T=1/6/8 (8-14% slower), with identical results.
+* Four, sixteen, and thirty-two warps per CTA: no consistent improvement over eight; T=8 was
+  3.225/3.265/3.494 ms versus about 3.10-3.14 ms with eight.
+
+Six GPU regression tests cover top-k=1/2/3/4/6, up to sixteen pairs on one expert, null experts,
+partial output and scatter layouts, output-row tails, graph replay, and long router runs. Native
+routing now splits runs longer than sixteen into additional blocks instead of dropping pairs.
+Both reduction modes pass. Compute Sanitizer memcheck on the default mode reports zero errors.
+No two-rank serving run or full-model generation quality evaluation was performed for this tuning.
+
+Reproduce current arms with `MODEL_DIR=/path/to/checkpoint python tools/bench_fp4_moe_cuda.py
+--graph --compare-relaxed --iters 100`. `--baseline-source PATH` adds a saved ABI-compatible CUDA
+source as the fourth arm; the previous source SHA256 was
+`1f33165b6759be39368eb77605a3ff9013445c22daf730037fc3a54e55d7b0c0`.
+
+### Casting consolidation and predecoded weights: negative results (2026-09-22)
+
+The follow-up tested whether fewer conversions, two-pair reuse, or extra weight memory help the
+**already tuned relaxed CUDA default**. Each row below is a separate 100-repetition alternating
+CUDA-graph A/B run on GB10, with the serving worker stopped, real layer-0 weights in a 32-expert
+arena, top-k=6, and FP32 routed output. Entries are baseline -> candidate milliseconds; compare
+within each entry, not across rows (clocks drift). No candidate was promoted.
+
+| candidate | T=1 / 6 experts | T=6 / 30 experts | T=8 / 32 experts |
+|---|---:|---:|---:|
+| Pair FP32->FP16 activation conversions with half2 | 0.535 -> 0.536 | 2.683 -> 2.685 | 2.913 -> 2.886 |
+| Convert each activation tensor once before up/down | 0.534 -> 0.542 | 2.720 -> 2.729 | 2.917 -> 2.917 |
+| Share weight decode across two routed pairs | 0.536 -> 0.567 | 2.712 -> 2.852 | 2.894 -> 3.108 |
+| Combine four FP4 values' unpacking in one asm block | 0.532 -> 0.532 | 2.722 -> 2.731 | 2.899 -> 2.934 |
+| Predecode FP4 codes to FP16; retain group scales | 0.536 -> 1.878 | 2.762 -> 11.383 | 2.879 -> 13.969 |
+| Predecode and fold group scales into FP16 weights | 0.535 -> 1.822 | 2.819 -> 11.018 | 3.051 -> 14.082 |
+
+Every candidate was bit-identical to its CUDA baseline on these three real-weight inputs. Relative
+errors against Triton remained 4.59e-8 / 2.54e-5 / 2.17e-4; this is not a general guarantee for
+prescaling other weights or a language-quality evaluation. All candidates keep FP32 accumulation.
+
+The packed conversion changes show no consistent useful win. A second 100-repetition packed
+activation run gave 0.537 -> 0.534 / 2.719 -> 2.691 / 2.894 -> 2.904 ms: the roughly 1% advantage
+moved between workloads, and T=8 changed from winning to losing. A second precasting run gave
+0.534 -> 0.543 / 2.695 -> 2.701 / 2.882 -> 2.884 ms, confirming no win. Precasting removes repeated
+BF16->FP16 conversion from the row loops but adds two conversion launches and scratch buffers;
+those costs are included in its times. Two-pair reuse raises up-kernel registers from 40 to 54
+(no spills) and loses 5-7% on these sparse routes. It might behave differently on denser routing;
+these results do not prove every possible two-pair implementation loses.
+
+FP16 weight expansion grows just the weight payload from 566,231,040 to 2,264,924,160 bytes for
+32 experts, excluding scales and the original FP4 copy retained for A/B. Expansion is outside the
+timed region, making these optimistic steady-state cache numbers. Even eliminating scale loads
+and multiplies does not offset the extra weight traffic: these variants lose 3.4-4.9x. Freeing memory
+by reducing context length therefore does not make this particular FP16 CUDA-core cache faster.
+This is not a measurement of a different tensor-core GEMM implementation.
+
+The serving CUDA source was restored byte-for-byte (SHA256
+`f28eb41f84b0e7b607335ca7837055a0850d9972116da1074e0410089875eede`), keeping both CUDA defaults
+enabled. All six GPU regression tests pass in both reduction modes after restoration. No engine settings, serving
+allocations, or quality assumptions changed.
+
+Reproduce with the worker stopped and `MODEL_DIR` pointing at the checkpoint:
+
+```sh
+python tools/bench_fp4_casting.py packed --iters 100
+python tools/bench_fp4_casting.py precast --iters 100
+python tools/bench_fp4_casting.py pair2 --iters 100
+python tools/bench_fp4_casting.py decode4 --iters 100
+python tools/bench_fp4_predecoded.py --iters 100
+python tools/bench_fp4_predecoded.py --iters 100 --scaled
+```
+
+The benchmark-only patches under `tools/experiments/` are applied to temporary sources with
+zero patch fuzz. They are not production switches; patch failures after kernel changes should be
+reviewed rather than silently adapting a stale experiment.
+
+### Aggressive half2 arithmetic: no useful speed/accuracy tradeoff (2026-09-22)
+
+The next experiment changes the arithmetic, not just the casts. `half2_group` keeps decoded
+FP4 values and rounded activations in packed FP16, uses `__hmul2`/`__hfma2` for the local
+products, and performs the three width-8 shuffle/add stages in packed FP16. Only then are
+the even/odd partials widened to FP32, combined, scaled, and accumulated across K. No
+unscaled partial crosses a 32-element scale boundary. The less aggressive `half2_local`
+widens immediately after the local two-term packed sums and retains FP32 subgroup reduction.
+Both are benchmark-only patches; neither changes the serving source or boot configuration.
+
+Two 100-repetition alternating graph runs of `half2_group`, real layer-0 weights, top-k=6,
+32-expert arena, stopped serving worker, relaxed baseline, FP32 output:
+
+| tokens / distinct experts | baseline -> candidate, run 1 (ms) | run 2 (ms) | candidate relative L2 error vs Triton |
+|---|---:|---:|---:|
+| 1 / 6 | 0.5361 -> 0.5329 | 0.5362 -> 0.5342 | 0.002738 |
+| 6 / 30 | 2.7086 -> 2.7160 | 2.7028 -> 2.7134 | 0.002511 |
+| 8 / 32 | 2.9155 -> 2.9156 | 2.8880 -> 2.8836 | 0.002660 |
+
+That is within about +/-0.6% of baseline, with substantially greater numerical error. The
+baseline errors remain 4.59e-8 / 2.54e-5 / 2.17e-4. The CUDA 13.0 sm_121a disassembly confirms
+actual HMUL2/HFMA2 and packed reduction instructions; up registers fall from 40 to 38 with
+no spills. Fewer instructions alone do not establish a speedup on this workload.
+
+`half2_local`'s first 100-repetition run gave 0.5353 -> 0.5340 / 2.7427 -> 2.7101 /
+2.9165 -> 2.8721 ms, with errors 0.002147 / 0.001805 / 0.001867. These 0.3-1.5% improvements
+are small and all three errors still exceed the existing 1e-3 kernel gate. This is not a
+language-quality measurement, and the gate was not loosened to promote either candidate.
+
+The aggressive candidate also fails the synthetic parity checks (seven routing/shape subcases,
+relative error 0.0030-0.0033) and the mixed-null parity assertion (0.00318). Graph replay,
+down scatter/tail layout, and both routing tests pass. These accuracy failures are distinct
+from the following deliberate range stress, not evidence of a routing bug.
+
+The range stress uses a down projection with K=128, all FP4 weights +6, scales 1/128, and
+constant BF16 activations. At activation 1024 the exact and baseline result is 6144, while
+`half2_group` produces infinity before the scale can bring it back into range. `half2_local`
+remains finite there, but overflows at activation 8192 (baseline 49152). These deliberately
+large inputs are not a measured serving activation distribution; they demonstrate lost
+range, not observed full-model collapse. Neither candidate has a full-model quality test.
+
+Reproduce without changing the serving kernel:
+
+```sh
+MODEL_DIR=/path/to/checkpoint python tools/bench_fp4_casting.py half2_group --iters 100 --stress
+MODEL_DIR=/path/to/checkpoint python tools/bench_fp4_casting.py half2_local --iters 100 --stress
+```
+
+For these approximate candidates the benchmark reports `kernel_error_gate_passed=False` but
+continues through all workloads. Its process exit status is **not** an accuracy gate. The
+production CUDA source retains the SHA256 recorded above, and its six GPU tests still pass.
+
+### Batching the sampled verifier can waste work after early rejection
+
+The opt-in `DSV41_BATCHED_VERIFY=1` prototype removes per-proposal scalar readbacks and
+batches probability calculation. At three drafts/top_p=0.95, synthetic mixed-acceptance
+sampler latency improved 0.855 -> 0.719 ms, but first-rejection latency regressed
+0.344 -> 0.720 ms because unused target rows were sorted. The absolute saving is small,
+seeded outputs change, and no end-to-end speedup is established. It stays default-off;
+see [sampling tests and measurements](spec-sampling.md) before enabling or extending it.
+
+### Mapped host weights avoid a copy but can slow repeated reads
+
+GB10's shared physical DRAM does not make the current pinned staging buffer and CUDA arena the
+same allocation. `ExpertStore._read_leased` reads SSD data into pinned host memory, then
+`_load_into_slot` copies it into the arena. NVIDIA also documents that ordinary `cudaMalloc`
+allocations cannot be coherently accessed by the CPU/I/O complex on Spark; see the
+[Spark CUDA porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html).
+A zero-copy design needs an appropriate mapped allocation and ownership/synchronization protocol.
+
+`tools/bench_fp4_mapped.py` compares the same native kernel with device weights and pinned CPU
+weights obtained through `cudaHostGetDevicePointer`. A 60-repetition alternating graph run,
+32 real experts, original-order tuned reduction (`DSV41_FP4_CUDA_RELAXED=0`), gave:
+
+| tokens / distinct experts | device weights | mapped weights |
+|---|---:|---:|
+| 1 / 6 | 0.565 ms | 0.588 ms |
+| 6 / 30 | 2.871 ms | 3.493 ms |
+| 8 / 32 | 3.198 ms | 4.434 ms |
+
+Outputs were bit-identical, but mapped reads were 4%, 22%, and 39% slower. This excludes the
+initial copy and SSD I/O: it rejects assuming mapped memory is free for a hot resident arena,
+not the possibility of saving latency on one-use cold experts. Measure load-plus-compute and
+buffer lifetime before adopting it. The serving expert allocator/loader was not changed.
+
 ## `persistent_topk` does not fit in GB10's shared memory
 
 This one is inherited, and it is the reason no upstream engine runs this model on one

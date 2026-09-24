@@ -300,6 +300,14 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
         if not isinstance(m, dict) or not isinstance(m.get("role"), str):
             raise APIError(400, f"messages[{i}] must be an object with a `role`", param=f"messages[{i}]")
     messages = copy.deepcopy(messages)
+    # OpenAI renamed the system role to "developer" for its newer models and harnesses send
+    # it by default. V4.1 has no developer role and an unknown role is a hard error in the
+    # encoder, so fold it into system -- including mid-conversation, which the encoder
+    # supports. Do this before the tools/schema check below so they ride the first message
+    # instead of spawning a second, empty system one.
+    for m in messages:
+        if m["role"] == "developer":
+            m["role"] = "system"
     _reject_images(messages)
 
     # Tools and response_format ride on the first message; the encoder only

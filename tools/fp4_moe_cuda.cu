@@ -1,0 +1,377 @@
+// Decode-sized native CUDA kernels for fp4_moe.py.
+//
+// The serving Triton kernel deliberately uses a BM=16 tensor-core tile even when an expert
+// receives only one routed pair.  That is the right general grouped-GEMM shape, but decode usually
+// has 18-36 pairs spread over almost as many experts.  These kernels instead assign one warp to an
+// output row, stream a coalesced 64-byte FP4 weight tile, and do work only for the real pairs in the
+// block. Pair-outer loops keep one pair's state live; activation loads are vectorized. The default
+// FP4_RELAXED_REDUCE removes more shuffles by changing summation order; set it to 0 to retain the
+// original CUDA arithmetic order. BF16 output boundaries remain intact in both modes. See
+// docs/gotchas.md for the measured tradeoffs and remaining whole-engine validation scope.
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+
+namespace {
+
+constexpr int kBlockM = 16;
+#ifndef FP4_WARPS_SHIFT
+#define FP4_WARPS_SHIFT 3
+#endif
+constexpr int kWarpsShift = FP4_WARPS_SHIFT;
+constexpr int kWarps = 1 << kWarpsShift;
+constexpr int kThreads = kWarps << 5;
+#ifndef FP4_ROWS_PER_WARP
+#define FP4_ROWS_PER_WARP 1
+#endif
+constexpr int kRowsPerWarp = FP4_ROWS_PER_WARP;
+constexpr int kRowsPerBlock = kRowsPerWarp << kWarpsShift;
+
+constexpr int log2_exact(unsigned value) {
+    int shift = 0;
+    while (value > 1) { value >>= 1; ++shift; }
+    return shift;
+}
+
+static_assert(kRowsPerBlock > 0 && (kRowsPerBlock & (kRowsPerBlock - 1)) == 0,
+              "rows per block must remain a power of two");
+constexpr int kRowsPerBlockShift = log2_exact(kRowsPerBlock);
+#ifndef FP4_RELAXED_REDUCE
+#define FP4_RELAXED_REDUCE 1
+#endif
+
+__device__ __forceinline__ void decode_e2m1x2(uint8_t packed, float &even, float &odd) {
+    uint32_t bits;
+    uint32_t src = packed;
+    // sm_121a requires the cvt source to be a real .b8 register.  The low output half is the
+    // low-nibble (even-K) value and the high output half is the high-nibble (odd-K) value.
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, %1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
+        "}"
+        : "=r"(bits) : "r"(src));
+    __half_raw lo{static_cast<uint16_t>(bits)};
+    __half_raw hi{static_cast<uint16_t>(bits >> 16)};
+    even = __half2float(static_cast<__half>(lo));
+    odd = __half2float(static_cast<__half>(hi));
+}
+
+__device__ __forceinline__ float ue8m0(uint8_t scale) {
+    return __uint_as_float(static_cast<uint32_t>(scale) << 23);
+}
+
+__device__ __forceinline__ void load_activation4(
+    const __nv_bfloat16 *p, float &x0, float &x1, float &x2, float &x3) {
+    // Model strides and lane offsets are multiples of four BF16 elements (8-byte aligned).
+    const uint2 bits = *reinterpret_cast<const uint2 *>(p);
+    x0 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x & 0xffff))));
+    x1 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x >> 16))));
+    x2 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y & 0xffff))));
+    x3 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y >> 16))));
+}
+
+__device__ __forceinline__ float subgroup8_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 4, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 2, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 1, 8);
+    return v;
+}
+
+__device__ __forceinline__ float ordered_quad_sum(float v) {
+    // The four subgroup leaders hold the per-32-K partials.  Add them in K order, matching
+    // _quad_dot rather than allowing the compiler to tree-reduce across scale boundaries.
+    // Only lane 0 consumes the result, so its first partial needs no broadcast.
+    float out = v;
+    out += __shfl_sync(0xffffffffu, v, 8);
+    out += __shfl_sync(0xffffffffu, v, 16);
+    out += __shfl_sync(0xffffffffu, v, 24);
+    return out;
+}
+
+__device__ __forceinline__ float silu_like_triton(float x) {
+    float e, inv;
+    const float exponent = -x * 1.4426950408889634f;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(exponent));
+    const float denom = 1.0f + e;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(inv) : "f"(1.0f), "f"(denom));
+    return x * inv;
+}
+
+__global__ void moe_up_bm16(
+    const __nv_bfloat16 *__restrict__ x,
+    const uint8_t *__restrict__ w1, const uint8_t *__restrict__ s1,
+    const uint8_t *__restrict__ w3, const uint8_t *__restrict__ s3,
+    __nv_bfloat16 *__restrict__ h, const float *__restrict__ route_weight,
+    const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
+    int64_t stride_x, int64_t stride_h, float limit,
+    int topk, int n, int k, int null_slot) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0 || slot_i == null_slot) return;
+
+    // k is a positive model dimension and a multiple of 128. Keep these as explicit shifts: these
+    // address calculations sit in the hot kernel and must not depend on strength reduction.
+    const int kb = k >> 1;
+    const int sg = k >> 5;
+    const int q_count = k >> 7;
+    const int subgroup = lane >> 3;
+    const int subgroup_lane = lane & 7;
+    for (int row_in_warp = 0; row_in_warp < kRowsPerWarp; ++row_in_warp) {
+        const int out_n = (static_cast<int>(blockIdx.y) << kRowsPerBlockShift)
+                        + (row_in_warp << kWarpsShift) + warp;
+        if (out_n >= n) continue;
+        const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+        const uint8_t *w1_row = w1 + row * kb;
+        const uint8_t *w3_row = w3 + row * kb;
+        const uint8_t *s1_row = s1 + row * sg;
+        const uint8_t *s3_row = s3 + row * sg;
+
+        // Routing entries are contiguous, then padded with -1. Keep only one pair's accumulators
+        // live across K, instead of sixteen pairs and sixteen validity branches per K tile.
+        for (int m = 0; m < kBlockM; ++m) {
+            const int route = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+            if (route < 0) break;
+            const int pair = route & 0xffff;
+            const __nv_bfloat16 *x_row = x + static_cast<int64_t>(route >> 16) * stride_x;
+            float gate = 0.0f, up = 0.0f;
+            // One warp load is 32 x uint16 = 64 contiguous bytes = 128 logical K values.
+            for (int q = 0; q < q_count; ++q) {
+                const int byte_k = (q << 6) + (lane << 1);
+                const uint16_t p1 = *reinterpret_cast<const uint16_t *>(w1_row + byte_k);
+                const uint16_t p3 = *reinterpret_cast<const uint16_t *>(w3_row + byte_k);
+                float w1e0, w1o0, w1e1, w1o1, w3e0, w3o0, w3e1, w3o1;
+                decode_e2m1x2(static_cast<uint8_t>(p1), w1e0, w1o0);
+                decode_e2m1x2(static_cast<uint8_t>(p1 >> 8), w1e1, w1o1);
+                decode_e2m1x2(static_cast<uint8_t>(p3), w3e0, w3o0);
+                decode_e2m1x2(static_cast<uint8_t>(p3 >> 8), w3e1, w3o1);
+                const float scale1 = ue8m0(s1_row[(q << 2) + subgroup]);
+                const float scale3 = ue8m0(s3_row[(q << 2) + subgroup]);
+                const int xk = (q << 7) + (lane << 2);
+
+                float pge = 0.0f, pgo = 0.0f, pue = 0.0f, puo = 0.0f;
+                const __nv_bfloat16 *xp = x_row + xk;
+                float x0, x1, x2, x3;
+                load_activation4(xp, x0, x1, x2, x3);
+                pge = fmaf(x0, w1e0, pge); pge = fmaf(x2, w1e1, pge);
+                pgo = fmaf(x1, w1o0, pgo); pgo = fmaf(x3, w1o1, pgo);
+                pue = fmaf(x0, w3e0, pue); pue = fmaf(x2, w3e1, pue);
+                puo = fmaf(x1, w3o0, puo); puo = fmaf(x3, w3o1, puo);
+                float pg, pu;
+                if constexpr (FP4_RELAXED_REDUCE) {
+                    pg = subgroup8_sum(pge + pgo);
+                    pu = subgroup8_sum(pue + puo);
+                } else {
+                    pg = subgroup8_sum(pge) + subgroup8_sum(pgo);
+                    pu = subgroup8_sum(pue) + subgroup8_sum(puo);
+                }
+                if (subgroup_lane == 0) { pg *= scale1; pu *= scale3; }
+                if constexpr (FP4_RELAXED_REDUCE) {
+                    // Keep each scale subgroup's sum across K; combine the four only once at the end.
+                    gate += pg; up += pu;
+                } else {
+                    pg = ordered_quad_sum(pg);
+                    pu = ordered_quad_sum(pu);
+                    if (lane == 0) { gate += pg; up += pu; }
+                }
+            }
+
+            if constexpr (FP4_RELAXED_REDUCE) {
+                gate = ordered_quad_sum(gate);
+                up = ordered_quad_sum(up);
+            }
+            if (lane == 0) {
+                // The reference quantized linear rounds to BF16 before the FP32 epilogue.
+                float g = __bfloat162float(__float2bfloat16_rn(gate));
+                float u = __bfloat162float(__float2bfloat16_rn(up));
+                g = fminf(g, limit);
+                u = fminf(fmaxf(u, -limit), limit);
+                const float silu = silu_like_triton(g);
+                const float value = silu * u * route_weight[pair];
+                h[static_cast<int64_t>(pair) * stride_h + out_n] = __float2bfloat16_rn(value);
+            }
+        }
+    }
+}
+
+__global__ void moe_down_bm16(
+    const __nv_bfloat16 *__restrict__ h,
+    const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
+    float *__restrict__ y, const int32_t *__restrict__ block_slot,
+    const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0) return;
+
+    const int kb = k >> 1;
+    const int sg = k >> 5;
+    const int q_count = k >> 7;
+    const int subgroup = lane >> 3;
+    const int subgroup_lane = lane & 7;
+    for (int row_in_warp = 0; row_in_warp < kRowsPerWarp; ++row_in_warp) {
+        const int out_n = (static_cast<int>(blockIdx.y) << kRowsPerBlockShift)
+                        + (row_in_warp << kWarpsShift) + warp;
+        if (out_n >= n) continue;
+        const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+        for (int m = 0; m < kBlockM; ++m) {
+            const int pair = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+            if (pair < 0) break;
+            float acc = 0.0f;
+            if (slot_i != null_slot) {
+                const uint8_t *w2_row = w2 + row * kb;
+                const uint8_t *s2_row = s2 + row * sg;
+                const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pair) * stride_h;
+                for (int q = 0; q < q_count; ++q) {
+                    const int byte_k = (q << 6) + (lane << 1);
+                    const uint16_t packed = *reinterpret_cast<const uint16_t *>(w2_row + byte_k);
+                    float we0, wo0, we1, wo1;
+                    decode_e2m1x2(static_cast<uint8_t>(packed), we0, wo0);
+                    decode_e2m1x2(static_cast<uint8_t>(packed >> 8), we1, wo1);
+                    const float scale = ue8m0(s2_row[(q << 2) + subgroup]);
+                    const int hk = (q << 7) + (lane << 2);
+                    float pe = 0.0f, po = 0.0f;
+                    const __nv_bfloat16 *hp = h_row + hk;
+                    float x0, x1, x2, x3;
+                    load_activation4(hp, x0, x1, x2, x3);
+                    pe = fmaf(x0, we0, pe); pe = fmaf(x2, we1, pe);
+                    po = fmaf(x1, wo0, po); po = fmaf(x3, wo1, po);
+                    float p;
+                    if constexpr (FP4_RELAXED_REDUCE) p = subgroup8_sum(pe + po);
+                    else p = subgroup8_sum(pe) + subgroup8_sum(po);
+                    if (subgroup_lane == 0) p *= scale;
+                    if constexpr (FP4_RELAXED_REDUCE) acc += p;
+                    else {
+                        p = ordered_quad_sum(p);
+                        if (lane == 0) acc += p;
+                    }
+                }
+            }
+
+            if constexpr (FP4_RELAXED_REDUCE) acc = ordered_quad_sum(acc);
+            if (lane == 0) {
+                const int local_n = n / parts_world;
+                const int token = pair / topk;
+                const int expert_k = pair % topk;
+                const int64_t out_row = static_cast<int64_t>(expert_k) * ntok + token;
+                int64_t offset;
+                if (parts_world > 1) {
+                    offset = ((out_n / local_n) * static_cast<int64_t>(topk * ntok) + out_row)
+                             * local_n + out_n % local_n;
+                } else {
+                    offset = out_row * stride_y + out_n;
+                }
+                float value = slot_i == null_slot ? 0.0f : acc;
+                if (!partial) value = __bfloat162float(__float2bfloat16_rn(value));
+                y[offset] = value;
+            }
+        }
+    }
+}
+
+__global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
+                                 int32_t *block_pair, int32_t *block_route,
+                                 int pairs, int topk) {
+    const int p = threadIdx.x;
+    for (int i = p; i < pairs; i += blockDim.x) block_slot[i] = -1;
+    for (int i = p; i < (pairs << 4); i += blockDim.x) {
+        block_pair[i] = -1;
+        block_route[i] = -1;
+    }
+    __shared__ int32_t sorted_slot[64];
+    __shared__ int32_t sorted_pair[64];
+    if (p < pairs) { sorted_slot[p] = slots[p]; sorted_pair[p] = p; }
+    __syncthreads();
+    if (p != 0) return;
+    // Stable insertion sort is only O(P^2) once, with P <= 64, and exactly matches the torch
+    // builder's argsort contract.  The earlier one-thread-per-p ranker did O(P^3) work.
+    for (int i = 1; i < pairs; ++i) {
+        const int32_t value = sorted_slot[i], pair = sorted_pair[i];
+        int j = i;
+        while (j && sorted_slot[j - 1] > value) {
+            sorted_slot[j] = sorted_slot[j - 1];
+            sorted_pair[j] = sorted_pair[j - 1];
+            --j;
+        }
+        sorted_slot[j] = value;
+        sorted_pair[j] = pair;
+    }
+    int block = -1, rank = 0;
+    int32_t previous = INT32_MIN;
+    for (int i = 0; i < pairs; ++i) {
+        const int32_t value = sorted_slot[i];
+        if (!i || value != previous || rank == kBlockM) {
+            ++block; rank = 0; previous = value; block_slot[block] = value;
+        }
+        // Split long runs instead of silently dropping pair 17+ when small top-k permits T > 16.
+        const int index = (block << 4) + rank;
+        block_pair[index] = sorted_pair[i];
+        block_route[index] = sorted_pair[i] | ((sorted_pair[i] / topk) << 16);
+        ++rank;
+    }
+}
+
+__global__ void round_reduce(const float *parts, void *out, int td, int topk, int out_bf16) {
+    // This internal kernel is always launched with 256 threads below.
+    const int i = (static_cast<int>(blockIdx.x) << 8) + threadIdx.x;
+    if (i >= td) return;
+    float total = 0.0f;
+    for (int k = 0; k < topk; ++k)
+        total += __bfloat162float(__float2bfloat16_rn(parts[static_cast<int64_t>(k) * td + i]));
+    if (out_bf16)
+        static_cast<__nv_bfloat16 *>(out)[i] = __float2bfloat16_rn(total);
+    else
+        static_cast<float *>(out)[i] = total;
+}
+
+} // namespace
+
+extern "C" int fp4_moe_cuda_up(
+    void *stream, const void *x, const void *w1, const void *s1, const void *w3, const void *s3,
+    void *h, const void *route_weight, const void *block_slot, const void *block_pair,
+    int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
+    int null_slot) {
+    dim3 grid(nb, (n + kRowsPerBlock - 1) >> kRowsPerBlockShift);
+    moe_up_bm16<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
+        static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
+        static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
+        static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),
+        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k,
+        null_slot);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_down(
+    void *stream, const void *h, const void *w2, const void *s2, void *y,
+    const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
+    dim3 grid(nb, (n + kRowsPerBlock - 1) >> kRowsPerBlockShift);
+    moe_down_bm16<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
+        static_cast<const uint8_t *>(s2), static_cast<float *>(y),
+        static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_route_small(void *stream, const void *slots, void *block_slot,
+                                          void *block_pair, void *block_route,
+                                          int pairs, int topk) {
+    route_small_bm16<<<1, 64, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const int32_t *>(slots), static_cast<int32_t *>(block_slot),
+        static_cast<int32_t *>(block_pair), static_cast<int32_t *>(block_route), pairs, topk);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_round_reduce(void *stream, const void *parts, void *out,
+                                           int td, int topk, int out_bf16) {
+    round_reduce<<<(td + 255) >> 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const float *>(parts), out, td, topk, out_bf16);
+    return static_cast<int>(cudaGetLastError());
+}

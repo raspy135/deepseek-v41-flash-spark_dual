@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Execution walkthrough — prefill and decode</title>
+<style>
+:root { --fg:#1c1e21; --muted:#5b6470; --line:#d9dee5; --code:#f4f6f8;
+        --accent:#0b5fa5; --warn:#8a5b00; --bg:#fff; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:16px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+.wrap { max-width:920px; margin:0 auto; padding:32px 22px 80px; }
+h1 { font-size:1.9rem; line-height:1.25; margin:.2em 0 .6em; }
+h2 { font-size:1.42rem; margin:2.1em 0 .55em; padding-bottom:.28em; border-bottom:2px solid var(--line); }
+h3 { font-size:1.14rem; margin:1.7em 0 .45em; }
+h4 { font-size:1rem; margin:1.3em 0 .35em; }
+p { margin:.7em 0; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+code { font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:.87em;
+       background:var(--code); padding:.12em .35em; border-radius:4px; }
+pre { background:#11151c; color:#e7edf5; padding:14px 16px; border-radius:8px;
+      overflow-x:auto; font-size:.84rem; line-height:1.5; }
+pre code { background:none; color:inherit; padding:0; font-size:1em; }
+hr { border:0; border-top:1px solid var(--line); margin:2.2em 0; }
+blockquote { margin:1em 0; padding:.55em 1em; border-left:4px solid var(--accent);
+             background:#f7fafd; color:var(--muted); border-radius:0 6px 6px 0; }
+table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.9rem; display:block; overflow-x:auto; }
+th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+th { background:#f2f5f8; font-weight:600; }
+tr:nth-child(even) td { background:#fafbfc; }
+ul, ol { margin:.6em 0; padding-left:1.5em; }
+li { margin:.28em 0; }
+nav.toc { background:#f7fafd; border:1px solid var(--line); border-radius:8px;
+          padding:12px 18px; margin:0 0 2em; font-size:.9rem; }
+nav.toc h2 { font-size:.95rem; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--muted); border:0; margin:0 0 .5em; }
+nav.toc ul { list-style:none; padding-left:0; margin:0; columns:2; column-gap:24px; }
+nav.toc li.lvl3 { padding-left:1.1em; color:var(--muted); }
+nav.toc a { color:var(--fg); }
+@media (max-width:640px){ nav.toc ul{columns:1;} .wrap{padding:20px 14px 60px;} }
+</style></head>
+<body><div class="wrap">
+<nav class="toc"><h2>Contents</h2><ul><li class="lvl1"><a href="#execution-walkthrough-what-runs-in-what-order-and-how-long">Execution walkthrough: what runs, in what order, and how long</a></li><li class="lvl2"><a href="#0-vocabulary-in-one-screen-skip-if-you-know-inference">0. Vocabulary in one screen (skip if you know inference)</a></li><li class="lvl2"><a href="#1-the-two-phases-at-a-glance">1. The two phases at a glance</a></li><li class="lvl2"><a href="#2-boot-once-before-the-port-opens-no-request-yet">2. Boot (once, before the port opens — no request yet)</a></li><li class="lvl2"><a href="#3-request-lifecycle">3. Request lifecycle</a></li><li class="lvl2"><a href="#4-prefill-in-execution-order">4. Prefill, in execution order</a></li><li class="lvl3"><a href="#4-1-before-the-first-chunk">4.1 Before the first chunk</a></li><li class="lvl3"><a href="#4-2-per-chunk-ced-path-the-default">4.2 Per chunk (CED path, the default)</a></li><li class="lvl3"><a href="#4-3-after-the-last-chunk">4.3 After the last chunk</a></li><li class="lvl3"><a href="#4-4-prefill-phase-budget-measured">4.4 Prefill phase budget (measured)</a></li><li class="lvl2"><a href="#5-decode-in-execution-order">5. Decode, in execution order</a></li><li class="lvl3"><a href="#5-1-one-iteration-one-verify-step-up-to-t-verify-6-tokens">5.1 One iteration = one verify step (up to T_VERIFY=6 tokens)</a></li><li class="lvl3"><a href="#5-2-inside-fastdecoder-step">5.2 Inside FastDecoder.step</a></li><li class="lvl3"><a href="#5-3-decode-phase-budget-measured">5.3 Decode phase budget (measured)</a></li><li class="lvl3"><a href="#5-4-what-is-not-in-the-decode-step">5.4 What is *not* in the decode step</a></li><li class="lvl3"><a href="#5-5-the-block-size-t-draft-t-verify">5.5 The block size: T_DRAFT / T_VERIFY</a></li><li class="lvl2"><a href="#6-the-per-token-cost-model">6. The per-token cost model</a></li><li class="lvl2"><a href="#7-instrumentation-map">7. Instrumentation map</a></li><li class="lvl2"><a href="#8-changing-code-build-sync-restart">8. Changing code: build, sync, restart</a></li><li class="lvl3"><a href="#why-both-build-and-sync">Why both build *and* sync</a></li><li class="lvl3"><a href="#cost-and-failure-modes">Cost and failure modes</a></li><li class="lvl2"><a href="#9-where-to-go-next-by-question">9. Where to go next, by question</a></li></ul></nav>
+<h1 id="execution-walkthrough-what-runs-in-what-order-and-how-long">Execution walkthrough: what runs, in what order, and how long</h1>
+<p>A guided tour of the prefill and decode paths, written for someone who is strong in Python/CUDA-adjacent systems but new to transformer inference. Every claim about *order* is read from the source, with <code>file:line</code>. Every number is either marked *measured* (taken from an artifact in <code>results/</code> or a doc) or *estimated* (arithmetic from a measured envelope). Read <a href="gotchas.md">gotchas.md</a> before touching anything; read <a href="architecture.md">architecture.md</a> for why the design is shaped this way.</p>
+<hr>
+<h2 id="0-vocabulary-in-one-screen-skip-if-you-know-inference">0. Vocabulary in one screen (skip if you know inference)</h2>
+<table><thead><tr><th>term</th><th>what it means here</th></tr></thead><tbody><tr><td><strong>token</strong></td><td>one vocabulary id; <code>vocab_size=129280</code>. The model turns a sequence of ids into a sequence of next-token distributions.</td></tr><tr><td><strong>prefill</strong></td><td>run the whole prompt through the model once, in parallel. Shape is <code>[T_prompt, model]</code>. Compute-bound. Produces the KV cache and the first logits.</td></tr><tr><td><strong>decode</strong></td><td>produce one (or a few) tokens at a time, reusing the KV cache. Shape is <code>[T_verify≈6, model]</code>. Memory-bandwidth-bound.</td></tr><tr><td><strong>KV cache</strong></td><td>per-layer key/value tensors for every position already processed, so decode doesn't recompute the past. Here it is MLA-style: one 512-dim latent per token, not full K and V.</td></tr><tr><td><strong>MoE</strong></td><td>Mixture of Experts. Each token is routed to the top-k (k=6) of 384 small FFNs ("experts") per layer. Only those experts run. The weights are the 288 GB problem.</td></tr><tr><td><strong>router / gate</strong></td><td>the tiny linear + softmax that picks the top-6 experts and their weights.</td></tr><tr><td><strong>GEMM</strong></td><td>matrix multiply (<code>C = A @ B</code>). "fp8/fp4/bf16 GEMM" = the stored dtype of the weights.</td></tr><tr><td><strong>kernel launch</strong></td><td>one CPU→GPU work submission. Hundreds per token. Launch overhead matters at T=1.</td></tr><tr><td><strong>CUDA graph</strong></td><td>a recorded sequence of kernels replayed with one launch. The graphed decode path replays ~3 graphs per step instead of ~1000 launches.</td></tr><tr><td><strong>TP2 / EP2</strong></td><td>two DGX Sparks. <strong>TP</strong> splits a tensor across ranks and all-reduces the result; <strong>EP</strong> gives each rank half the experts. This fork runs both.</td></tr><tr><td><strong>DSpark</strong></td><td>a resident 3-block drafter that proposes 5 tokens; the main model verifies them in one pass. Speculative decoding: lossless, faster when drafts are accepted.</td></tr><tr><td><strong>Engram</strong></td><td>an n-gram lookup table on layers 1 and 14. 24 rows/token/layer, keyed by token ids alone (no forward pass needed to know the addresses).</td></tr></tbody></table>
+<p>Two model stacks live in one process:</p>
+<ul><li><strong>main</strong>: <code>n_layers=40</code> backbone layers, indices <code>0..39</code>.</li><li><strong>drafter</strong>: 3 MTP blocks, indices <code>40..42</code>, own 128-expert MoE each, always resident.</li></ul>
+<p>Layer constants (from <code>inference/config.json</code>): <code>dim=5120</code>, <code>hc_mult=4</code> (hyper-connection stream width), <code>n_heads=64</code>, <code>head_dim=512</code>, <code>window_size=128</code>, <code>n_routed_experts=384</code>, <code>n_activated_experts=6</code>, <code>compress_ratios = [0,0, 2×18, 1×20, 0,0,0]</code>, <code>kv_source_layers=(2,8,14,20)</code>, <code>engram_layer_ids=(1,14)</code>, <code>dspark_target_layer_ids=(37,38,39)</code>, <code>candidate_source_layer=20</code>.</p>
+<p>Size of the job, for intuition:</p>
+<pre><code>T=1 decode, per emitted token:
+  40 layers × (attention + 6 routed experts + 1 shared expert)
+  + 3 drafter blocks × (attention + 3 of 128 experts)
+  ≈ 1000 CUDA kernel launches, ~100 ms of GPU work</code></pre>
+<hr>
+<h2 id="1-the-two-phases-at-a-glance">1. The two phases at a glance</h2>
+<pre><code>                          PREFILL                              DECODE (per verify step)
+input shape               [T_prompt, ...]                      [6, ...]  (1 tok + 5 drafts)
+chunking                  DSV41_PREFILL_CHUNK=1024 (default 2048)  none
+layers run                0..20 encoder, then 21..39 replay   0..39 every step
+KV writes                 every position                       6 positions, rolling window
+bottleneck                GPU compute + EP2 grouping            memory bandwidth + NVMe misses
+measured envelope         ~460-950 tok/s                       ~19-25 tok/s
+per-token wall            ~1.1-2.2 ms (fast) / ~10-20 ms (cold) ~37-51 ms</code></pre>
+<p>The single most important structural fact: <strong>prefill only runs the encoder half of the prompt.</strong> Under CED (Cross-layer Encoder-Decoder, <code>swa_replay=True</code>, the default), layers 0..20 write all the global compressed KV the decoder needs; the decoder's only per-position state is its 128-token sliding window, which is replayed once over the prompt's tail. The code for this is <code>Model.forward(..., encoder_only=True)</code> at <code>engine/model.py:1215</code> and <code>Model.decoder_replay</code> at <code>engine/model.py:1176</code>.</p>
+<hr>
+<h2 id="2-boot-once-before-the-port-opens-no-request-yet">2. Boot (once, before the port opens — no request yet)</h2>
+<p><code>V41Engine.__init__</code> (<code>engine/v41_engine.py:454</code>) then <code>server/app.py:main</code>.</p>
+<table><thead><tr><th>order</th><th>what</th><th>where</th><th>measured time</th></tr></thead><tbody><tr><td>1</td><td>read <code>model.safetensors.index.json</code>, <code>config.json</code></td><td><code>v41_engine.py:475</code></td><td>ms</td></tr><tr><td>2</td><td>init NCCL/Gloo process group</td><td><code>dist.py::EPDistributed</code></td><td>seconds</td></tr><tr><td>3</td><td>size + allocate expert arena</td><td><code>v41_engine.py:610-666</code></td><td>—</td></tr><tr><td>4</td><td>build keep mask, broadcast to peer, boot guard</td><td><code>v41_engine.py:787-905</code></td><td>—</td></tr><tr><td>5</td><td>load 19 GB of non-expert weights</td><td><code>model.Weights.__init__</code></td><td>~63 s (doc)</td></tr><tr><td>6</td><td>load all 384 DSpark experts (7.2 GB)</td><td><code>v41_engine.py:666</code></td><td>—</td></tr><tr><td>7</td><td><strong>warm start the LRU</strong> from routing trace</td><td><code>store.warm_start</code> <code>experts.py:497</code></td><td>~16 s / 73 GB at 4.6 GB/s</td></tr><tr><td>8</td><td>build device slot LUT (all-resident)</td><td><code>FastDecoder.build_lut</code> <code>fastdecode.py:535</code></td><td>~1 s</td></tr><tr><td>9</td><td>capture CUDA graphs (warm-up + capture)</td><td><code>FastDecoder.capture</code> <code>fastdecode.py:638</code></td><td>seconds</td></tr></tbody></table>
+<p>The arena sizing is deliberately paranoid (<code>v41_engine.py:610</code>): <code>torch.cuda.mem_get_info()</code> undercounts free memory after a download because it counts page cache, so the engine takes <code>max(mem_get_info, /proc/meminfo MemAvailable)</code> and keeps a hard <code>keep_free_gb</code> floor. Getting this wrong gives a 23 GB arena and a permanently NVMe-bound server with no error.</p>
+<p><strong>Graph capture</strong> is where the interesting boot cost is. <code>capture(S_parity, index_bucket)</code> does one warm-up pass and then records. With the device LUT it records <strong>whole segments of layers</strong>, not one graph per layer:</p>
+<pre><code>bounds = {0, 1, 14, 40}  (0, each engram layer boundary, n_layers)
+→ 3 segment graphs: [0,1), [1,14), [14,40)
+41 replays/step become 3.</code></pre>
+<p>Plus two drafter graphs (greedy and sampled) and one graph per <code>(S%2, index bucket)</code>. The <code>S%2</code> parity is required because the ratio-2 key compressor groups positions in pairs around one pending slot (<code>fastdecode.py:71</code>). Context buckets are powers of two (<code>_index_bucket</code>, <code>fastdecode.py:93</code>) so the number of resident graph variants is logarithmic rather than one per token.</p>
+<hr>
+<h2 id="3-request-lifecycle">3. Request lifecycle</h2>
+<pre><code>HTTP POST /v1/chat/completions
+  server/app.py Handler._chat / _completions
+    State.generate(prompt_ids, sampling, ...)              server/app.py:611
+      engine.generate(prompt_ids, ...)                     v41_engine.py:1201   ⏎ generator
+        engine._generate(...)                              v41_engine.py:1219
+          engine._decode_loop(...)                         v41_engine.py:1810
+            [ PREFILL ] ─────────────────────────────► first token
+            [ DECODE  ] ──── yields bursts of tokens ─► ...
+      IncrementalDetokenizer.push(ids)                     server/app.py:356
+      OutputRouter.feed(text)                              server/app.py:398
+    SSE / JSON to client</code></pre>
+<p><code>generate</code> holds <code>self.lock</code> and is a <strong>generator</strong>: each <code>yield</code> is a burst of one or more settled token ids. The server detokenizes and applies stop strings/tool-call parsing *outside* the engine. The engine is single-sequence by default (<code>DSV41_MAX_CONCURRENCY=1</code>).</p>
+<p><code>_reset()</code> (<code>v41_engine.py:1009</code>) zeroes every counter at the top of each request, because the stats epilogue runs in a <code>finally</code> and an aborted request still has to report its own work rather than the previous request's.</p>
+<hr>
+<h2 id="4-prefill-in-execution-order">4. Prefill, in execution order</h2>
+<p>Driver: <code>V41Engine._decode_loop</code> (<code>v41_engine.py:1810</code>), lines 1828–1945.</p>
+<h3 id="4-1-before-the-first-chunk">4.1 Before the first chunk</h3>
+<pre><code>m.begin_prompt()                     # empties the SWA replay buffer (only if prefix_start==0)
+hashes_t = m.hash_state(ids[None], 0, mask)          # GPU: n-gram hashes for the WHOLE prompt
+ra = self._engram_readahead(...)                      # CPU thread pool: start NVMe reads NOW</code></pre>
+<p><code>hash_state</code> (<code>engine/engram.py:396::make_hash_state</code>) maps token ids through a compressed vocab (NFKC+lowercase, 99092 ids) and XORs previous ids under per-<code>(layer,lookback)</code> multipliers. <strong>The addresses depend on ids alone</strong>, so the engine hashes the entire prompt up front (<code>v41_engine.py:1863-1865</code>) and lets chunk *k+1*'s rows read off NVMe while chunk *k* is on the GPU. Hashing per-chunk is bit-identical but costs ~1 s of idle GPU per chunk.</p>
+<p><code>_prefill_spans</code> (<code>v41_engine.py:1755</code>) computes chunk boundaries: <code>MAX_CHUNK</code> tokens, except no image span may straddle one.</p>
+<h3 id="4-2-per-chunk-ced-path-the-default">4.2 Per chunk (CED path, the default)</h3>
+<p>For each span <code>(s, e)</code>:</p>
+<pre><code>_fwd(s, chunk, need_logits=False, encoder_only=True)   # v41_engine.py:1867
+  Model.forward(chunk, s, prefill=True, encoder_only=True)   engine/model.py:1215</code></pre>
+<p>Inside <code>Model.forward</code> (<code>model.py:1238-1294</code>):</p>
+<ol><li><code>hashes = m.hash_state(...)</code> — only if the caller didn't pass them (here it did).</li><li><code>e = self.W.embed[ids]</code> — embedding gather.</li><li><code>h = e.unsqueeze(1).repeat(1, hc_mult, 1)</code> — expand to the 4-wide hyper-connection stream.</li><li>loop <code>L = 0 .. 20</code>:</li></ol>
+<p>a. <strong>Engram</strong> (<code>L in (1,14)</code>): <code>rows = get_rows(L, hashes[:, li, :])</code> → <code>R.engram_forward(h, rows, ...)</code> (<code>v41_ref.py:791</code>). The read is already in flight; this line blocks on the future if it isn't. Row = 256 B FP8 + 8 B UE8M0 scale, 24 rows/token/layer.</p>
+<p>b. <strong><code>Model.block(h, pre_mix, w, L, S, ...)</code></strong> (<code>model.py:1104</code>):</p>
+<p>``<code> _hc_mixes  →  hc_split_sinkhorn  (rms_rsqrt + mm(hc_fn) + 20 Sinkhorn iters) _hc_pre_rn_fused(h, pre_mix, attn_norm)      # hc_ops.py:99 Triton kernel Model.attention(y, w, L, ...)                # model.py:484 q  = rmsnorm(qlinear(x, wq_a)) ; q = qlinear(q, wq_b)     # fp8 Triton q[..., -64:] = apply_rotary(...)                          # RoPE kv = rmsnorm(qlinear(x, wkv)) ; kv = apply_rotary(...) ring[pos % 128] = kv ; wkv = ring[wpos % 128]              # window gather if w.ratio:                                               # layers 2..39 Model._compressed(...)                                # model.py:627 # source layers (2,8,14,20): write global KV # indexer layers (2,8,14,20): Model._indexer → top-512 scores # others: reuse sh.ckv / sh.topk o = _prefill_attn(...) or _softmax_attn(...)              # sinked softmax o = wo_a_proj(o, w.wo_a, tiled=True) ; out = qlinear(o, wo_b)  # grouped + fp8 _hc_post_fused(y, residual, attn_post, attn_comb)  # hc_ops.py:59 _hc_mixes ; _hc_pre_rn_fused(h, attn_pre, ffn_norm) Model.moe(y, w, L, prefill=True, ...)        # model.py:971 scores  = softplus(mm(y.float(), gate_w)).sqrt()   # fp32, near-ties matter logits  = scores + gate_bias indices = logits.topk(6)                            # top-6 of 384 weights = normalize(scores.gather(indices)) * route_scale slots   = store.resolve(L, indices, prefill=True)   # experts.py:420 routed  = moe_fn(y, slots, weights, arena, ...)     # fp4_moe.py:558 _moe_up_kernel   (grid (pair-block, n-block))   # gate+up+SwiGLU _moe_down_kernel (scatter-add fp32)             # down proj shared  = expert_ffn(y, sh_w1, sh_w2, sh_w3)        # dense, every token out     = routed + shared _hc_post_fused(out, residual, ffn_post, ffn_comb) </code>``</p>
+<p>c. if <code>L == 20</code>: <code>_rep_keep(h, pre_mix, sh, S, T)</code> caches the last 128 rows for replay.</p>
+<ol><li><code>self.c.len = S + T</code>.</li></ol>
+<p>Then per-chunk bookkeeping in <code>_decode_loop</code>: <code>_snapshot_prefix</code> (optional), <code>replicas.finish_probe</code>.</p>
+<h3 id="4-3-after-the-last-chunk">4.3 After the last chunk</h3>
+<pre><code>self._save_prefix(prompt)                     # in-memory prefix snapshot
+self.prefix_disk.save(prompt)                 # optional, persistent
+logits, mh, s_rep = m.decoder_replay()        # engine/model.py:1176
+    # layers 21..39 over the last 128 tokens + Model.head
+m.dspark_seed(mh, s_rep)                      # write drafter window KV (model.py:1305)
+self.maintain_inline(P - prefix_start)        # adaptation swaps, if enabled
+tok = sample_probs(logits[-1], temperature, top_p) → multinomial/argmax
+yield [tok]</code></pre>
+<p><strong>Why replay is only 128 tokens:</strong> the decoder's global KV is projected from layer 20's hidden state (CED), so the only thing the decoder layers owe the first decode steps is their own 128-token sliding window. Replay runs them over that tail, not the whole prompt.</p>
+<h3 id="4-4-prefill-phase-budget-measured">4.4 Prefill phase budget (measured)</h3>
+<p>From <code>results/prefill-before.json</code>, <code>results/prefill-stream-1-2-4.json</code> (EP2, 4509-token prompt, 4 chunks of 1024/2048, 19 output tokens). These are host wall-clock counters from <code>last_stats</code>, so they include waits; do not add across rows.</p>
+<table><thead><tr><th>phase</th><th>slow run (before)</th><th>fast run (stream)</th><th>per prompt token (fast)</th></tr></thead><tbody><tr><td>total <code>prefill_s</code></td><td>9.916 s</td><td>5.545 s</td><td><strong>1.23 ms</strong></td></tr><tr><td><code>prefill_tok_s</code></td><td>455</td><td>813</td><td>—</td></tr><tr><td><code>moe_s</code> (40 layers × chunks)</td><td>6.99 s</td><td>0.37 s</td><td>0.08 ms</td></tr><tr><td><code>attn_s</code></td><td>0.30 s</td><td>2.62 s</td><td>0.58 ms</td></tr><tr><td><code>engram_s</code> (host, 94,973 rows)</td><td>2.58 s</td><td>1.53 s</td><td>0.34 ms</td></tr><tr><td><code>ep_s</code> / 82 calls</td><td>0.01 s / 118 µs</td><td>0.02 s / 284 µs</td><td>—</td></tr><tr><td><code>engram_read_s</code></td><td>2.29 s</td><td>0.28 s</td><td>0.06 ms</td></tr></tbody></table>
+<p>The <code>moe_s</code> vs <code>attn_s</code> swap between the two runs is the point: the slow run is dominated by MoE host grouping/dispatch (<code>prefill-moe-timing.md</code> measured 4.15 s of host grouping on a cold request versus 44 ms of GPU grouping envelope), the fast run is attention-bound. Neither is stable across runs. The README's 7,709-token runs measured 489 / 576 / 954 tok/s (15.8 / 13.4 / 8.1 s) with zero prefix reuse.</p>
+<p>The MoE subphases (<code>DSV41_PREFILL_MOE_TIMING=1</code>, <code>engine/prefill_timing.py</code>): <code>router_and_lookup</code>, <code>grouping</code>, <code>scratch_alloc</code>, <code>up_gemm</code>, <code>down_gemm</code>, <code>reduce</code>. The second-vs-third-request comparison in <code>prefill-moe-timing.md</code> puts the variance in the <strong>GPU timeline around expert compute</strong> (up-GEMM envelopes of 4448 ms vs 1496 ms; largest single up interval 364 ms vs 19 ms), not in Python dispatch or allocation.</p>
+<hr>
+<h2 id="5-decode-in-execution-order">5. Decode, in execution order</h2>
+<p>Driver: same <code>_decode_loop</code>, the <code>while self.ep.control(...)</code> loop at <code>v41_engine.py:1967</code>. Two paths: <strong>lean</strong> (<code>LEAN_STEP=1</code>, greedy, the default) and the sequential sampled path. Only the lean path is described; the sampled path is line 2098+.</p>
+<h3 id="5-1-one-iteration-one-verify-step-up-to-t-verify-6-tokens">5.1 One iteration = one verify step (up to <code>T_VERIFY=6</code> tokens)</h3>
+<p>With <code>DSV41_BLOCK=3</code> (current <code>.env</code>), <code>T_DRAFT=3</code>, <code>T_VERIFY=4</code>. With the checkpoint default <code>DSV41_BLOCK=5</code>, <code>T_VERIFY=6</code>. The measured runs above used 6.</p>
+<pre><code>1. drafts, q = self.fast.draft(tok, pos-1, temperature)     fastdecode.py:818
+       draft_graphs[0 if greedy else 1].replay()            # 3 MTP blocks
+       ~15.7 ms (code comment v41_engine.py:1995, confirmed by GPU timing)
+
+2. block[0] = tok ; block[1:] = drafts                      (static buffer, fill_ + copy_)
+
+3. hashes = m.hash_state(block[None], pos)[0]               # GPU, ~0.17 ms
+   h_np = hashes.cpu().numpy()                             # D2H — blocks on the drafter,
+                                                           # NOT on the hash
+4. futs = {L: eg_pool.submit(tables[L].read_raw, h_np)}     # 2 tables, background threads
+
+5. logits, mh = self.fast.step(block, pos, lambda: futs)   fastdecode.py:713
+       (see §5.2)
+
+6. grammar.mask_rows(logits, block)   # no-op unless tool grammar active
+   pen.apply(logits, out)             # no-op unless penalties active
+
+7. LEAN verification, all on GPU except one D2H:
+       am   = logits.argmax(-1)                       # [T_VERIFY]
+       acc  = am[:T-1].eq(block[1:]).cumprod(0)       # leading accepts
+       vhost.copy_(accepted_count ++ am)              # ONE 7-wide D2H
+       a = v[0] ; new = v[1:1+a] ; bonus = v[1+a]
+8. m.c.rollback(pos + a + 1)                          # drop rejected KV positions
+9. emitted = new + [bonus] (clamped to max_tokens - n_out)
+   pos += a + 1 ; yield emitted</code></pre>
+<p>The whole step is one host sync (the 7-wide readback). <strong>The verification math is free relative to the backbone</strong> — it exists so the next step starts from the right KV.</p>
+<h3 id="5-2-inside-fastdecoder-step">5.2 Inside <code>FastDecoder.step</code></h3>
+<pre><code>ids.copy_(block_ids) ; pos = S + arange(6)
+h.copy_(embed[ids]) ; pre_mix.copy_(premix0)
+prepare_pending_buffers()                     # copy host truth into static graph buffers
+graph_key = (S % 2, _index_bucket(S + 6, max_seq))
+if new key: capture()                         # cold graph — count this as startup, not steady state
+futs = rows_fn()                              # engram reads already running
+for lo, g in segments:                        # 3 segment graphs: [0,1), [1,14), [14,40)
+    if lo in futs:
+        eg_rows[lo].copy_(finish(*fut.result()))   # block on NVMe -&gt; H2D (engram_s)
+    g.replay()                                # 40 layers of attention + LUT routing + MoE
+c.pending = ... ; c.len = S + 6</code></pre>
+<p>Each <code>g.replay()</code> contains, per layer, the same math as <code>Model.block</code> but reading static buffers:</p>
+<ul><li><code>_layer_a</code> (<code>fastdecode.py:351</code>): engram → HC mixes → attention → router topk.</li></ul>
+<p>Routing is a <strong>device LUT gather</strong> (<code>self.lut[L][route_idx]</code>) — no host round-trip.</p>
+<ul><li><code>_layer_b</code> (<code>fastdecode.py:432</code>): <code>_routed_experts()</code> → fp4 MoE kernel (+ EP2 all-reduce</li></ul>
+<p>inside the graph), shared expert on a side stream if <code>SHARED_OVERLAP</code>, HC post.</p>
+<ul><li><code>_final</code> (<code>fastdecode.py:459</code>): final norm + head, and seeds the drafter's window KV.</li></ul>
+<p>The graph captures the NCCL <code>all_reduce</code>; Gate G1 verified that replays correctly.</p>
+<h3 id="5-3-decode-phase-budget-measured">5.3 Decode phase budget (measured)</h3>
+<p>From <code>docs/decode-timeline.md</code>, a 14,435-token capture, 64 output tokens, TP2, HC32, 90 GB arena. Ten steady-state iterations after trimming edges. <strong>Mean ms per iteration:</strong></p>
+<table><thead><tr><th>phase</th><th>rank 0</th><th>rank 1</th><th>notes</th></tr></thead><tbody><tr><td>observed interval</td><td>129.06</td><td>129.07</td><td>wall between loop-control marks</td></tr><tr><td><strong>any GPU kernel/copy active</strong></td><td>113.95</td><td>118.91</td><td>the GPU is busy ~90 %</td></tr><tr><td>no recorded GPU activity</td><td>15.12</td><td>10.16</td><td>gaps</td></tr><tr><td>expert projections (MoE)</td><td>38.23</td><td>36.30</td><td><code>_moe_up_kernel</code> + <code>_moe_down_kernel</code></td></tr><tr><td>dense/grouped FP8 projections</td><td>30.71</td><td>27.99</td><td>attention + shared expert</td></tr><tr><td>FP32 GEMMs</td><td>9.28</td><td>8.53</td><td>HC mixes, router, head</td></tr><tr><td>NCCL (incl. waits)</td><td>7.66</td><td>20.35</td><td>rank-asymmetric; not pure wire time</td></tr><tr><td>host waiting for Engram futures</td><td>0.72</td><td>1.59</td><td>overlaps GPU work, do not add</td></tr></tbody></table>
+<p>Per-layer, per-step: <strong>129 ms / 40 layers ≈ 3.2 ms/layer</strong>, of which ~1 ms is MoE and ~0.75 ms is dense projections. Per *emitted token*: the HTML run measured mean accepted length 3.45 and 25.13 tok/s → <strong>~40 ms/token</strong>; the earlier capture with accept 3.0 measured 22.4 tok/s warm → ~45 ms/token. <code>bench-session-end.json</code> (8192 ISL, 512 OSL, random) measured TPOT <strong>51.1 ms</strong>, decode <strong>19.56 tok/s</strong>, accept <strong>3.56</strong>, expert hit rate 1.0.</p>
+<p>The split matters when optimizing: at accept 3.5, the drafter's ~16 ms is amortized over the same 40-layer pass as the accepted tokens; a 10 % faster MoE buys ~3.8 ms/step ≈ 1 ms per emitted token.</p>
+<h3 id="5-4-what-is-not-in-the-decode-step">5.4 What is *not* in the decode step</h3>
+<ul><li>Detokenization, stop-string matching, tool-call parsing, SSE framing: <code>server/app.py</code>,</li></ul>
+<p>outside the engine, overlapped with the next step's GPU work.</p>
+<ul><li>Prefix-response preparation (<code>DSV41_PREFIX_RESPONSE=1</code>): shifts the previous answer's</li></ul>
+<p>prefill into the inter-request gap, not into decode.</p>
+<ul><li>Adaptation swaps (<code>maintain_inline</code>): at request boundaries, not inside the step.</li></ul>
+<h3 id="5-5-the-block-size-t-draft-t-verify">5.5 The block size: <code>T_DRAFT</code> / <code>T_VERIFY</code></h3>
+<p><code>DSV41_BLOCK</code> sets the number of drafted positions. The code (<code>fastdecode.py:65-85</code>) makes <code>T_VERIFY</code> even, so the setting must be an <strong>odd</strong> integer:</p>
+<pre><code>b = DSV41_BLOCK           # drafted positions, odd
+V = T_VERIFY = b + 1      # verified positions, even
+A = tokens per step       # = 1 + E[a], a = leading accepted drafts; reported accept_len_mean
+W = step wall time        # verify graph + drafter graph
+
+tok/s = A / W             ms per accepted token = W / A</code></pre>
+<p>A step verifies <code>V</code> rows in one forward pass and emits at most <code>V</code> tokens (accepted drafts plus one bonus). Acceptance is the engine's <code>accept_len_mean</code>, already counted in tokens-per-step (<code>v41_engine.py:1302</code>).</p>
+<p><strong>Why the curve has an optimum.</strong> If each draft is accepted with probability <code>p</code>, <code>E[a] = p(1-p^b)/(1-p)</code>, so the b-th draft adds only <code>p^b</code> on average — geometrically decreasing. Cost is *not* linear in <code>V</code>: dense weights are read once per step whatever the row count, but more rows route to more <strong>distinct</strong> routed experts and each distinct expert is read once. Measured: T=6 → 21.13 distinct experts/layer → 7.94 GB/step; T=10 → 29.85 → 11.23 GB/step (<code>docs/gotchas.md</code>). Past the drafter's trained horizon (<code>dspark_block_size=5</code>), <code>p→0</code> and the extra positions are paid for and never collected.</p>
+<p>Measured, one run per setting, same prompt, ±5 % acceptance spread (<code>RESULTS.md:499</code>, <code>NOTES.md:1982</code>):</p>
+<table><thead><tr><th><code>DSV41_BLOCK</code></th><th><code>T_VERIFY</code></th><th>verify step</th><th>draft</th><th>step+draft</th><th>acceptance A</th><th>ms/token</th></tr></thead><tbody><tr><td>3</td><td>4</td><td>102.0 ms</td><td>8.7 ms</td><td>110.7 ms</td><td>2.70</td><td>41.0</td></tr><tr><td><strong>5 (default)</strong></td><td><strong>6</strong></td><td>114.9</td><td>9.9</td><td>124.8</td><td>3.14</td><td><strong>39.7</strong></td></tr><tr><td>7</td><td>8</td><td>126.0</td><td>11.0</td><td>137.0</td><td>3.45</td><td><strong>39.7</strong></td></tr></tbody></table>
+<p>At the small end the per-token ratio is flat; the repo's decision is the default <code>DSV41_BLOCK=5</code> (V=6). The unambiguous negative result is <code>DSV41_BLOCK=9</code> (V=10): <strong>27 % slower</strong> (18.10 → 13.24 tok/s) with acceptance *unchanged* (2.95 → 2.87), because drafts 6–9 are beyond the trained horizon while the step still grew linearly. This is the repo's clearest case of utilization and throughput pointing opposite ways — fuller tiles are not the goal, tokens per byte read is.</p>
+<p>Constraints if you change it:</p>
+<ol><li><strong>b odd ⇒ V even</strong>, for the ratio-2 compressor's pending-slot pairing</li></ol>
+<p>(<code>capture(S_parity)</code>).</p>
+<ol><li><strong>Real cap is b ≤ 9 (V ≤ 10), not 15.</strong> <code>build_routing_small</code> is handed</li></ol>
+<p><code>P = V × 6</code> <code>(token, expert)</code> pairs and handles <code>P ≤ 64</code>; above that the MoE falls back to a <code>torch.unique</code> path that cannot be captured into a graph.</p>
+<ol><li><strong><code>draft_tokens</code> is in the EP2 boot guard</strong> (<code>v41_engine.py:835</code>) — both ranks must match.</li><li><strong><code>context_margin</code> is a fixed 8</strong> (<code>server/app.py:626</code>); a block wider than 8 can overrun</li></ol>
+<p>the configured context at the tail unless the margin is raised too.</p>
+<ol><li>Every static buffer in <code>FastDecoder</code> is sized <code>T = T_VERIFY</code>, so changing it forces a</li></ol>
+<p>graph recapture; <code>Model.dspark_draft</code> reads <code>T_DRAFT</code>, and <code>engine/batch2.py</code> splits by <code>T_VERIFY</code>.</p>
+<hr>
+<h2 id="6-the-per-token-cost-model">6. The per-token cost model</h2>
+<table><thead><tr><th>stage</th><th>prefill</th><th>decode</th></tr></thead><tbody><tr><td>embedding + HC expand</td><td>~µs/token</td><td>~µs/token</td></tr><tr><td>attention q/kv/o projections</td><td>40 × (2–3 GEMMs) per token</td><td>same, but T=6 so launch-bound</td></tr><tr><td>indexer / compressed KV</td><td>only for source/indexer layers; <code>[T, context]</code> score buffer</td><td>gathered top-512</td></tr><tr><td>routed MoE</td><td>6 of 384 experts × 40 layers</td><td>same, + EP2 all-reduce ×40</td></tr><tr><td>shared expert</td><td>1 dense FFN × 40 layers</td><td>same</td></tr><tr><td>Engram</td><td>24 rows × 2 layers/token</td><td>same, ~0.5–12 ms host wait/step</td></tr><tr><td>drafter</td><td><code>dspark_seed</code> only</td><td>full 3-block draft every step</td></tr><tr><td>head</td><td>once, on last chunk</td><td>every step</td></tr></tbody></table>
+<p>Amdahl notes this repo has already priced:</p>
+<ul><li><strong>Drafter</strong> ≈ 12 % of step wall (<code>draft_share</code>, <code>v41_engine.py:1409</code>), and its value</li></ul>
+<p>scales with acceptance. At accept 1.0 it is pure loss.</p>
+<ul><li><strong>NCCL</strong> on rank 1 is ~2.5× rank 0 and is *waits*, not wire transfer</li></ul>
+<p>(<code>decode-timeline.md</code>). The ranks make asymmetric progress; the pair is lockstep.</p>
+<ul><li><strong>NVMe expert reads</strong> are ~0 when all-resident (<code>expert_hit_rate: 1.0</code> in the fast</li></ul>
+<p>numbers), and ~0.7 s/step at 20 % miss at 5.5 GB/s in the streaming design.</p>
+<ul><li><strong>Engram</strong> is not the bottleneck (0.72 ms host wait in the HTML run, 12 ms in the</li></ul>
+<p>long-capture run, and the two table reads overlap each other). <code>decode-host-work.md</code> rejects the native gather path as an end-to-end win despite 4× faster microbenchmarks.</p>
+<hr>
+<h2 id="7-instrumentation-map">7. Instrumentation map</h2>
+<table><thead><tr><th>flag</th><th>what it reports</th><th>where</th></tr></thead><tbody><tr><td><code>DSV41_STEP_TIMING=1</code></td><td>host wall-clock per decode step, by phase</td><td><code>v41_engine.py:79</code> <code>StepPhases</code></td></tr><tr><td><code>DSV41_PREFILL_MOE_TIMING=1</code></td><td>MoE subphase host+GPU envelopes</td><td><code>engine/prefill_timing.py</code></td></tr><tr><td><code>PREFILL_TIMING</code> / <code>DSV41_PREFILL_TIMING=1</code></td><td>per-chunk host and GPU envelopes</td><td><code>engine/prefill_timing.py::PrefillTiming</code></td></tr><tr><td><code>DSV41_ROUTE_STATS=1</code></td><td>distinct experts/layer/step → GB/step</td><td><code>fastdecode.py:628</code></td></tr><tr><td><code>DSV41_GPU_TIMING</code></td><td>per-segment, draft, sample GPU ms</td><td><code>fastdecode.py:597</code></td></tr><tr><td><code>engine/diag_layers.py</code>, <code>engine/profile_fast.py</code></td><td>per-layer / shape profiles</td><td>—</td></tr><tr><td><code>tools/bench_decode_timeline_tp.py</code> + <code>_analysis.py</code></td><td>full CUPTI timeline</td><td><code>docs/decode-timeline.md</code></td></tr></tbody></table>
+<p><code>last_stats["decode_accounting"]</code> (<code>v41_engine.py:1477</code>) already prints a decomposition of <code>decode_s</code> into attn / sync / book / NVMe / compute / EP / Engram / graphs / draft / unaccounted. It is <strong>not clamped at zero on purpose</strong>: a negative value means two timers are counting the same seconds (Engram runs overlap GPU work), and hiding that turns a bug into a confident 0.0 %.</p>
+<hr>
+<h2 id="8-changing-code-build-sync-restart">8. Changing code: build, sync, restart</h2>
+<p>Serving code is <strong>baked into the image</strong>, not bind-mounted. The <code>Dockerfile</code> ends with <code>COPY . /app</code>, and <code>scripts/dual-up.sh</code> mounts only <code>/models</code>, <code>results</code>, and <code>.triton-cache</code> — there is no source bind. So a code change is a rebuild on the head, a ship of the *identical* image to the peer, a mirror of the host checkout, and a restart of both ranks.</p>
+<pre><code>cd /home/ryan/git/deepseek-v41-flash-spark
+
+# 1. fast feedback without a rebuild (CPU-only unit tests; no model, no GPU)
+CUDA_VISIBLE_DEVICES=&#x27;&#x27; .venv/bin/python -m unittest engine.test_prefill_timing tools.test_swap_plan
+
+# 2. build once on the head AND ship the identical image to PEER (.env)
+bash scripts/dual-build.sh              # build + ~10 GB over the 200G link
+bash scripts/dual-build.sh --local-only # build only, skip the transfer
+
+# 3. mirror the host checkout to the peer (scripts, tools, tests, trace stats)
+bash scripts/sync-peer.sh --dry-run     # preview first
+bash scripts/sync-peer.sh
+
+# 4. restart the pair (down waits for MemAvailable on BOTH boxes)
+bash scripts/dual-down.sh
+bash scripts/dual-up.sh --check         # preflight only
+bash scripts/dual-up.sh                 # rank0 then rank1, waits for /health (up to 1 h)</code></pre>
+<p>What to run for a given change:</p>
+<table><thead><tr><th>changed</th><th>rebuild image</th><th><code>sync-peer.sh</code></th><th>restart</th></tr></thead><tbody><tr><td><code>engine/</code>, <code>server/</code>, <code>tools/fp4_moe.py</code>, <code>bench/</code></td><td>yes</td><td>yes</td><td>yes</td></tr><tr><td><code>scripts/entrypoint.sh</code></td><td>yes (it is <code>COPY</code>'d)</td><td>yes</td><td>yes</td></tr><tr><td><code>scripts/roce_gid.sh</code>, gate/test scripts run from the host</td><td>—</td><td>yes</td><td>only if used at up-time</td></tr><tr><td><code>.env</code> flags / <code>DSV41_*</code> only</td><td>—</td><td>— (<code>.env</code> is excluded)</td><td>yes</td></tr><tr><td><code>docs/</code> only</td><td>—</td><td>—</td><td>—</td></tr></tbody></table>
+<h3 id="why-both-build-and-sync">Why both build *and* sync</h3>
+<p>They move different things:</p>
+<ul><li><strong><code>scripts/dual-build.sh</code></strong> builds <code>IMAGE</code> (default <code>deepseek-v41-flash-spark:local</code>), then</li></ul>
+<p><code>docker save | ssh docker load</code>, and <strong>asserts the image id matches on both boxes</strong>. That assertion is the point: EP2 skew does not give a wrong answer, it wedges the pair on a mismatched collective. Two independent <code>docker build</code>s are not guaranteed identical (mutable base tag, moving PyPI), so one build is shipped twice.</p>
+<ul><li><strong><code>scripts/sync-peer.sh</code></strong> is an <code>rsync</code> of the checkout. <code>dual-up.sh</code>'s preflight runs</li></ul>
+<p><code>ssh peer "cd $ROOT &amp;&amp; ./scripts/roce_gid.sh"</code> — the peer's <strong>host</strong> script at the same absolute path — and it deliberately syncs <code>results/trace-*/stats/coverage.json</code>, which is an <strong>input</strong>: two ranks on different keep-sets route differently and desync. It excludes <code>.venv</code>, <code>.env</code>, <code>models/</code>, and <code>.triton-cache</code> (all per-box; the Triton cache keys on the local GPU and driver).</p>
+<ul><li><code>.triton-cache</code> is bind-mounted at <code>/app/.triton</code>. Editing <code>tools/fp4_moe.py</code> needs no cache</li></ul>
+<p>surgery: Triton keys the JIT on source hash and recompiles on the first call.</p>
+<h3 id="cost-and-failure-modes">Cost and failure modes</h3>
+<ul><li>A code-only edit rebuilds just the tail layers (<code>COPY . /app</code> plus the import sanity check)</li></ul>
+<p>because the CUDA base and pip layers are cached. Seconds, not the twenty minutes a C++ engine build would be.</p>
+<ul><li><code>docker save | ssh docker load</code> ships the <strong>whole ~10 GB image every time</strong>; there is no</li></ul>
+<p>delta transfer. Over the direct-attach link that is seconds; over WiFi it is not, which is why <code>PEER</code> and <code>NCCL_SOCKET_IFNAME</code> matter.</p>
+<ul><li><code>dual-up.sh</code> blocks on <code>/health</code>; the socket is bound only after both ranks warm-start their</li></ul>
+<p>arenas. A server not answering at minute 5 is normal.</p>
+<ul><li>The boot-time config guard (<code>v41_engine.py:909</code>) broadcasts ~40 fields and refuses to start</li></ul>
+<p>on a mismatch — but it only sees <strong>env flags and code paths someone put in it</strong>. An image mismatch is caught by the id check; a *behavioral* asymmetry introduced by new code that changes control flow or numerics per rank is not, unless you add it to <code>cfg</code>.</p>
+<hr>
+<h2 id="9-where-to-go-next-by-question">9. Where to go next, by question</h2>
+<ul><li>"Why is prefill slow on the first request?" → <code>docs/prefill-moe-timing.md</code>,</li></ul>
+<p><code>docs/prefill-replicas.md</code>.</p>
+<ul><li>"Why doesn't decode hit 40 tok/s?" → <code>docs/decode-timeline.md</code>,</li></ul>
+<p><code>docs/decode-host-work.md</code>.</p>
+<ul><li>"Why did my change silently break quality?" → <code>docs/gotchas.md</code>,</li></ul>
+<p><code>docs/nesting-regression-tp.md</code>.</p>
+<ul><li>"Where does the memory go?" → <code>docs/architecture.md</code>, <code>docs/tp-memory.md</code>.</li><li>"How do I measure without fooling myself?" → <code>docs/benchmarking.md</code>,</li></ul>
+<p><code>AGENTS.md</code> ("Measure before claiming").</p>
+<p><strong>One warning, from <code>AGENTS.md</code> and true of every number above:</strong> EP2's dangerous failures do not raise. Two ranks that disagree about how to compute emit different tokens with nothing in the log. Anything that changes numerics or control flow per rank belongs in the boot-time <code>cfg</code> guard at <code>v41_engine.py:909</code>, and any new collective must be reached by both ranks unconditionally. The numbers in §4–5 come from single runs on one workload; treat them as the shape of the budget, not a benchmark you can regress by 3 %.</p>
+</div></body></html>

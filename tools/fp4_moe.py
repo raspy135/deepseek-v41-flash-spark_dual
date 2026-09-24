@@ -50,6 +50,9 @@ INTER = 2304  # expert intermediate size (N of w1/w3, K of w2)
 # partial sum per scale group, whereas dot_scaled carries the MMA accumulator along K.
 # This is a numerics change; a random-error/generation floor gate alone cannot qualify it.
 DOT_SCALED = os.environ.get("DSV41_FP4_DOT_SCALED", "0") == "1"
+# Native CUDA is the default BM=16 decode path; prefill and unsupported shapes use Triton.
+# Set DSV41_FP4_CUDA=0 to restore Triton throughout. Measured scope is in docs/gotchas.md.
+CUDA_DECODE = os.environ.get("DSV41_FP4_CUDA", "1") == "1"
 
 GROUP = 32  # K elements per UE8M0 scale
 KB1 = DIM // 2  # packed bytes per w1/w3 row
@@ -597,6 +600,9 @@ def moe_forward(
     dev = x.device
     split_decode_null = slots_repeat and null_slot >= 0 and P <= 64
     BM = block_m or (64 if (slots_repeat and P <= 64 and not split_decode_null) else _pick_bm(P))
+    native_decode = CUDA_DECODE and not DOT_SCALED and P <= 64 and BM == 16
+    if native_decode:
+        import fp4_moe_cuda as CUDA
     bn1, nw1, ns1 = up_cfg or (_UP_CFG_SCALED if DOT_SCALED else _UP_CFG)[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
     # TP's 1152 intermediate columns are not divisible by the EP decode tile of
@@ -619,7 +625,11 @@ def moe_forward(
             # operations are CUDA-graph capturable.
             pair = torch.arange(P, dtype=torch.int32, device=dev).view_as(slots)
             route_slots = torch.where(slots == null_slot, null_slot + 1 + pair, slots)
-        block_slot, block_pair, NB = build_routing_small(route_slots, BM)
+        if native_decode:
+            route_slots = route_slots.to(torch.int32).contiguous()
+            block_slot, block_pair, block_route, NB = CUDA.build_routing_small(route_slots, BM, K)
+        else:
+            block_slot, block_pair, NB = build_routing_small(route_slots, BM)
         if split_decode_null:
             block_slot = torch.where(block_slot > null_slot,
                                      torch.full_like(block_slot, null_slot), block_slot)
@@ -657,12 +667,16 @@ def moe_forward(
     parts = torch.empty((P, down_n), dtype=torch.float32, device=dev)  # one row per (token, k) pair
     if stage_mark is not None:
         stage_mark('scratch_alloc')
-    _moe_up_kernel[(NB, inter // bn1)](
-        x, arena.w1, arena.s1, arena.w3, arena.s3, h,
-        wgt, block_slot, block_pair,
-        x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
-    )
+    if native_decode:
+        CUDA.up(x, arena.w1, arena.s1, arena.w3, arena.s3, h, wgt, block_slot, block_route,
+                float(swiglu_limit), K, inter, DIM, NB, null_slot)
+    else:
+        _moe_up_kernel[(NB, inter // bn1)](
+            x, arena.w1, arena.s1, arena.w3, arena.s3, h,
+            wgt, block_slot, block_pair,
+            x.stride(0), h.stride(0), float(swiglu_limit),
+            TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
+        )
     if stage_mark is not None:
         stage_mark('up_gemm')
     down_k = inter
@@ -676,14 +690,19 @@ def moe_forward(
         down_k = INTER
     if stage_mark is not None:
         stage_mark('intermediate_gather')
-    _moe_down_kernel[(NB, down_n // bn2)](
-        h, arena.w2, arena.s2, parts,
-        block_slot, block_pair,
-        h.stride(0), parts.stride(0),
-        TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
-        PARTIAL=tp and not tp_output, PARTS_WORLD=arena.tp_world if scatter and not tp_output else 1,
-        num_warps=nw2, num_stages=ns2,
-    )
+    parts_world = arena.tp_world if scatter and not tp_output else 1
+    if native_decode:
+        CUDA.down(h, arena.w2, arena.s2, parts, block_slot, block_pair, K, down_n, down_k,
+                  T, NB, null_slot, tp and not tp_output, parts_world)
+    else:
+        _moe_down_kernel[(NB, down_n // bn2)](
+            h, arena.w2, arena.s2, parts,
+            block_slot, block_pair,
+            h.stride(0), parts.stride(0),
+            TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
+            PARTIAL=tp and not tp_output, PARTS_WORLD=parts_world,
+            num_warps=nw2, num_stages=ns2,
+        )
     if stage_mark is not None:
         stage_mark('down_gemm')
     if tp_output:
@@ -704,14 +723,20 @@ def moe_forward(
             reduced = torch.empty((P, width), dtype=torch.float32, device=dev)
             torch.distributed.reduce_scatter_tensor(reduced, parts.view(world * P, width))
             local = torch.empty((T, width), dtype=out_dtype, device=dev)
-            _tp_round_reduce[(triton.cdiv(T * width, 1024),)](reduced, local, T * width, K, 1024)
+            if native_decode:
+                CUDA.round_reduce(reduced, local, K)
+            else:
+                _tp_round_reduce[(triton.cdiv(T * width, 1024),)](reduced, local, T * width, K, 1024)
             gathered = torch.empty((world * T, width), dtype=out_dtype, device=dev)
             torch.distributed.all_gather_into_tensor(gathered, local)
             result = gathered.view(world, T, width).transpose(0, 1).reshape(T, DIM)
         else:
             torch.distributed.all_reduce(parts)
             result = torch.empty((T, DIM), dtype=out_dtype, device=dev)
-            _tp_round_reduce[(triton.cdiv(T * DIM, 1024),)](parts, result, T * DIM, K, 1024)
+            if native_decode:
+                CUDA.round_reduce(parts, result, K)
+            else:
+                _tp_round_reduce[(triton.cdiv(T * DIM, 1024),)](parts, result, T * DIM, K, 1024)
     else:
         result = parts.view(K, T, DIM).sum(dim=0).to(out_dtype)
     if stage_mark is not None:

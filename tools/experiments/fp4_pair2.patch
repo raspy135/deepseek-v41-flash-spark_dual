@@ -1,0 +1,131 @@
+--- fp4_moe_cuda.cu
++++ candidate.cu
+@@ -133,12 +133,12 @@
+ 
+         // Routing entries are contiguous, then padded with -1. Keep only one pair's accumulators
+         // live across K, instead of sixteen pairs and sixteen validity branches per K tile.
+-        for (int m = 0; m < kBlockM; ++m) {
++        for (int m = 0; m < kBlockM; m += 2) {
+             const int route = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+             if (route < 0) break;
+-            const int pair = route & 0xffff;
+-            const __nv_bfloat16 *x_row = x + static_cast<int64_t>(route >> 16) * stride_x;
+-            float gate = 0.0f, up = 0.0f;
++            const int next = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m + 1];
++            const int routes[2] = {route, next};
++            float gates[2] = {}, ups[2] = {};
+             // One warp load is 32 x uint16 = 64 contiguous bytes = 128 logical K values.
+             for (int q = 0; q < q_count; ++q) {
+                 const int byte_k = (q << 6) + (lane << 1);
+@@ -152,7 +152,10 @@
+                 const float scale1 = ue8m0(s1_row[(q << 2) + subgroup]);
+                 const float scale3 = ue8m0(s3_row[(q << 2) + subgroup]);
+                 const int xk = (q << 7) + (lane << 2);
+-
++                #pragma unroll
++                for (int j = 0; j < 2; ++j) {
++                if (j && next < 0) continue;
++                const __nv_bfloat16 *x_row = x + static_cast<int64_t>(routes[j] >> 16) * stride_x;
+                 float pge = 0.0f, pgo = 0.0f, pue = 0.0f, puo = 0.0f;
+                 const __nv_bfloat16 *xp = x_row + xk;
+                 float x0, x1, x2, x3;
+@@ -172,14 +175,19 @@
+                 if (subgroup_lane == 0) { pg *= scale1; pu *= scale3; }
+                 if constexpr (FP4_RELAXED_REDUCE) {
+                     // Keep each scale subgroup's sum across K; combine the four only once at the end.
+-                    gate += pg; up += pu;
++                    gates[j] += pg; ups[j] += pu;
+                 } else {
+                     pg = ordered_quad_sum(pg);
+                     pu = ordered_quad_sum(pu);
+-                    if (lane == 0) { gate += pg; up += pu; }
++                    if (lane == 0) { gates[j] += pg; ups[j] += pu; }
++                }
+                 }
+             }
+-
++            #pragma unroll
++            for (int j = 0; j < 2; ++j) {
++            if (j && next < 0) continue;
++            const int pair = routes[j] & 0xffff;
++            float gate = gates[j], up = ups[j];
+             if constexpr (FP4_RELAXED_REDUCE) {
+                 gate = ordered_quad_sum(gate);
+                 up = ordered_quad_sum(up);
+@@ -194,6 +202,7 @@
+                 const float value = silu * u * route_weight[pair];
+                 h[static_cast<int64_t>(pair) * stride_h + out_n] = __float2bfloat16_rn(value);
+             }
++            }
+         }
+     }
+ }
+@@ -219,14 +228,15 @@
+                         + (row_in_warp << kWarpsShift) + warp;
+         if (out_n >= n) continue;
+         const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+-        for (int m = 0; m < kBlockM; ++m) {
++        for (int m = 0; m < kBlockM; m += 2) {
+             const int pair = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+             if (pair < 0) break;
+-            float acc = 0.0f;
++            const int next = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m + 1];
++            const int pairs[2] = {pair, next};
++            float accum[2] = {};
+             if (slot_i != null_slot) {
+                 const uint8_t *w2_row = w2 + row * kb;
+                 const uint8_t *s2_row = s2 + row * sg;
+-                const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pair) * stride_h;
+                 for (int q = 0; q < q_count; ++q) {
+                     const int byte_k = (q << 6) + (lane << 1);
+                     const uint16_t packed = *reinterpret_cast<const uint16_t *>(w2_row + byte_k);
+@@ -235,6 +245,10 @@
+                     decode_e2m1x2(static_cast<uint8_t>(packed >> 8), we1, wo1);
+                     const float scale = ue8m0(s2_row[(q << 2) + subgroup]);
+                     const int hk = (q << 7) + (lane << 2);
++                    #pragma unroll
++                    for (int j = 0; j < 2; ++j) {
++                    if (j && next < 0) continue;
++                    const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pairs[j]) * stride_h;
+                     float pe = 0.0f, po = 0.0f;
+                     const __nv_bfloat16 *hp = h_row + hk;
+                     float x0, x1, x2, x3;
+@@ -245,14 +259,20 @@
+                     if constexpr (FP4_RELAXED_REDUCE) p = subgroup8_sum(pe + po);
+                     else p = subgroup8_sum(pe) + subgroup8_sum(po);
+                     if (subgroup_lane == 0) p *= scale;
+-                    if constexpr (FP4_RELAXED_REDUCE) acc += p;
++                    if constexpr (FP4_RELAXED_REDUCE) accum[j] += p;
+                     else {
+                         p = ordered_quad_sum(p);
+-                        if (lane == 0) acc += p;
++                        if (lane == 0) accum[j] += p;
++                    }
+                     }
+                 }
+             }
+ 
++            #pragma unroll
++            for (int j = 0; j < 2; ++j) {
++            if (j && next < 0) continue;
++            const int pair = pairs[j];
++            float acc = accum[j];
+             if constexpr (FP4_RELAXED_REDUCE) acc = ordered_quad_sum(acc);
+             if (lane == 0) {
+                 const int local_n = n / parts_world;
+@@ -270,6 +290,7 @@
+                 if (!partial) value = __bfloat162float(__float2bfloat16_rn(value));
+                 y[offset] = value;
+             }
++            }
+         }
+     }
+ }
+@@ -331,6 +352,7 @@
+ 
+ } // namespace
+ 
++
+ extern "C" int fp4_moe_cuda_up(
+     void *stream, const void *x, const void *w1, const void *s1, const void *w3, const void *s3,
+     void *h, const void *route_weight, const void *block_slot, const void *block_pair,

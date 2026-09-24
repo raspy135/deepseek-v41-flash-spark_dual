@@ -1,9 +1,9 @@
 # DeepSeek-V4.1-Flash on one DGX Spark (GB10 / sm_121a) -- serving image.
 #
-# There is nothing to compile here. The engine is plain PyTorch plus one Triton kernel
-# (tools/fp4_moe.py) that is JIT-compiled on the first MoE call, so the image is a Python
-# environment and a copy of this repo -- no C++ extension build, no engine fork, minutes
-# rather than the twenty of the V4 recipe.
+# The engine uses PyTorch, Triton, and native CUDA kernels compiled on first use, so the image
+# needs no ahead-of-time extension build. DSV41_FP4_CUDA=1 (default) JITs tools/fp4_moe_cuda.cu
+# into a small C-ABI CUDA shared library on first decode. DSV41_FP4_CUDA_RELAXED=1 selects the
+# faster reduction order by default; either setting can be explicitly disabled.
 #
 # The weights are NOT in the image and never will be: 510 GB. Mount them at /models
 # (scripts/download-model.sh fetches them) and give the container the whole box.
@@ -25,7 +25,7 @@
 # vendored compiler is not worth the ~2 GB the devel layer costs. So: the CUDA 13 devel
 # image, and TRITON_PTXAS_PATH pinned at its ptxas. If you would rather trust the wheel,
 # swap the base for nvidia/cuda:13.0.2-runtime-ubuntu24.04 and drop TRITON_PTXAS_PATH;
-# everything else in this file is unchanged. Nothing else here needs nvcc.
+# everything else in this file is unchanged. Only the opt-in native FP4 experiment needs nvcc.
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
 
 ARG TORCH_VERSION=2.13.0

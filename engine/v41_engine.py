@@ -505,6 +505,26 @@ class V41Engine:
                 self.kernel = "dequant-fallback"
                 log(f"Triton kernel unavailable ({e!r}); using the slow dequant fallback")
         self.fp4_dot_scaled = bool(getattr(K, "DOT_SCALED", False))
+        self.fp4_cuda = bool(getattr(K, "CUDA_DECODE", False))
+        # Fixed-count random draws keep the ranks aligned, but change seeded completions
+        # relative to sequential rejection sampling. Remain opt-in pending serving gates.
+        self.batched_verify = os.environ.get("DSV41_BATCHED_VERIFY", "0") == "1"
+        self.batched_verify_source = None
+        if self.batched_verify:
+            from engine.spec_sampling import source_digest, verify_sampled
+            self._verify_sampled = verify_sampled
+            self.batched_verify_source = source_digest()
+            log("DSV41_BATCHED_VERIFY=1: batched sampled verifier (different RNG sequence)")
+        self.fp4_cuda_relaxed = False
+        self.fp4_cuda_source = None
+        if self.fp4_cuda and self.fp4_dot_scaled:
+            raise ValueError("DSV41_FP4_CUDA and DSV41_FP4_DOT_SCALED are separate arithmetic arms")
+        if self.fp4_cuda:
+            import fp4_moe_cuda as native_fp4
+            self.fp4_cuda_relaxed = native_fp4.RELAXED_REDUCE
+            self.fp4_cuda_source = native_fp4.source_digest()
+            log(f"DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode "
+                f"(relaxed reduction={self.fp4_cuda_relaxed})")
         cb3_cls = None
         if self.expert_format == "cb3":
             import cb3_moe as C3
@@ -858,6 +878,11 @@ class V41Engine:
                 "head_fmt": R.head_fmt(),
                 "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
                 "fp4_dot_scaled": self.fp4_dot_scaled,
+                "fp4_cuda": self.fp4_cuda,
+                "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
+                "fp4_cuda_source": self.fp4_cuda_source,
+                "batched_verify": self.batched_verify,
+                "batched_verify_source": self.batched_verify_source,
                 "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
                 "packed_kv": bool(M_.PACKED_KV),
                 "hc_ops": bool(M_.HC_OPS),
@@ -2096,43 +2121,43 @@ class V41Engine:
                     if ph is not None:
                         ph.steps = steps
                     continue
-                # The sampled verifier is deliberately sequential: accepting draft i decides
-                # whether row i+1 is inspected, and preserving its variable-length RNG stream was
-                # why the greedy lean-step work left this path alone.  Time its whole device
-                # envelope separately.  The pair starts after the verify graph on the same stream,
-                # so it excludes the backbone; host gaps between scalar decisions are included,
-                # which is exactly the latency a batched sampler could remove.
+                # Time the sampling envelope after the backbone. The opt-in batched path uses
+                # fixed-count random draws and one compact result transfer. The default keeps
+                # the historical, variable-length RNG stream and sequential stop semantics.
                 _ev_sample = self.fast._ev_begin("sample") if self.fast is not None else None
-                a = 0
-                new = []
-                bonus = None
-                # DSV41_BLOCK can differ from the checkpoint's default five.
-                # Use the actual draft tensor for both fast and eager paths.
-                for i in range(len(drafts)):
-                    pt = sample_probs(logits[i], temperature, top_p)
-                    d = int(drafts[i])
-                    if temperature <= 0:
-                        ok = int(pt.argmax()) == d
-                    else:
-                        r = torch.rand((), device=self.device)
-                        ok = bool(r < (pt[d] / q[i][d].clamp_min(1e-20)).clamp(max=1.0))
-                    if ok:
-                        a += 1
-                        new.append(d)
-                        if d in stop_ids:
-                            break
-                    else:
+                if self.batched_verify and temperature > 0 and 0 < top_p <= 1:
+                    a, new, bonus = self._verify_sampled(
+                        logits, q, drafts, temperature, top_p, stop_ids)
+                else:
+                    a = 0
+                    new = []
+                    bonus = None
+                    # Use the actual width for both fast and eager paths (DSV41_BLOCK varies).
+                    for i in range(len(drafts)):
+                        pt = sample_probs(logits[i], temperature, top_p)
+                        d = int(drafts[i])
                         if temperature <= 0:
-                            bonus = int(pt.argmax())
+                            ok = int(pt.argmax()) == d
                         else:
-                            resid = (pt - q[i]).clamp_min(0)
-                            if float(resid.sum()) <= 0:
-                                resid = pt
-                            bonus = int(torch.multinomial(resid / resid.sum(), 1))
-                        break
-                if bonus is None and not (new and new[-1] in stop_ids):
-                    pt = sample_probs(logits[a], temperature, top_p)
-                    bonus = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
+                            r = torch.rand((), device=self.device)
+                            ok = bool(r < (pt[d] / q[i][d].clamp_min(1e-20)).clamp(max=1.0))
+                        if ok:
+                            a += 1
+                            new.append(d)
+                            if d in stop_ids:
+                                break
+                        else:
+                            if temperature <= 0:
+                                bonus = int(pt.argmax())
+                            else:
+                                resid = (pt - q[i]).clamp_min(0)
+                                if float(resid.sum()) <= 0:
+                                    resid = pt
+                                bonus = int(torch.multinomial(resid / resid.sum(), 1))
+                            break
+                    if bonus is None and not (new and new[-1] in stop_ids):
+                        pt = sample_probs(logits[a], temperature, top_p)
+                        bonus = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
                 if _ev_sample is not None:
                     _ev_sample.record()
                 if ph is not None:
@@ -2239,6 +2264,11 @@ class V41Engine:
             "head_fmt": R.head_fmt(),
             "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
             "fp4_dot_scaled": self.fp4_dot_scaled,
+            "fp4_cuda": self.fp4_cuda,
+            "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
+            "fp4_cuda_source": self.fp4_cuda_source,
+            "batched_verify": self.batched_verify,
+            "batched_verify_source": self.batched_verify_source,
             "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),
             "packed_kv": bool(M_.PACKED_KV),
             "hc_ops": bool(M_.HC_OPS),

@@ -22,6 +22,10 @@ Rejected with HTTP 400: `n > 1`, images, `logprobs`. Errors are OpenAI-shaped
 (`{"error": {"message","type","param","code"}}`); a failure mid-stream arrives as a
 `data: {"error": ...}` event followed by `data: [DONE]`.
 
+Message roles are `system`, `user`, `assistant` and `tool`. `developer` — the name OpenAI's
+newer models use for `system`, which some harnesses send unprompted — is accepted and folded
+into `system` (mid-conversation included); any other role is a 400.
+
 ## Thinking and reasoning effort
 
 V4.1's template is not a binary switch. Thinking is on or off, *and* there is an effort

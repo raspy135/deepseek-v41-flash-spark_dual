@@ -1,0 +1,22 @@
+--- predecoded.cu
++++ prescaled.cu
+@@ -134,8 +134,8 @@
+                 float w1e0, w1o0, w1e1, w1o1, w3e0, w3o0, w3e1, w3o1;
+                 load_weight4(w1_row + byte_k * 4, w1e0, w1o0, w1e1, w1o1);
+                 load_weight4(w3_row + byte_k * 4, w3e0, w3o0, w3e1, w3o1);
+-                const float scale1 = ue8m0(s1_row[(q << 2) + subgroup]);
+-                const float scale3 = ue8m0(s3_row[(q << 2) + subgroup]);
++                const float scale1 = 1.0f;
++                const float scale3 = 1.0f;
+                 const int xk = (q << 7) + (lane << 2);
+ 
+                 float pge = 0.0f, pgo = 0.0f, pue = 0.0f, puo = 0.0f;
+@@ -216,7 +216,7 @@
+                     const int byte_k = (q << 6) + (lane << 1);
+                     float we0, wo0, we1, wo1;
+                     load_weight4(w2_row + byte_k * 4, we0, wo0, we1, wo1);
+-                    const float scale = ue8m0(s2_row[(q << 2) + subgroup]);
++                    const float scale = 1.0f;
+                     const int hk = (q << 7) + (lane << 2);
+                     float pe = 0.0f, po = 0.0f;
+                     const __nv_bfloat16 *hp = h_row + hk;

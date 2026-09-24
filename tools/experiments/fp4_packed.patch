@@ -1,0 +1,18 @@
+--- fp4_moe_cuda.cu
++++ candidate.cu
+@@ -68,10 +68,11 @@
+     const __nv_bfloat16 *p, float &x0, float &x1, float &x2, float &x3) {
+     // Model strides and lane offsets are multiples of four BF16 elements (8-byte aligned).
+     const uint2 bits = *reinterpret_cast<const uint2 *>(p);
+-    x0 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x & 0xffff))));
+-    x1 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.x >> 16))));
+-    x2 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y & 0xffff))));
+-    x3 = __half2float(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(bits.y >> 16))));
++    const float2 a = __half22float2(__floats2half2_rn(
++        __uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u)));
++    const float2 b = __half22float2(__floats2half2_rn(
++        __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u)));
++    x0 = a.x; x1 = a.y; x2 = b.x; x3 = b.y;
+ }
+ 
+ __device__ __forceinline__ float subgroup8_sum(float v) {
