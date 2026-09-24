@@ -42,6 +42,7 @@ for _p in (HERE, REPO_ROOT):
 from engine_api import Engine, MockEngine  # noqa: E402
 from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
 from server.progress import DecodeProgress  # noqa: E402
+from engine.adapt_config import CFG as ADAPT  # noqa: E402  (expert adaptation settings)
 
 log = logging.getLogger("dsv41.server")
 
@@ -595,7 +596,7 @@ class State:
             if not self.engine.maintain_demand():
                 return False
             swaps = self.engine.plan_swaps(
-                max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
+                max_swaps=ADAPT.swap_max)
         except Exception as e:  # noqa: BLE001
             # Planning is rank-local and nothing has been broadcast yet, so giving up here is
             # safe -- unlike a failure after the broadcast, which desyncs the pair.

@@ -37,7 +37,10 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 # gathered window+compressed KV of one layer is ~2.7 GB.
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
 # Record which experts the router wanted but pruning removed (Model._record_prune_miss).
-PRUNE_MISS = os.environ.get("DSV41_PRUNE_MISS", "0") == "1"
+# Resolved with the rest of adaptation (engine/adapt_config.py): on whenever the DSV41_ADAPT_*
+# knobs are used, else the legacy DSV41_PRUNE_MISS.
+from engine.adapt_config import CFG as _ADAPT  # noqa: E402
+PRUNE_MISS = _ADAPT.record
 # Record decode-sized blocks with one Triton launch instead of ~20 torch kernels
 # (engine/prune_miss_fused.py). Database-only: routing and tokens are unchanged either way.
 # Read at call time so the A/B bench can toggle it; the boot guard pins it.
@@ -49,7 +52,7 @@ PRUNE_MISS_FUSED = os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1"
 # once per request, so every request is one vote. The unit changes with the mode -- per-layer
 # routing slots vs requests -- so DSV41_PRUNE_PRIOR and DSV41_PRUNE_HALFLIFE must be set to match,
 # and the persisted DB is tagged with its unit so a mismatched one is ignored rather than misread.
-PRUNE_UNIT_REQUEST = os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request"
+PRUNE_UNIT_REQUEST = _ADAPT.request_unit
 # Storage dtype of the prefill indexer's score buffer (see Model._indexer). DSV41_INDEX_SCORE_BF16=0
 # restores fp32 for an A/B.
 SCORE_DTYPE = (torch.bfloat16 if os.environ.get("DSV41_INDEX_SCORE_BF16", "1") == "1"

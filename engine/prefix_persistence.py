@@ -41,7 +41,7 @@ def namespace(engine):
         st = path.stat()
         h.update(f'{path.name}:{st.st_size}:{st.st_mtime_ns}'.encode())
     ignored = ('DSV41_CAPTURE', 'DSV41_LOG_', 'DSV41_PREFIX_', 'DSV41_PRUNE_SWAP',
-               'DSV41_PRUNE_DB', 'DSV41_PRUNE_UNIT', 'DSV41_PRUNE_HALFLIFE')
+               'DSV41_PRUNE_DB', 'DSV41_PRUNE_UNIT', 'DSV41_PRUNE_HALFLIFE', 'DSV41_ADAPT_')
     env = {k: v for k, v in os.environ.items()
            if k.startswith('DSV41_') and not k.startswith(ignored)}
     import triton

@@ -168,25 +168,43 @@ routing trace, and replaces less-used resident experts. Swaps can happen after
 prefill and at the end of a request, subject to the thresholds below. They do not
 retroactively recompute tokens that were already processed.
 
-Use these values for request-weighted adaptation:
+Two settings control it; the engine derives the rest and logs what it chose at startup:
 
-| Setting | Value | Purpose |
+| Setting | Default in `.env.example` | Meaning |
 | --- | --- | --- |
-| `DSV41_PRUNE_MISS` | `1` | Record demand and report missed expert selections. |
-| `DSV41_PRUNE_SWAP` | `1` | Enable request-boundary swaps. |
-| `DSV41_PRUNE_SWAP_PREFILL` | `1` | Also allow swaps before decoding. |
-| `DSV41_PRUNE_UNIT` | `request` | Give each request one vote instead of weighting by token count. |
-| `DSV41_PRUNE_PRIOR` | `8` | Weight of the initial trace relative to observed requests. |
-| `DSV41_PRUNE_HALFLIFE` | `20` | Age demand over 20 requests. |
-| `DSV41_PRUNE_SWAP_MAX` | `512` | Maximum expert replacements per pass. |
-| `DSV41_PRUNE_SWAP_MIN_GAIN` | `0.005` | Avoid swaps with little expected benefit. |
-| `DSV41_PRUNE_SWAP_PREFILL_MIN` | `32` | Minimum newly prefilled tokens for a prefill swap. |
-| `DSV41_PRUNE_SWAP_PREFILL_MIN_MISS` | `0.02` | Skip that pass if prefill misses less than 2% of selections. |
-| `DSV41_PRUNE_DB` | `results/prune_demand_req.npz` | Save demand across restarts. Use a separate file when changing units. |
+| `DSV41_ADAPT_SENSITIVITY` | `medium` | How far one request moves the resident set. See the levels below. |
+| `DSV41_ADAPT_PRIOR` | `8` | Weight of the shipped routing trace, in requests. Lower lets this server's own traffic dominate sooner. |
+
+| Sensitivity | Demand half-life | Newest request's share of observed demand | Prefill-pass miss gate |
+| --- | ---: | ---: | ---: |
+| `off` | never (ranking frozen) | — | — |
+| `low` | 40 requests | 1.7% | 4% |
+| `medium` | 20 requests | 3.4% | 2% |
+| `high` | 10 requests | 6.7% | 1% |
+| `max` | 5 requests | 12.9% | 0.5% |
+
+A number in `[0, 0.5)` sets the newest request's share directly. Higher sensitivity swaps
+more experts per request (roughly 2x from `medium` to `high`). Judge it by the `routed-miss`
+rate in the request logs, not by swap counts: too high a setting chases each prompt and makes
+misses worse (see [gotchas](docs/gotchas.md)).
+
+Fixed by the engine:
+- demand counted per request, not per routing slot;
+- swaps at the end of each request, and at the prefill→decode boundary when the prompt has at
+  least 32 new tokens and misses at least the gate above;
+- at most 512 swaps per pass;
+- a gain floor of 0.005 of the layer's mean score.
+
+`DSV41_PRUNE_DB` (default `results/prune_demand_req.npz`) is the demand history, kept across
+restarts. Keep it private and out of Git. With neither knob set, the legacy `DSV41_PRUNE_*`
+settings are read exactly as before. With a knob set they are ignored and named in the log,
+except that `DSV41_PRUNE_SWAP=0` and `DSV41_PRUNE_SWAP_PREFILL=0` still switch swapping off
+(benchmarks use them to freeze placement).
+`medium` reproduces the previous request-weighted profile exactly.
 
 `TRACE_STATS` chooses the initial `coverage.json`; when unset, the launcher looks
 under `results/trace-*/stats/`. Keep the demand database private and out of Git.
-To freeze expert placement for an A/B test, set both swap flags to `0`.
+To freeze expert placement for an A/B test, set `DSV41_ADAPT_SENSITIVITY=off`.
 
 ## Persistent prefix cache
 

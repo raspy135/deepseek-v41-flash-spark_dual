@@ -53,10 +53,11 @@ PREFIX_DISK = os.environ.get("DSV41_PREFIX_DISK", "0") == "1"
 # prompt carries most of the signal and waiting until the end applies it only once the answer is
 # already written. Boot-time and part of the cross-rank config guard: a rank that adapts mid-
 # request while its peer does not is exactly the silent divergence apply_swaps exists to prevent.
-PREFILL_SWAP = os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0") == "1"
+from engine.adapt_config import CFG as ADAPT  # noqa: E402  (every adaptation setting below)
+PREFILL_SWAP = ADAPT.swap_prefill
 # Below this many NEWLY prefilled tokens the prompt has not earned an adaptation: at 400 tokens
 # the blend moves 11% and the swap costs ~0.18 s plus a routing change mid-request.
-PREFILL_SWAP_MIN = int(os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"))
+PREFILL_SWAP_MIN = ADAPT.swap_prefill_min
 # ...and only when THIS prompt is actually being served badly. Without this the inline pass
 # re-fits the resident set to whatever the latest prompt wants -- at 4.5k tokens a prompt is 58%
 # of the blend weight -- and the next request pushes it back: measured 100-128 slots swapped on
@@ -64,7 +65,7 @@ PREFILL_SWAP_MIN = int(os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"))
 # end-of-response pass had already converged to 3-7 slots over the same requests. This pass
 # exists for the out-of-distribution prompt (a new language, an unfamiliar domain); when the
 # prompt is already well served there is nothing for it to fix.
-PREFILL_SWAP_MIN_MISS = float(os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN_MISS", "0.10"))
+PREFILL_SWAP_MIN_MISS = ADAPT.swap_prefill_min_miss
 
 # Lean step: keep the per-step host work off the critical path -- the greedy accept/reject decision
 # is taken on the GPU and read back as ONE 7-element tensor instead of up to eleven separate
@@ -381,7 +382,7 @@ def require_pruned_residency(ranked: list[tuple[int, int]], world: int, lru_slot
     return owned
 
 
-PRUNE_DB = os.environ.get("DSV41_PRUNE_DB", "results/prune_demand.npz")
+PRUNE_DB = ADAPT.db_path
 
 
 def load_prune_db(path: str = PRUNE_DB):
@@ -395,7 +396,7 @@ def load_prune_db(path: str = PRUNE_DB):
         # The database's unit is part of its meaning: 671k/layer in slot units is a busy server,
         # the same number in request units is not a server at all. Reading one as the other would
         # silently pin the observed weight at ~100% (or ~0%), so a mismatch is ignored, not read.
-        want = 1 if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request" else 0
+        want = 1 if ADAPT.request_unit else 0
         have = int(d["unit"][0]) if "unit" in d.files else 0
         if have != want:
             log(f"prune demand DB {path} is in {'request' if have else 'slot'} units but this run "
@@ -416,7 +417,7 @@ def save_prune_db(counts, mass, path: str = PRUNE_DB):
     # and leave the rename below pointing at a file that was never created. Hand it a HANDLE.
     with open(tmp, "wb") as f:
         np.savez(f, counts=counts, mass=mass,
-                 unit=np.array([1 if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request" else 0]))
+                 unit=np.array([1 if ADAPT.request_unit else 0]))
     os.replace(tmp, path)
 
 
@@ -765,9 +766,10 @@ class V41Engine:
             # restarts, so a server used mostly for one kind of work drifts towards the experts
             # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
             self._prune_trace = {L: v.copy() for L, v in counts.items()}   # pre-blend, for plan_swaps
-            db = load_prune_db() if os.environ.get("DSV41_PRUNE_ADAPT", "1") == "1" else None
+            log(ADAPT.describe())
+            db = load_prune_db() if ADAPT.use_db else None
             if db is not None:
-                prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
+                prior = ADAPT.prior
                 counts, w = blend_demand(counts, db, prior)
                 log(f"prune ranking adapted from {PRUNE_DB}: observed weight {w:.1%} "
                     f"({db[0].sum():,.0f} recorded routing slots)")
@@ -917,8 +919,10 @@ class V41Engine:
                 # masking a different expert set, so the two replicated routers pick different
                 # top-k and the pair emits different tokens with nothing raising. The threshold
                 # matters as much as the switch: it decides WHETHER the collective happens.
-                "prune_swap_prefill": os.environ.get("DSV41_PRUNE_SWAP_PREFILL", "0"),
-                "prune_swap_prefill_min": os.environ.get("DSV41_PRUNE_SWAP_PREFILL_MIN", "1024"),
+                # Resolved adaptation settings (engine/adapt_config.py), not the raw variables:
+                # the two DSV41_ADAPT_* knobs and the legacy DSV41_PRUNE_* spellings must agree
+                # on what they MEAN, e.g. whether the prefill-boundary collective happens.
+                **ADAPT.boot_fields(),
                 "prefill_chunk": MAX_CHUNK,
                 "prefill_timing": PREFILL_TIMING,
                 "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
@@ -1471,7 +1475,7 @@ class V41Engine:
             # Request-unit mode folds this request in as one normalized vote; no-op in slot mode.
             # Before prune_miss_report so the save below and the per-request delta both see it.
             self.model.flush_request_demand(
-                float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7")))
+                ADAPT.halflife)
             # One request has now landed since the last applied plan.  maintain_demand() counts
             # this in request mode: the demand DB's total mass is flat once converged, so a mass
             # delta cannot distinguish "a request happened" from "nothing changed".
@@ -1563,9 +1567,9 @@ class V41Engine:
         total = float(demand.sum())
         if total <= 0:
             return []
-        prior = float(os.environ.get("DSV41_PRUNE_PRIOR", "2e7"))
+        prior = ADAPT.prior
         if min_gain is None:
-            min_gain = float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05"))
+            min_gain = ADAPT.swap_min_gain
         ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
         world = 1 if getattr(self.ep, 'tensor_parallel', False) else max(1, self.ep.world)
         out = []
@@ -1676,14 +1680,14 @@ class V41Engine:
         be captured too; once per idle tick is often enough for a half-life measured in millions
         of slots, and it keeps the hot path untouched.
         """
-        if os.environ.get("DSV41_PRUNE_SWAP", "0") != "1":
+        if not ADAPT.swap:
             return False
         rep = self.model.prune_miss_report()
         if rep is None:
             return False
         total = float(rep[1].sum())
         grown = total - self._swap_baseline
-        if os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request":
+        if ADAPT.request_unit:
             # Trigger on REQUESTS SINCE THE LAST APPLIED PLAN, not on `grown`.  The demand DB is
             # an EWMA (Model.flush_request_demand: db*0.5**(1/H) + one normalized vote), so its
             # total mass is constant once converged and `grown = total - _swap_baseline` sits at
@@ -1692,14 +1696,13 @@ class V41Engine:
             # miss gate in maintain_inline was never reached (a 14,649-token request at 12.1%
             # routed-miss produced no swap).  The slot-tuned MIN_GROWTH (5e5) is equally useless
             # here, so this reuses SWAP_MIN_GROWTH_REQ as "requests needed", defaulting to one.
-            return self._requests_since_plan >= max(
-                1, int(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH_REQ", "1")))
-        half = float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7"))
+            return self._requests_since_plan >= ADAPT.min_growth_req
+        half = ADAPT.halflife
         if half > 0 and grown > 0:
             # decay proportional to the evidence that arrived since the last tick, so the rate is
             # set by traffic rather than by wall-clock or by how often this happens to run
             self.model.decay_demand(0.5 ** (grown / half))
-        return grown >= float(os.environ.get("DSV41_PRUNE_SWAP_MIN_GROWTH", "5e5"))
+        return grown >= ADAPT.min_growth_slots
 
     def swaps_due(self, min_growth: float | None = None) -> bool:
         """Back-compat shim for callers that only want the predicate."""
@@ -1743,10 +1746,10 @@ class V41Engine:
         # maintain_demand(): the end-of-response tick applies a plan after every request and resets
         # _requests_since_plan, so a counter test would starve this path on every request but the
         # first.
-        request_mode = os.environ.get("DSV41_PRUNE_UNIT", "slot") == "request"
+        request_mode = ADAPT.request_unit
         if request_mode:
             self.model.flush_request_demand(
-                float(os.environ.get("DSV41_PRUNE_HALFLIFE", "2e7")))
+                ADAPT.halflife)
         due = ((new_tokens >= PREFILL_SWAP_MIN) if request_mode else
                (self.maintain_demand() and new_tokens >= PREFILL_SWAP_MIN))
         if due and PREFILL_SWAP_MIN_MISS > 0:
@@ -1762,7 +1765,7 @@ class V41Engine:
         if self.ep.rank == 0 and due:
             try:
                 swaps = self.plan_swaps(
-                    max_swaps=int(os.environ.get("DSV41_PRUNE_SWAP_MAX", "64")))
+                    max_swaps=ADAPT.swap_max)
             except Exception as e:  # noqa: BLE001
                 # Planning is rank-local and nothing has been broadcast yet, so giving up is safe.
                 log(f"inline adaptation planning failed ({type(e).__name__}: {e}); skipping")
