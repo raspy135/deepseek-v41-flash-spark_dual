@@ -12,6 +12,12 @@ shift
 set -a
 source .env
 set +a
+# GATE_ENV="DSV41_BLOCK=5 DSV41_X=1": override .env for this gate only (both ranks). Sourcing
+# .env would otherwise overwrite anything exported by the caller.
+for kv in ${GATE_ENV:-}; do
+    [[ "$kv" =~ ^DSV41_[A-Z0-9_]+=[^[:space:]]*$ ]] || { echo "GATE_ENV: bad entry '$kv'" >&2; exit 1; }
+    export "$kv"
+done
 if docker container inspect deepseek-v41-ep2-rank0 >/dev/null 2>&1; then
     echo 'Stop serving before the gate' >&2; exit 1
 fi
@@ -22,9 +28,18 @@ flags=(--rm --network host --gpus all --device /dev/infiniband --cap-add IPC_LOC
        -e WORLD_SIZE=2 -e MASTER_ADDR=10.0.0.1 -e MASTER_PORT=29629
        -e NCCL_SOCKET_IFNAME=enp1s0f1np1 -e GLOO_SOCKET_IFNAME=enp1s0f1np1 -e NCCL_IB_DISABLE=0
        -e DSV41_DIST_TIMEOUT_S=180 -e "MODEL_DIR=/models/$(basename "$MODEL_DIR")")
+# grep, not rg: rg is often a shell function or alias that a script does not inherit. When it
+# was missing here, the process substitution failed silently and BOTH ranks ran on code
+# defaults (EP2, DSV41_BLOCK=5, no overlap) while .env said TP2/BLOCK=3 -- the boot guard
+# cannot catch that, because the two ranks agree with each other.
+forwarded=0
 while IFS='=' read -r key _; do
     flags+=(-e "$key=${!key}")
-done < <(env | rg '^DSV41_[A-Z0-9_]+=')
+    forwarded=$((forwarded + 1))
+done < <(env | grep -E '^DSV41_[A-Z0-9_]+=')
+if grep -qE '^DSV41_[A-Z0-9_]+=' .env && (( forwarded == 0 )); then
+    echo '.env sets DSV41_* but none were forwarded to the gate containers' >&2; exit 1
+fi
 flags+=(-e DSV41_CAPTURE_NEXT=0 -e DSV41_PREFIX_DISK_DIR=/app/results/prefix-cache-gate
         -e DSV41_PREFIX_DISK_GB=20)
 if [[ -n "$gate_source_root" ]]; then
