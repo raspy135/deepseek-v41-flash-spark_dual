@@ -889,6 +889,10 @@ class V41Engine:
                 "hc_fused": bool(M_.HC_FUSED),
                 "hc_mm_tile": R.HC_MM_TILE,
                 "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
+                # Which verify widths exist (buffers, graphs). The depth each step uses is
+                # decided on rank 0 and broadcast with the control flag, so the other
+                # DSV41_BLOCK_DYNAMIC_* policy knobs only need to be right on rank 0.
+                "block_dynamic": os.environ.get("DSV41_BLOCK_DYNAMIC", ""),
                 # Decode fp8 scheduling and projection merging are meant to be bit-identical to
                 # the defaults, but that is a measured property of this GPU and compiler, not a
                 # guarantee; a pair split across them must refuse to start.
@@ -1022,11 +1026,25 @@ class V41Engine:
                 f"{replica_bytes / 1e9:.3f} extra GB/rank; prefix reuse disabled")
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
-        from engine.fastdecode import T_VERIFY as _TV
+        from engine.fastdecode import T_VERIFY as _TV, VERIFY_WIDTHS, DYNAMIC_DEPTHS
         self._tv = _TV
-        self._blk = torch.empty(_TV, dtype=torch.long, device=device)
-        self._vout = torch.empty(_TV + 1, dtype=torch.long, device=device)
-        self._vhost = torch.empty(_TV + 1, dtype=torch.long).pin_memory()
+        # one (block, readback, pinned host) triple per verify width; the defaults are the widest
+        self._vbufs = {T: (torch.empty(T, dtype=torch.long, device=device),
+                           torch.empty(T + 1, dtype=torch.long, device=device),
+                           torch.empty(T + 1, dtype=torch.long).pin_memory()) for T in VERIFY_WIDTHS}
+        self._blk, self._vout, self._vhost = self._vbufs[_TV]
+        self.depth_policy = None
+        if DYNAMIC_DEPTHS:
+            # Scope: the single-request greedy/sampled graphed path. Two-request serving
+            # (engine/batch2.py) and the eager path stack or verify T_VERIFY rows unconditionally.
+            if not (self.spec and self.fast is not None and self.fast.use_graphs):
+                raise ValueError("DSV41_BLOCK_DYNAMIC needs speculative decoding on the graphed fast path")
+            if int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) != 1:
+                raise ValueError("DSV41_BLOCK_DYNAMIC supports DSV41_MAX_CONCURRENCY=1 only")
+            from engine.spec_depth import DepthPolicy
+            self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS)
+            log(f"dynamic speculative depth {DYNAMIC_DEPTHS} (start {self.depth_policy.start}, "
+                f"decided every {self.depth_policy.interval} tokens)")
         torch.cuda.synchronize()
         if self.ep.active:
             # Force the NCCL communicator into existence now instead of inside the first
@@ -1334,6 +1352,8 @@ class V41Engine:
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
+                "spec_depth": (self.depth_policy.report() if getattr(self, "depth_policy", None) is not None
+                               else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
                 "prefill_expert_misses": st["prefill_misses"], "nvme_gb": round(st["bytes_read"] / 1e9, 2),
                 "nvme_read_s": round(st["read_s"], 2),
@@ -1998,7 +2018,27 @@ class V41Engine:
         # pair, because the server-side stops -- a text stop sequence, a client disconnect,
         # the max_tokens re-clamp against an already-emitted burst -- are invisible there.
         # Inert at world 1: control() returns its argument before touching anything.
-        while self.ep.control(n_out < max_tokens and tok not in stop_ids):
+        # DSV41_BLOCK_DYNAMIC: rank 0's policy picks each step's depth and control() carries it,
+        # so both ranks verify the same width. Without it the depth is the fixed T_DRAFT.
+        pol = self.depth_policy if (self.spec and self.fast is not None) else None
+        if pol is not None:
+            pol.reset_request()
+        while self.ep.control(n_out < max_tokens and tok not in stop_ids,
+                              pol.decide() if pol is not None and self.ep.rank == 0 else 0):
+            t_iter = time.perf_counter()
+            depth = self.ep.control_value if pol is not None else self._tv - 1
+            if pol is not None and self.ep.rank == 0:
+                sw = pol.pop_switch()
+                if sw is not None:
+                    # Rates are output tokens per second of verify loop. The depth that was not
+                    # running is marked "would be": exact when coming down from the deep depth
+                    # (same drafts, fewer checked), an estimate when going up.
+                    other = sw["estimated"]
+                    log(f"spec depth {sw['from']} -> {sw['to']} at output token {n_out}: "
+                        f"{sw['tokens_per_step']} tokens/step over {sw['steps']} steps; "
+                        + ", ".join(f"depth {d} {'would be ' if d == other else ''}{r} tok/s"
+                                    for d, r in sorted(sw["rate"].items())))
+            vblk, vout, vhost = self._vbufs[depth + 1]
             if ph is not None:
                 ph.start()
             if self.spec:
@@ -2007,6 +2047,9 @@ class V41Engine:
                 lean = LEAN_STEP and self.fast is not None and temperature <= 0
                 if self.fast is not None:
                     drafts, q = self.fast.draft(tok, pos - 1, temperature)
+                    if depth < drafts.numel():
+                        # dynamic depth: verify the first `depth` of the deeper draft
+                        drafts, q = drafts[:depth], q[:depth]
                     if not lean:
                         # the drafter's static buffers survive until the next draft() call, which is
                         # after this step's verification, so the lean path does not need the copies
@@ -2015,7 +2058,7 @@ class V41Engine:
                         ph.mark("draft")
                     if lean:
                         # no H2D and no allocation: fill_ bakes the token into the kernel argument
-                        block = self._blk
+                        block = vblk
                         block[0].fill_(tok)
                         block[1:].copy_(drafts)
                     else:
@@ -2080,11 +2123,11 @@ class V41Engine:
                     # Verify the block actually passed through the backbone.
                     # A cold graph capture warms the drafter and overwrites its
                     # static d_out buffer, which `drafts` aliases on this path.
-                    acc = am[:self._tv - 1].eq(block[1:]).to(torch.int32).cumprod(0)
-                    self._vout[0] = acc.sum()
-                    self._vout[1:].copy_(am)
-                    self._vhost.copy_(self._vout)
-                    v = self._vhost.tolist()
+                    acc = am[:depth].eq(block[1:]).to(torch.int32).cumprod(0)
+                    vout[0] = acc.sum()
+                    vout[1:].copy_(am)
+                    vhost.copy_(vout)
+                    v = vhost.tolist()
                     a, cand = v[0], v[1:]
                     new = cand[:a]
                     bonus = cand[a]
@@ -2124,6 +2167,8 @@ class V41Engine:
                             ph.mark("consumer")
                         if any(t in stop_ids for t in emitted):
                             break
+                    if pol is not None and self.ep.rank == 0:
+                        pol.observe(depth, a, len(emitted), time.perf_counter() - t_iter)
                     steps += 1
                     out_st["steps"] = steps
                     if ph is not None:
@@ -2198,6 +2243,8 @@ class V41Engine:
                         ph.mark("consumer")
                     if any(t in stop_ids for t in emitted):
                         break
+                if pol is not None and self.ep.rank == 0:
+                    pol.observe(depth, a, len(emitted), time.perf_counter() - t_iter)
                 steps += 1
                 out_st["steps"] = steps
                 if ph is not None:

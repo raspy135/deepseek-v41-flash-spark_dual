@@ -106,8 +106,39 @@ def _draft_block() -> int:
     return b
 
 
-T_DRAFT = _draft_block()
-T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts
+def _dynamic_depths():
+    """DSV41_BLOCK_DYNAMIC="3,5": two draft depths the engine switches between per request as
+    acceptance changes (engine/spec_depth.py). The drafter always drafts the deeper block (the
+    checkpoint was trained at 5) and the verifier checks the first `depth` drafts, so each depth
+    has its own verify graphs and nothing else changes. Greedy output is identical at any depth
+    schedule -- verification accepts exactly the target model's argmax -- so switching moves
+    speed, never text."""
+    v = os.environ.get("DSV41_BLOCK_DYNAMIC", "").strip()
+    if v in ("", "0", "off"):
+        return None
+    try:
+        depths = tuple(sorted({int(x) for x in v.split(",")}))
+    except ValueError:
+        raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two odd depths, e.g. 3,5") from None
+    # T_VERIFY <= 10 is the graph-capturable routing limit (docs/gotchas.md, wider verify block)
+    if len(depths) != 2 or any(d < 1 or d > 9 or d % 2 == 0 for d in depths):
+        raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two different odd depths in 1..9, e.g. 3,5")
+    fixed = os.environ.get("DSV41_BLOCK", "").strip()
+    if fixed not in ("", "off", "default") and int(fixed) != depths[-1]:
+        raise ValueError(f"DSV41_BLOCK={fixed} conflicts with DSV41_BLOCK_DYNAMIC={v}: the drafter "
+                         f"drafts the deeper block ({depths[-1]}); unset DSV41_BLOCK")
+    return depths
+
+
+DYNAMIC_DEPTHS = _dynamic_depths()
+T_DRAFT = DYNAMIC_DEPTHS[-1] if DYNAMIC_DEPTHS else _draft_block()
+T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts; the widest verify block
+# Every verify width this process captures graphs and static buffers for.
+VERIFY_WIDTHS = tuple(d + 1 for d in DYNAMIC_DEPTHS) if DYNAMIC_DEPTHS else (T_VERIFY,)
+# FastDecoder attributes that are sized by the verify width; _bind(T) points them at T's set.
+_WIDTH_ATTRS = ("ids", "pos", "eg_rows", "slots", "h", "pre_mix", "attn_pre", "ffn_post", "ffn_comb",
+                "ffn_pre", "y", "route_idx", "route_w", "topk", "candidates", "main_hidden", "logits",
+                "_ar_t", "_premix0", "kvl_buf", "sc_buf")
 
 # The graphed indexer needs a fixed key-axis shape, but that shape does not need to be the
 # configured maximum context.  A small floor avoids capturing a new graph every few hundred
@@ -150,28 +181,12 @@ class FastDecoder:
                             if MERGED_PROJ else 0)
         a = self.a
         dev = self.dev
-        T = T_VERIFY
-        # ---- static buffers (inputs of the graphs)
-        self.ids = torch.zeros(T, dtype=torch.long, device=dev)
-        self.pos = torch.zeros(T, dtype=torch.long, device=dev)
-        self.eg_rows = {L: torch.zeros(T, a.engram_n_heads * (a.engram_max_ngram_size - 1), a.engram_head_dim,
-                                       dtype=torch.float32, device=dev) for L in a.engram_layer_ids}
-        self.slots = torch.zeros(T, a.n_activated_experts, dtype=torch.int32, device=dev)
-        # ---- static state carried between graphs of one step
-        self.h = torch.zeros(T, a.hc_mult, a.dim, dtype=torch.bfloat16, device=dev)
-        self.pre_mix = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
-        self.attn_pre = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
-        self.ffn_post = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
-        self.ffn_comb = torch.zeros(T, a.hc_mult, a.hc_mult, dtype=torch.float32, device=dev)
-        self.ffn_pre = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
-        self.y = torch.zeros(T, a.dim, dtype=torch.bfloat16, device=dev)
-        self.route_idx = torch.zeros(T, a.n_activated_experts, dtype=torch.long, device=dev)
-        self.route_w = torch.zeros(T, a.n_activated_experts, dtype=torch.float32, device=dev)
-        self.topk = torch.full((T, a.index_topk), -1, dtype=torch.long, device=dev)
-        n_cand = self._n_cache(1)
-        self.candidates = torch.zeros(T, n_cand, dtype=torch.bool, device=dev)
-        self.main_hidden = torch.zeros(T, a.dim * len(a.dspark_target_layer_ids), dtype=torch.float32, device=dev)
-        self.logits = torch.zeros(T, a.vocab_size, dtype=torch.float32, device=dev)
+        self.pend_buf = {L: torch.zeros(2, a.head_dim, dtype=torch.float32, device=dev)
+                         for L in a.kv_source_layers if a.compress_ratios[L] > 1}
+        # Width-sized static buffers, one set per verify width (graphs bake in their addresses).
+        self._width_bufs = {T: self._alloc_width(T) for T in VERIFY_WIDTHS}
+        self.width = None
+        self._bind(T_VERIFY)
         # draft
         self.d_tok = torch.zeros(1, dtype=torch.long, device=dev)
         self.d_last = torch.zeros(1, dtype=torch.long, device=dev)   # last main position
@@ -194,11 +209,7 @@ class FastDecoder:
         self.markov_embed_bf16 = self.W.mtp[2].markov_embed.to(torch.bfloat16)
         self.markov_head_bf16 = self.W.mtp[2].markov_head.to(torch.bfloat16)
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
-        # constants the lean step reuses instead of rebuilding them per step
-        self._ar_t = torch.arange(T, device=dev)
         self._index_cpos = torch.arange(self._n_cache(1), device=dev)
-        self._premix0 = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
-        self._premix0[:, 0] = 1.0
         self.graphs = {}
         self.draft_graphs = None
         self.pool = None
@@ -206,10 +217,6 @@ class FastDecoder:
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
         self.lut = None
         self.lut_version = -1
-        self.pend_buf = {L: torch.zeros(2, a.head_dim, dtype=torch.float32, device=dev)
-                         for L in a.kv_source_layers if a.compress_ratios[L] > 1}
-        self.kvl_buf = {L: torch.zeros(T, a.head_dim, dtype=torch.float32, device=dev) for L in self.pend_buf}
-        self.sc_buf = {L: torch.zeros(T, a.head_dim, dtype=torch.float32, device=dev) for L in self.pend_buf}
         self.stats = {"steps": 0, "graph_s": 0.0, "resolve_s": 0.0, "engram_s": 0.0, "draft_s": 0.0}
         # DSV41_GPU_TIMING=1: CUDA events around each phase of a step. Host timers cannot decompose
         # this path -- every one of them measures the host waiting for, or launching into, an async
@@ -235,6 +242,52 @@ class FastDecoder:
             self.rs_hits = torch.zeros(a.n_routed_experts, dtype=torch.int32, device=dev)
             self.rs_uniq = torch.zeros(self.m.args.n_layers, dtype=torch.float64, device=dev)
             self.rs_steps = 0
+
+    # ------------------------------------------------------------------ verify widths
+    def _alloc_width(self, T: int) -> dict:
+        """The static buffers whose first dimension is the verify width T."""
+        a, dev = self.a, self.dev
+        f32, bf16 = torch.float32, torch.bfloat16
+        b = dict(
+            # inputs of the graphs
+            ids=torch.zeros(T, dtype=torch.long, device=dev),
+            pos=torch.zeros(T, dtype=torch.long, device=dev),
+            eg_rows={L: torch.zeros(T, a.engram_n_heads * (a.engram_max_ngram_size - 1), a.engram_head_dim,
+                                    dtype=f32, device=dev) for L in a.engram_layer_ids},
+            slots=torch.zeros(T, a.n_activated_experts, dtype=torch.int32, device=dev),
+            # state carried between graphs of one step
+            h=torch.zeros(T, a.hc_mult, a.dim, dtype=bf16, device=dev),
+            pre_mix=torch.zeros(T, a.hc_mult, dtype=f32, device=dev),
+            attn_pre=torch.zeros(T, a.hc_mult, dtype=f32, device=dev),
+            ffn_post=torch.zeros(T, a.hc_mult, dtype=f32, device=dev),
+            ffn_comb=torch.zeros(T, a.hc_mult, a.hc_mult, dtype=f32, device=dev),
+            ffn_pre=torch.zeros(T, a.hc_mult, dtype=f32, device=dev),
+            y=torch.zeros(T, a.dim, dtype=bf16, device=dev),
+            route_idx=torch.zeros(T, a.n_activated_experts, dtype=torch.long, device=dev),
+            route_w=torch.zeros(T, a.n_activated_experts, dtype=f32, device=dev),
+            topk=torch.full((T, a.index_topk), -1, dtype=torch.long, device=dev),
+            candidates=torch.zeros(T, self._n_cache(1), dtype=torch.bool, device=dev),
+            main_hidden=torch.zeros(T, a.dim * len(a.dspark_target_layer_ids), dtype=f32, device=dev),
+            logits=torch.zeros(T, a.vocab_size, dtype=f32, device=dev),
+            # constants the lean step reuses instead of rebuilding them per step
+            _ar_t=torch.arange(T, device=dev),
+            _premix0=torch.zeros(T, a.hc_mult, dtype=f32, device=dev),
+            # per-step compressor inputs, kept for Caches.rollback
+            kvl_buf={L: torch.zeros(T, a.head_dim, dtype=f32, device=dev) for L in self.pend_buf},
+            sc_buf={L: torch.zeros(T, a.head_dim, dtype=f32, device=dev) for L in self.pend_buf},
+        )
+        b["_premix0"][:, 0] = 1.0
+        assert set(b) == set(_WIDTH_ATTRS)
+        return b
+
+    def _bind(self, T: int):
+        """Point the width-sized attributes at T's buffers. Captures and replays of width T both
+        run bound to T, so a graph always reads and writes the storage it was captured with."""
+        if self.width == T:
+            return
+        for name, value in self._width_bufs[T].items():
+            setattr(self, name, value)
+        self.width = T
 
     # ------------------------------------------------------------------ helpers
     def _n_cache(self, r):
@@ -675,10 +728,17 @@ class FastDecoder:
 
     # ------------------------------------------------------------------ capture
     def capture(self, S_parity: int, index_bucket: int):
-        """Capture graphs for one start parity and fixed indexer context bucket."""
+        """Capture graphs for one start parity, fixed indexer context bucket and the currently
+        bound verify width.
+
+        Only ever for the width of the step being run, never ahead for another width: the
+        warm-up forward writes KV at the bound width's positions, which the real step then
+        rewrites -- but a WIDER block warmed at the same start would write positions past the
+        step, and in the 128-slot window ring those overwrite entries the step's own last query
+        still attends to."""
         if not self.use_graphs:
             return
-        key = (S_parity, index_bucket)
+        key = (S_parity, index_bucket, self.width)
         if key in self.graphs:
             return
         if self.pool is None:
@@ -750,18 +810,21 @@ class FastDecoder:
         self.slots.copy_(slots)
 
     def step(self, block_ids: torch.Tensor, S: int, engram_rows: dict):
-        """Run the 6-token verify block at positions S..S+5. engram_rows: {L: [6,24,256] fp32}.
-        Returns (logits [6,V] fp32, main_hidden [6, 15360] fp32) as views of static buffers."""
+        """Run the T-token verify block at positions S..S+T-1, T = len(block_ids), one of
+        VERIFY_WIDTHS. engram_rows: {L: [T,24,256] fp32}. Returns (logits [T,V] fp32,
+        main_hidden [T, 15360] fp32) as views of T's static buffers."""
         a = self.a
-        assert block_ids.numel() == T_VERIFY
+        T = block_ids.numel()
+        assert T in self._width_bufs, (T, VERIFY_WIDTHS)
         assert self.c.len == S, (self.c.len, S)
+        self._bind(T)
         if LEAN_STEP:
             if block_ids is not self.ids:
                 self.ids.copy_(block_ids)
             torch.add(self._ar_t, S, out=self.pos)
         else:
             self.ids.copy_(block_ids)
-            self.pos.copy_(S + torch.arange(T_VERIFY, device=self.dev))
+            self.pos.copy_(S + torch.arange(T, device=self.dev))
         rows_fn = engram_rows if callable(engram_rows) else None
         if rows_fn is None:
             for L, rows in engram_rows.items():
@@ -774,9 +837,9 @@ class FastDecoder:
             self.h.copy_(self.W.embed[self.ids].unsqueeze(1).repeat(1, a.hc_mult, 1))
             self.pre_mix.zero_(); self.pre_mix[:, 0] = 1.0
         parity = S % 2
-        index_bucket = (_index_bucket(S + T_VERIFY, self.c.max_seq)
+        index_bucket = (_index_bucket(S + T, self.c.max_seq)
                         if INDEX_BUCKETS else self.c.max_seq)
-        graph_key = (parity, index_bucket)
+        graph_key = (parity, index_bucket, T)
         self.prepare_pending_buffers()
         if not LEAN_STEP or graph_key not in self.graphs:
             pending = ({L: None if value is None else (value[0].clone(), value[1].clone())
@@ -841,13 +904,13 @@ class FastDecoder:
             before = self.c.pending.get(L)
             self.c._chunk_inputs[L] = (S, self.kvl_buf[L], self.sc_buf[L], before)
             if parity == 1:
-                self.c.pending[L] = (self.kvl_buf[L][T_VERIFY - 1].clone(),
-                                     self.sc_buf[L][T_VERIFY - 1].clone())  # the last token is unpaired
+                self.c.pending[L] = (self.kvl_buf[L][T - 1].clone(),
+                                     self.sc_buf[L][T - 1].clone())  # the last token is unpaired
             else:
                 self.c.pending[L] = None
         if _ev_layers is not None:
             _ev_layers.record()
-        self.c.len = S + T_VERIFY
+        self.c.len = S + T
         self.stats["steps"] += 1
         self.stats["graph_s"] += time.perf_counter() - t0
         if self.rs_uniq is not None:
