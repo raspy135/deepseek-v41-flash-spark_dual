@@ -889,6 +889,14 @@ class V41Engine:
                 "hc_fused": bool(M_.HC_FUSED),
                 "hc_mm_tile": R.HC_MM_TILE,
                 "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
+                # Decode fp8 scheduling and projection merging are meant to be bit-identical to
+                # the defaults, but that is a measured property of this GPU and compiler, not a
+                # guarantee; a pair split across them must refuse to start.
+                "fp8_decode_block_n": os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto"),
+                "fp8_decode_warps": os.environ.get("DSV41_FP8_DECODE_WARPS", "4"),
+                "decode_merged_proj": os.environ.get("DSV41_DECODE_MERGED_PROJ", "1") == "1",
+                "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
+                "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
                 "moe_fallback": self.kernel == "dequant-fallback",
                 "act_quant": bool(self.act_quant),
                 "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0"),
@@ -2275,6 +2283,11 @@ class V41Engine:
             "hc_fused": bool(M_.HC_FUSED),
             "hc_mm_tile": R.HC_MM_TILE,
             "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
+            "fp8_decode_block_n": os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto"),
+            "fp8_decode_warps": int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4")),
+            "decode_merged_proj": getattr(self.fast, "merged_proj", 0),
+            "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
+            "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
             "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0") == "1",
             "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
             "moe_fallback": self.kernel == "dequant-fallback",

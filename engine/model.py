@@ -38,6 +38,10 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
 # Record which experts the router wanted but pruning removed (Model._record_prune_miss).
 PRUNE_MISS = os.environ.get("DSV41_PRUNE_MISS", "0") == "1"
+# Record decode-sized blocks with one Triton launch instead of ~20 torch kernels
+# (engine/prune_miss_fused.py). Database-only: routing and tokens are unchanged either way.
+# Read at call time so the A/B bench can toggle it; the boot guard pins it.
+PRUNE_MISS_FUSED = os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1"
 # How the demand database counts evidence. "slot" (default) adds one per (token, expert) routing
 # decision, so a request's vote is its token count: a 10k-token prompt outvotes a three-sentence
 # story in proportion to their lengths, and short benchmark probes are effectively invisible.
@@ -835,6 +839,14 @@ class Model:
         """
         if getattr(self, '_prefix_replay_only', False):
             return  # Cache preparation must not count the same request a second time.
+        d = 1 if decode else 0
+        if PRUNE_MISS_FUSED:
+            from engine import prune_miss_fused as PMF
+            if PMF.supported(logits, scores, keep_mask):
+                self.alloc_prune_miss(logits.size(-1), logits.device)
+                PMF.record(logits, scores, keep_mask, k, self._rec_counts[L], self._want_mass[L],
+                           self._want_phase[d][L], self._miss_tot[L], self._miss_phase[d])
+                return
         want = logits.topk(k, dim=-1)[1]                       # [T, k] an unpruned router's picks
         self.alloc_prune_miss(logits.size(-1), logits.device)
         flat = want.reshape(-1)
@@ -847,7 +859,6 @@ class Model:
         # generation does, so a combined history is ~95% prefill -- yet output quality depends on
         # DECODE routing. Whether one predicts the other decides both how to weight this database
         # and whether a per-request preload between prefill and decode is worth anything.
-        d = 1 if decode else 0
         self._want_phase[d][L].scatter_add_(0, flat, ones)
         miss = (~keep_mask[want]).double()
         self._miss_tot[L, 0] += miss.sum()

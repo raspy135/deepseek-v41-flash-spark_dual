@@ -10,15 +10,87 @@ Accumulation is fp32; the block scale is applied to the fp32 partial of each 32-
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
+
+# Decode-sized (M <= 16) scheduling. The grid is N / BLOCK_N CTAs, and GB10 has 48 SMs: at the
+# default 128 the narrow projections launch 4 (wkv, N=512), 9 (TP shared w1/w3, N=1152) or 10
+# (wq_a, N=1280) CTAs and reach ~58-140 GB/s in the 2026-09-16 decode trace against ~200 for
+# wq_b's 128-CTA grid. BLOCK_N only partitions OUTPUT columns: every output element is still one
+# fp32 accumulation over K in the same BLOCK_K steps, so a narrower tile is meant to be
+# bit-identical (the 64-wide sweep was, 42/42) -- tools/test_fp8_decode_tiles.py checks it rather
+# than assuming it. "auto" takes the widest tile that still fills every SM, else 16.
+# Read at call time so a benchmark can A/B arms inside one process; the EP2 boot guard pins it.
+DECODE_BLOCK_N = os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto")
+DECODE_WARPS = int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4"))
+_DECODE_BLOCK_N_CHOICES = ("16", "32", "64", "128", "auto")
+if DECODE_BLOCK_N not in _DECODE_BLOCK_N_CHOICES:
+    raise ValueError(f"DSV41_FP8_DECODE_BLOCK_N={DECODE_BLOCK_N!r}; use one of {_DECODE_BLOCK_N_CHOICES}")
+_SMS: dict[int, int] = {}
+
+
+def _sm_count(device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    n = _SMS.get(idx)
+    if n is None:
+        n = _SMS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return n
+
+
+def decode_block_n(n_cols: int, groups: int, device, policy: str | None = None) -> int:
+    """BLOCK_N for a decode-sized call producing `groups` x `n_cols` outputs."""
+    policy = DECODE_BLOCK_N if policy is None else policy
+    if policy != "auto":
+        return int(policy)
+    sms = _sm_count(device)
+    for bn in (128, 64, 32):
+        if triton.cdiv(n_cols, bn) * groups >= sms:
+            return bn
+    return 16
+
+
+@triton.jit
+def _act_qdq_tile(x, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    """v41_ref.act_qdq_fp8 on a [BLOCK_M, BLOCK_K] bf16 tile whose K offset is a multiple of 32.
+
+    Bit-identical to the torch spelling, which is why each step is spelled the way it is:
+    amax is order-independent; `/` and log2/exp2 go through libdevice's IEEE div_rn / log2f /
+    exp2f like torch's CUDA kernels (Triton's default fp32 `/` is div.full and tl.log2 is
+    lg2.approx -- both can move ceil(log2(.)) across an integer); multiplying by the power-of-two
+    scale is exact; e4m3 conversion is round-to-nearest-even on both sides; the product is exact
+    in bf16 (3 mantissa bits). tools/test_fp8_act_qdq.py checks it through an identity weight.
+
+    Triton builds libdevice with flush-to-zero (the PTX has div.rn.ftz, ex2.approx.ftz); torch
+    does not. That cannot change a result here: amax / 448 >= 2.2e-7 is normal; exp2 only sees
+    integers and returns exact powers of two >= 2^-22; a subnormal x, or a quotient that
+    underflows, quantizes to a same-signed zero in e4m3 either way. And with bf16 x, amax / 448
+    is either an exact power of two (exact log2 in both libraries) or >= ~0.4% away from one, so
+    a last-ulp log2 difference cannot move ceil(). An fp32 x would lose that margin, which is one
+    reason fp8_linear refuses it.
+    """
+    xg = tl.reshape(x.to(tl.float32), (BLOCK_M, BLOCK_K // 32, 32))
+    amax = tl.maximum(tl.max(tl.abs(xg), axis=2), 1e-4)
+    # The expensive IEEE div/log2 run once per 32-group. Per element, x / s is spelled
+    # x * 2^-e: s = 2^e is a power of two, so the quotient and the product are the same real
+    # number and round identically. The first version divided per element with div_rn inside the
+    # K loop and was 2.3x SLOWER than the torch spelling (wq_a 56 -> 129 us, 2026-09-23).
+    e = libdevice.ceil(libdevice.log2(libdevice.div_rn(amax, 448.0)))
+    s = libdevice.exp2(e)[:, :, None]
+    inv = libdevice.exp2(-e)[:, :, None]
+    q = tl.minimum(tl.maximum(xg * inv, -448.0), 448.0)
+    q = q.to(tl.float8e4nv).to(tl.float32) * s
+    return tl.reshape(q, (BLOCK_M, BLOCK_K)).to(tl.bfloat16)
 
 
 @triton.jit
 def _fp8_linear_kernel(X, W, S, Y, M, N, K,
                        stride_xm, stride_wn, stride_sn, stride_ym,
-                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                       ACT_QDQ: tl.constexpr = False):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -32,6 +104,8 @@ def _fp8_linear_kernel(X, W, S, Y, M, N, K,
     for k0 in range(0, K, BLOCK_K):
         kk = k0 + rk
         x = tl.load(X + rm[:, None] * stride_xm + kk[None, :], mask=m_mask[:, None] & (kk[None, :] < K), other=0.0)
+        if ACT_QDQ:
+            x = _act_qdq_tile(x, BLOCK_M, BLOCK_K)
         w = tl.load(W + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & (kk[None, :] < K), other=0.0)
         # one ue8m0 scale per 32-wide K group: exact in bf16 (3 mantissa bits, power-of-two scale)
         s = tl.load(S + n_scale_row[:, None] * stride_sn + (k0 // 32 + rs)[None, :],
@@ -161,6 +235,31 @@ class FP8Weight:
         return t
 
 
+def concat_rows(*parts: FP8Weight) -> tuple[FP8Weight, tuple[FP8Weight, ...]] | None:
+    """Stack same-K weights along N: (merged, views), where each view is one input rebuilt as a
+    row slice of the merged storage -- rebinding the originals to the views keeps ONE resident
+    copy. Returns None when the parts cannot share a launch without changing any output: exact
+    FP8Weight only (a TP wrapper or FP4 weight has its own kernel), equal K, and every N a
+    multiple of 32 so no 32x32 scale block straddles a boundary.
+
+    One launch over the merged rows computes each output column exactly as its own launch did
+    (same K order, see DECODE_BLOCK_N), and the caller quantizes the shared activation once.
+    """
+    if len(parts) < 2 or any(type(p) is not FP8Weight for p in parts):
+        return None
+    if len({p.K for p in parts}) != 1 or any(p.N % 32 for p in parts):
+        return None
+    if len({p.w.device for p in parts}) != 1:
+        return None
+    w = torch.cat([p.w for p in parts])
+    s = torch.cat([p.s for p in parts])
+    views, n0 = [], 0
+    for p in parts:
+        views.append(FP8Weight(w[n0:n0 + p.N], s[n0 // 32:(n0 + p.N) // 32]))
+        n0 += p.N
+    return FP8Weight(w, s), tuple(views)
+
+
 def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:
     """fp32/bf16 [N, K] -> FP8Weight in the checkpoint's own dense format: e4m3 codes plus one
     UE8M0 power-of-two scale per 32x32 block.
@@ -201,21 +300,29 @@ def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:
     return FP8Weight(codes, scales)
 
 
-def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16) -> torch.Tensor:
-    """x bf16 [..., K] -> bf16 [..., N]."""
+def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16, act_qdq: bool = False) -> torch.Tensor:
+    """x bf16 [..., K] -> bf16 [..., N].
+
+    act_qdq: apply v41_ref.act_qdq_fp8 to x inside the kernel instead of as ~13 separate torch
+    kernels before it. Decode-sized bf16 input only: the torch spelling quantizes from x's own
+    dtype, and an fp32 x would first be rounded to bf16 here."""
     shape = x.shape
+    if act_qdq and (x.dtype != torch.bfloat16 or x.numel() // x.shape[-1] > 16):
+        raise ValueError(f"fused act_qdq needs bf16 input with <= 16 rows, got {x.dtype} {tuple(x.shape)}")
     x2 = x.reshape(-1, W.K)
     if x2.dtype != torch.bfloat16:
         x2 = x2.to(torch.bfloat16)
     x2 = x2.contiguous()
     M = x2.size(0)
     y = torch.empty(M, W.N, dtype=out_dtype, device=x.device)
-    BLOCK_M = 16 if M <= 16 else 64
-    BLOCK_N = 128
+    decode = M <= 16
+    BLOCK_M = 16 if decode else 64
+    BLOCK_N = decode_block_n(W.N, 1, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
     grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
     _fp8_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K, x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
-                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4, num_stages=3)
+                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, ACT_QDQ=act_qdq,
+                             num_warps=DECODE_WARPS if decode else 4, num_stages=3)
     return y.view(*shape[:-1], W.N)
 
 
@@ -263,15 +370,16 @@ def fp8_grouped_linear(x: torch.Tensor, W: FP8GroupedWeight) -> torch.Tensor:
     x = x.contiguous()
     T = x.size(0)
     y = torch.empty(T, W.G, W.R, dtype=torch.bfloat16, device=x.device)
-    BLOCK_M = 16 if T <= 16 else 64
-    BLOCK_N = 128
+    decode = T <= 16
+    BLOCK_M = 16 if decode else 64
+    BLOCK_N = decode_block_n(W.R, W.G, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
     grid = (triton.cdiv(W.R, BLOCK_N), triton.cdiv(T, BLOCK_M), W.G)
     _fp8_grouped_kernel[grid](x, W.w, W.s, y, T, W.R, W.K,
                               x.stride(0), x.stride(1), W.w.stride(0), W.s.stride(0),
                               y.stride(0), y.stride(1),
                               BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                              num_warps=4, num_stages=3)
+                              num_warps=DECODE_WARPS if decode else 4, num_stages=3)
     return y
 
 

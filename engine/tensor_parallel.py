@@ -22,13 +22,21 @@ class RowParallelWeight:
         self.local = local
         self.shape = local.shape
 
-    def tp_linear(self, x):
+    def tp_linear_act_qdq(self, x):
+        """qlinear(x, self) with act_qdq_fp8 applied inside the fp8 GEMM. This rank's x is the
+        K shard the unfused path quantizes, and shard widths are multiples of 32, so the
+        quantization groups are the same ones. Decode-sized bf16 x only (v41_ref gates it)."""
+        return self.tp_linear(x, act_qdq=True)
+
+    def tp_linear(self, x, act_qdq: bool = False):
         import v41_ref as R
         from fp8_linear import FP8Weight, fp8_linear
         x = x.to(torch.bfloat16)
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
-        if isinstance(self.local, FP8Weight) and flat.size(0) <= 16:
+        if act_qdq:
+            partial = fp8_linear(flat, self.local, out_dtype=torch.float32, act_qdq=True)
+        elif isinstance(self.local, FP8Weight) and flat.size(0) <= 16:
             partial = fp8_linear(flat, self.local, out_dtype=torch.float32)
         else:
             weight = self.local if isinstance(self.local, torch.Tensor) else self.local.dequant()
@@ -53,15 +61,23 @@ class OutputParallelWeight:
         self.local, self.world = local, world
         self.shape = (local.shape[0] * world, local.shape[1] // world)
 
-    def tp_linear(self, x):
+    def tp_linear_act_qdq(self, x):
+        """qlinear(x, self) with act_qdq_fp8 applied inside the fp8 GEMM, after the gather. The
+        quantization is per row and per 32-wide K group, and each rank's shard is a whole number
+        of groups, so quantizing the gathered row equals gathering quantized shards."""
+        return self.tp_linear(x, act_qdq=True)
+
+    def tp_linear(self, x, act_qdq: bool = False):
         import v41_ref as R
+        from fp8_linear import fp8_linear
         shape = x.shape
         flat = x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous()
         rows, width = flat.shape
         gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
         dist.all_gather_into_tensor(gathered, flat)
         full = gathered.view(self.world, rows, width).transpose(0, 1).reshape(rows, self.world * width)
-        local = R.mm(full, self.local).contiguous()
+        local = (fp8_linear(full, self.local, act_qdq=True) if act_qdq
+                 else R.mm(full, self.local)).contiguous()
         output = torch.empty((self.world * rows, local.shape[-1]), dtype=local.dtype, device=local.device)
         dist.all_gather_into_tensor(output, local)
         return output.view(self.world, rows, local.shape[-1]).transpose(0, 1).reshape(

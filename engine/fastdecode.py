@@ -60,6 +60,31 @@ INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
 # Experimental fork/join of the replicated shared expert and routed TP work.
 # Keep off until full-engine timings establish a gain, not just more GPU activity.
 SHARED_OVERLAP = os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1"
+# Experimental: one fp8 launch for projections that read the same activation -- attention
+# wq_a||wkv and shared-expert w1||w3 -- instead of two launches and two identical activation
+# quantizations each. Column-wise the GEMM is unchanged, so the output is meant to be
+# bit-identical; the stacked weight replaces the originals' storage (they become views), so no
+# memory is added. Read at call time so the A/B bench can toggle it; the boot guard pins it.
+MERGED_PROJ = os.environ.get("DSV41_DECODE_MERGED_PROJ", "1") == "1"
+
+
+def merge_decode_projections(weights) -> int:
+    """Attach `_wqkv_a` / `_sh_w13` to every block that can take them; returns the merge count.
+    Idempotent. The originals are rebound to row views of the merged storage."""
+    from fp8_linear import concat_rows
+    merged = 0
+    for w in weights:
+        for first, second, attr in (("wq_a", "wkv", "_wqkv_a"), ("sh_w1", "sh_w3", "_sh_w13")):
+            if getattr(w, attr, None) is not None:
+                continue
+            a, b = getattr(w, first, None), getattr(w, second, None)
+            got = concat_rows(a, b) if a is not None and b is not None else None
+            if got is None:
+                continue
+            both, (va, vb) = got
+            setattr(w, first, va); setattr(w, second, vb); setattr(w, attr, both)
+            merged += 1
+    return merged
 
 
 # The verify block: one accepted token plus DSV41_BLOCK drafted ones. The checkpoint's DSpark head
@@ -120,6 +145,9 @@ class FastDecoder:
         self.c = model.c
         self.use_graphs = use_graphs
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
+        # Before any capture: graphs bake in weight addresses.
+        self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
+                            if MERGED_PROJ else 0)
         a = self.a
         dev = self.dev
         T = T_VERIFY
@@ -225,14 +253,25 @@ class FastDecoder:
         # reduction and Sinkhorn path identical instead of maintaining a second approximation.
         return self.m._hc_mixes(x, hc_fn, hc_scale, hc_base)
 
+    def _shared_ffn(self, y, w):
+        return R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, self.a.swiglu_limit,
+                            w13=getattr(w, "_sh_w13", None) if MERGED_PROJ else None)
+
     # ------------------------------------------------------------------ attention (decode, T tokens)
     def _attention(self, x, w, L, ring, freqs, pos, sh_state, mtp_last=None):
         a = self.a
         T = x.size(0)
         fq = freqs[pos]
-        qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
+        both = getattr(w, "_wqkv_a", None) if MERGED_PROJ else None
+        if both is not None:
+            qkv = R.qlinear(x, both)
+            # contiguous: the norms' reductions then see exactly the tensors the split path makes
+            q_lin, kv_lin = qkv[:, :w.wq_a.N].contiguous(), qkv[:, w.wq_a.N:].contiguous()
+        else:
+            q_lin, kv_lin = R.qlinear(x, w.wq_a), R.qlinear(x, w.wkv)
+        qr = R.rmsnorm(q_lin, w.q_norm, a.norm_eps)
         q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
-        kv = self._rope(R.rmsnorm(R.qlinear(x, w.wkv), w.kv_norm, a.norm_eps), fq)
+        kv = self._rope(R.rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
         # torch fallback materialises kv_all. The draft's window is a stride-0 broadcast view.
@@ -434,7 +473,7 @@ class FastDecoder:
         w = self.W.layers[L]
         if self.shared_stream is None:
             out = self._routed_experts()
-            _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+            _sh = self._shared_ffn(self.y, w).float()
         else:
             # Both branches read y; neither consumes the other's result. Fork AFTER
             # y is ready and rejoin BEFORE residual update/next layer overwrites it.
@@ -442,7 +481,7 @@ class FastDecoder:
             main = torch.cuda.current_stream(self.dev)
             self.shared_stream.wait_stream(main)
             with torch.cuda.stream(self.shared_stream):
-                _sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+                _sh = self._shared_ffn(self.y, w).float()
             try:
                 out = self._routed_experts()
             finally:
@@ -496,7 +535,7 @@ class FastDecoder:
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
             # TP draft arenas gather complete outputs inside moe_fn. Shared experts remain
             # replicated: another collective here would double their contribution.
-            out += R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+            out += self._shared_ffn(y, w).float()
             h = (_hc_post_fused(out.to(torch.bfloat16), residual, ffn_post, ffn_comb) if _HC_OPS
                  else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))
             pre_mix = ffn_pre

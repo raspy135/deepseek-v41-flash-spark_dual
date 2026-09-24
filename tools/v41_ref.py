@@ -637,8 +637,31 @@ def dense(x: torch.Tensor, w) -> torch.Tensor:
     return F.linear(x, w)
 
 
+# DSV41_FP8_ACT_QDQ_FUSED=1: for decode-sized bf16 input to an fp8 weight, quantize the activation
+# inside the GEMM (fp8_linear act_qdq) instead of ~13 torch kernels per call. Meant to be
+# bit-identical (tools/test_fp8_act_qdq.py). Read at call time so the A/B bench can toggle it;
+# the EP2 boot guard pins it.
+ACT_QDQ_FUSED = os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1"
+_ACT_QDQ_REF = act_qdq_fp8   # the fused path reproduces THIS function; engine/model.py can swap it out
+
+
+def _act_qdq_fusable(x: torch.Tensor, w) -> bool:
+    if not (ACT_QDQ_FUSED and act_qdq_fp8 is _ACT_QDQ_REF and FP8Weight is not None):
+        return False
+    if x.dtype != torch.bfloat16 or not x.is_cuda or x.numel() // x.shape[-1] > 16:
+        return False
+    if type(w) is FP8Weight:
+        return x.shape[-1] == w.K
+    # TP wrappers that take the unquantized activation and quantize inside their fp8 GEMM
+    return type(getattr(w, "local", None)) is FP8Weight and hasattr(w, "tp_linear_act_qdq")
+
+
 def qlinear(x: torch.Tensor, w_bf16: torch.Tensor) -> torch.Tensor:
     """Quantized-weight linear: fake-quantize the activation to fp8 (as the kernels do), bf16 GEMM."""
+    if _act_qdq_fusable(x, w_bf16):
+        if type(w_bf16) is FP8Weight:
+            return fp8_linear(x, w_bf16, act_qdq=True)
+        return w_bf16.tp_linear_act_qdq(x)
     return mm(act_qdq_fp8(x), w_bf16)
 
 
@@ -694,10 +717,19 @@ def router(x: torch.Tensor, w: LayerWeights, args: Args):
     return weights, indices, scores
 
 
-def expert_ffn(x: torch.Tensor, w1, w2, w3, limit: float, weights: torch.Tensor | None = None) -> torch.Tensor:
+def expert_ffn(x: torch.Tensor, w1, w2, w3, limit: float, weights: torch.Tensor | None = None,
+               w13=None) -> torch.Tensor:
+    """`w13`: optional fp8_linear.concat_rows(w1, w3) merge. One activation quantization and one
+    launch instead of two; column-wise the GEMM is the same, and the slices below feed the same
+    elementwise ops, so the output is meant to be identical (tools/test_fp8_decode_tiles.py)."""
     dtype = x.dtype
-    gate = qlinear(x, w1).float()
-    up = qlinear(x, w3).float()
+    if w13 is not None:
+        gu = qlinear(x, w13)
+        gate = gu[..., :w1.N].float()
+        up = gu[..., w1.N:].float()
+    else:
+        gate = qlinear(x, w1).float()
+        up = qlinear(x, w3).float()
     if limit > 0:
         up = torch.clamp(up, min=-limit, max=limit)
         gate = torch.clamp(gate, max=limit)
