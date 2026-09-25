@@ -165,8 +165,9 @@ MAX_SEQ=524288 bash scripts/dual-up.sh
 
 The engine records the router's choices before pruning, blends that demand with a
 routing trace, and replaces less-used resident experts. Swaps can happen after
-prefill and at the end of a request, subject to the thresholds below. They do not
-retroactively recompute tokens that were already processed.
+prefill, every 600 tokens during long answers, and at the end of a request, subject to
+the thresholds below. They do not retroactively recompute tokens that were already
+processed.
 
 Two settings control it; the engine derives the rest and logs what it chose at startup:
 
@@ -175,7 +176,7 @@ Two settings control it; the engine derives the rest and logs what it chose at s
 | `DSV41_ADAPT_SENSITIVITY` | `medium` | How far one request moves the resident set. See the levels below. |
 | `DSV41_ADAPT_PRIOR` | `8` | Weight of the shipped routing trace, in requests. Lower lets this server's own traffic dominate sooner. |
 
-| Sensitivity | Demand half-life | Newest request's share of observed demand | Prefill-pass miss gate |
+| Sensitivity | Demand half-life | Newest request's share of observed demand | Miss gate (prefill and decode passes) |
 | --- | ---: | ---: | ---: |
 | `off` | never (ranking frozen) | — | — |
 | `low` | 40 requests | 1.7% | 4% |
@@ -192,6 +193,11 @@ Fixed by the engine:
 - demand counted per request, not per routing slot;
 - swaps at the end of each request, and at the prefill→decode boundary when the prompt has at
   least 32 new tokens and misses at least the gate above;
+- during long answers, a pass every 600 output tokens when that stretch misses at least the
+  same gate (~0.2 s each, about 1% of decode time at ~20 tok/s). It plans with the answer's
+  demand so far without adding an extra vote, and logs `decode adaptation at output token N`.
+  `DSV41_ADAPT_DECODE_TOKENS` changes the interval; `0` turns only these passes off. Added
+  2026-09-24 and unit-tested; its effect on miss rate in serving is not yet measured;
 - at most 512 swaps per pass;
 - a gain floor of 0.005 of the layer's mean score.
 

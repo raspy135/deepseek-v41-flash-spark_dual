@@ -1543,7 +1543,7 @@ class V41Engine:
             self.last_stats["accounting_covers"] = "prefill+decode"
 
     # ------------------------------------------------------------ online adaptation (stage 2)
-    def plan_swaps(self, max_swaps: int = 64, min_gain: float | None = None):
+    def plan_swaps(self, max_swaps: int = 64, min_gain: float | None = None, pending_request: bool = False):
         """Which residents should be replaced, given everything the router has asked for since boot.
 
         Swaps are planned WITHIN each ownership class. Both ranks hold the same number of arena
@@ -1565,6 +1565,16 @@ class V41Engine:
         _summary, demand, _mass = rep
         demand = demand.numpy()
         total = float(demand.sum())
+        if pending_request and ADAPT.request_unit and getattr(self.model, "_req_counts", None) is not None:
+            # Decode-time pass: plan as if THIS request's demand so far were folded in -- aged
+            # history plus its normalized per-layer distribution, exactly what
+            # flush_request_demand would write -- without writing it. The end-of-request fold
+            # still adds exactly one vote; a pass every 600 tokens must not add one each time.
+            req = self.model._req_counts.cpu().numpy()
+            tot = req.sum(axis=1, keepdims=True)
+            decay = 0.5 ** (1.0 / ADAPT.halflife) if 0 < ADAPT.halflife < float("inf") else 1.0
+            demand = demand * decay + np.divide(req, tot, out=np.zeros_like(req), where=tot > 0)
+            total = float(demand.sum())
         if total <= 0:
             return []
         prior = ADAPT.prior
@@ -1707,6 +1717,52 @@ class V41Engine:
     def swaps_due(self, min_growth: float | None = None) -> bool:
         """Back-compat shim for callers that only want the predicate."""
         return self.maintain_demand()
+
+    def _decode_adapt_due(self, n_out: int) -> int:
+        """Rank 0, once per decode step: 1 if a decode-time adaptation pass should run before
+        this step. Every ADAPT.decode_tokens output tokens, the decode stretch since the last
+        check is judged by its OWN routed-miss rate against the same gate the prefill pass uses;
+        the check point then moves on whether or not a pass runs. One GPU read per interval."""
+        mark = getattr(self, "_decode_adapt_mark", None)
+        if not ADAPT.decode_tokens or mark is None or n_out - mark[0] < ADAPT.decode_tokens:
+            return 0
+        now = self.model.miss_snapshot() if hasattr(self.model, "miss_snapshot") else None
+        self._decode_adapt_mark = (n_out, now)
+        if now is None or mark[1] is None or now[1] <= mark[1][1]:
+            return 0
+        self._decode_adapt_rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1])
+        return 1 if self._decode_adapt_rate >= ADAPT.swap_prefill_min_miss else 0
+
+    def maintain_decode(self, n_out: int) -> int:
+        """Re-fit the resident experts mid-decode. Both ranks reach this unconditionally when
+        rank 0's control() flag says so -- the top of a decode step is a lockstep point, the same
+        argument as maintain_inline. Rank 0 plans (with this request's decode demand previewed,
+        see plan_swaps) and broadcasts; both apply. Past tokens are untouched: their KV is
+        already written, only later tokens route to the new experts."""
+        t0 = time.perf_counter()
+        swaps = None
+        if self.ep.rank == 0:
+            try:
+                swaps = self.plan_swaps(max_swaps=ADAPT.swap_max, pending_request=True)
+            except Exception as e:  # noqa: BLE001
+                log(f"decode adaptation planning failed ({type(e).__name__}: {e}); skipping")
+                swaps = None
+        swaps = self.ep.broadcast_obj(swaps)
+        if not swaps:
+            return 0
+        try:
+            n = self.apply_swaps(swaps)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            log("decode adaptation failed after the plan was broadcast; the pair would desync")
+            os._exit(1)
+        if self.ep.rank == 0:
+            log(f"decode adaptation at output token {n_out}: {n} expert slots in "
+                f"{1000 * (time.perf_counter() - t0):.0f} ms "
+                f"(miss rate {getattr(self, '_decode_adapt_rate', 0.0):.1%} over the last "
+                f"{ADAPT.decode_tokens} tokens)")
+        return n
 
     def maintain_inline(self, new_tokens: int) -> int:
         """Re-fit the resident experts mid-request, at the prefill -> decode boundary.
@@ -2031,8 +2087,18 @@ class V41Engine:
         pol = self.depth_policy if (self.spec and self.fast is not None) else None
         if pol is not None:
             pol.reset_request()
+        # Decode-time expert adaptation (engine/adapt_config.py: every ADAPT.decode_tokens
+        # output tokens, gated on that stretch's miss rate). Rank 0 decides; control() carries
+        # the flag so both ranks run the pass at the same step. Single-request serving only.
+        decode_adapt = (ADAPT.decode_tokens > 0 and self.ep.rank == 0 and self.ep.active
+                        and int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) == 1
+                        and getattr(self, "model_prune_mask", None))
+        self._decode_adapt_mark = ((n_out, self.model.miss_snapshot()) if decode_adapt else None)
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
-                              pol.decide() if pol is not None and self.ep.rank == 0 else 0):
+                              pol.decide() if pol is not None and self.ep.rank == 0 else 0,
+                              self._decode_adapt_due(n_out) if decode_adapt else 0):
+            if self.ep.control_flag:
+                self.maintain_decode(n_out)
             t_iter = time.perf_counter()
             # A step that captures a CUDA graph (first use of a width/parity/bucket, or the
             # drafter) costs seconds; timing it would skew the policy's step-time estimate.

@@ -15,7 +15,8 @@ DSV41_PRUNE_UNIT (routing slots vs requests). They only ever expressed two decis
 
 With either knob set, the engine derives the rest -- request units, swaps on (off at
 sensitivity `off`, or with an explicit legacy DSV41_PRUNE_SWAP=0, which scripts use to freeze
-placement; likewise DSV41_PRUNE_SWAP_PREFILL=0), prefill-boundary swaps on, a prefill miss gate that scales inversely with
+placement; likewise DSV41_PRUNE_SWAP_PREFILL=0), prefill-boundary swaps on, decode-time passes every 600 output tokens, a miss gate that
+scales inversely with
 sensitivity (2% at medium, 1% at high), a 512-swap cap, a 0.005 gain floor -- and ignores the
 old per-setting variables, naming them in the startup log. With neither set, every legacy
 DSV41_PRUNE_* variable is read exactly as before, with the same defaults.
@@ -31,6 +32,7 @@ from dataclasses import dataclass, field
 
 LEVELS = {"off": None, "low": 40.0, "medium": 20.0, "high": 10.0, "max": 5.0}   # half-life, requests
 DEFAULT_PRIOR = 8.0
+DECODE_TOKENS = 600
 REQUEST_DB = "results/prune_demand_req.npz"
 # Legacy settings the two knobs replace; reported (not read) when a knob is set.
 REPLACED = ("DSV41_PRUNE_UNIT", "DSV41_PRUNE_PRIOR", "DSV41_PRUNE_HALFLIFE", "DSV41_PRUNE_SWAP",
@@ -56,6 +58,7 @@ class AdaptConfig:
     swap_min_gain: float         # x the layer's mean score
     min_growth_req: int          # requests between plans (request unit)
     min_growth_slots: float      # new slots between plans (slot unit)
+    decode_tokens: int = 0       # decode-time pass every this many output tokens (0 = never)
     sensitivity: float | None = None   # newest request's share of observed demand (knobs only)
     level: str | None = None
     ignored: tuple = field(default_factory=tuple)
@@ -73,7 +76,8 @@ class AdaptConfig:
         msg = (f"expert adaptation: sensitivity {s}, prior {self.prior:g} requests; derived: "
                f"prefill swaps {'on' if self.swap_prefill else 'off'} at >= {self.swap_prefill_min} "
                f"new tokens and >= {self.swap_prefill_min_miss:.1%} misses, <= {self.swap_max} swaps "
-               f"per pass, gain floor {self.swap_min_gain}")
+               f"per pass, gain floor {self.swap_min_gain}, decode passes "
+               + (f"every {self.decode_tokens} tokens at the same miss gate" if self.decode_tokens else "off"))
         if self.ignored:
             msg += f"; ignoring {', '.join(self.ignored)} (replaced by DSV41_ADAPT_*)"
         return msg
@@ -83,7 +87,8 @@ class AdaptConfig:
         (the prefill-boundary pass) or what the ranking/mask is built from."""
         return {"adapt_source": self.source, "adapt_request_unit": self.request_unit,
                 "adapt_prior": self.prior, "adapt_halflife": round(self.halflife, 6),
-                "adapt_swap": self.swap, "prune_swap_prefill": "1" if self.swap_prefill else "0",
+                "adapt_swap": self.swap, "adapt_decode_tokens": self.decode_tokens,
+                "prune_swap_prefill": "1" if self.swap_prefill else "0",
                 "prune_swap_prefill_min": str(self.swap_prefill_min)}
 
 
@@ -103,6 +108,20 @@ def _sensitivity(raw: str) -> tuple[str | None, float | None]:
     if s == 0:
         return "off", None
     return None, math.log(0.5) / math.log(1 - s)
+
+
+def _decode_tokens(raw: str | None) -> int:
+    """DSV41_ADAPT_DECODE_TOKENS: optional override of the decode-pass interval; 0 turns decode
+    passes off (the rollback if they ever misbehave), leaving the rest of adaptation alone."""
+    if raw is None:
+        return DECODE_TOKENS
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"DSV41_ADAPT_DECODE_TOKENS={raw!r}: output tokens between passes, 0 = off") from None
+    if n < 0:
+        raise ValueError(f"DSV41_ADAPT_DECODE_TOKENS={raw!r} must be >= 0")
+    return n
 
 
 def resolve(env=None) -> AdaptConfig:
@@ -127,6 +146,7 @@ def resolve(env=None) -> AdaptConfig:
             swap_min_gain=float(get("DSV41_PRUNE_SWAP_MIN_GAIN", "0.05")),
             min_growth_req=max(1, int(get("DSV41_PRUNE_SWAP_MIN_GROWTH_REQ", "1"))),
             min_growth_slots=float(get("DSV41_PRUNE_SWAP_MIN_GROWTH", "5e5")),
+            decode_tokens=0,
         )
     level, halflife = _sensitivity(sens_raw if sens_raw is not None else "medium")
     try:
@@ -162,6 +182,9 @@ def resolve(env=None) -> AdaptConfig:
         swap_min_gain=0.005,
         min_growth_req=1,
         min_growth_slots=0.0,
+        # ~30 s of decode at ~20 tok/s for a ~0.2 s pass (~1% overhead), gated on the decode
+        # stretch's own miss rate like the prefill pass (swap_prefill_min_miss).
+        decode_tokens=_decode_tokens(get("DSV41_ADAPT_DECODE_TOKENS")) if (on and not freeze) else 0,
         sensitivity=s if on else 0.0,
         level=level,
         ignored=tuple(k for k in REPLACED if k in env and k not in honored),

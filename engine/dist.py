@@ -74,7 +74,8 @@ class EPDistributed:
         self.rank = int(os.environ.get("RANK", 0)) if rank is None else int(rank)
         self.world = int(os.environ.get("WORLD_SIZE", 1)) if world_size is None else int(world_size)
         self.active = self.world > 1
-        self.control_value = 0   # rank 0's per-step value from the last control() broadcast
+        self.control_value = 0   # rank 0's per-step values from the last control() broadcast
+        self.control_flag = 0
         self.tensor_parallel = os.environ.get('DSV41_TP_EXPERTS', '0') == '1'
         if self.tensor_parallel and self.world != 2:
             raise ValueError('DSV41_TP_EXPERTS requires two ranks')
@@ -202,7 +203,7 @@ class EPDistributed:
         return obj[0]
 
     # ------------------------------------------------------- step control
-    def control(self, keep_going: bool, value: int = 0) -> bool:
+    def control(self, keep_going: bool, value: int = 0, flag: int = 0) -> bool:
         """rank 0 -> all, once per decode step: does the loop run another iteration?
 
         The lockstep argument in this module's docstring covers *what* the two ranks compute
@@ -224,18 +225,19 @@ class EPDistributed:
         evaluates its own. A CPU tensor keeps this on the Gloo half of the mixed group -- no CUDA
         sync, no interleaving with the in-flight NCCL combines, just the host bool the loop needs.
 
-        The same message carries `value`, rank 0's per-step decision (the speculative depth,
-        DSV41_BLOCK_DYNAMIC); every rank reads it back from `self.control_value`. It is always
-        two ints, for every caller including release_peer, so a rank blocked in a decode loop's
-        control() can never be paired with a broadcast of a different size.
+        The same message carries rank 0's per-step decisions: `value` (the speculative depth,
+        DSV41_BLOCK_DYNAMIC) and `flag` (run a decode-time expert adaptation pass before this
+        step); every rank reads them back from `self.control_value` / `self.control_flag`. It is
+        always three ints, for every caller including release_peer, so a rank blocked in a
+        decode loop's control() can never be paired with a broadcast of a different size.
         """
         if not self.active:
-            self.control_value = int(value)
+            self.control_value, self.control_flag = int(value), int(flag)
             return keep_going
-        flag = torch.tensor([1 if keep_going else 0, int(value)], dtype=torch.int32)
-        dist.broadcast(flag, src=0)
-        self.control_value = int(flag[1])
-        return bool(flag[0])
+        msg = torch.tensor([1 if keep_going else 0, int(value), int(flag)], dtype=torch.int32)
+        dist.broadcast(msg, src=0)
+        self.control_value, self.control_flag = int(msg[1]), int(msg[2])
+        return bool(msg[0])
 
     def release_peer(self) -> None:
         """Best-effort 'stop' for the abort paths (GeneratorExit, exceptions, shutdown).
