@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek V4.1 on two Sparks: adaptive speculative depth</title>
+<style>
+  /* Same system as dual-spark.html: paper, ink, lime; 1600 x 900 (16:9, X large card).
+     Sized for phones: X shows this ~400 px wide (x0.25), so no text below ~22 px here. */
+  :root { color-scheme: light; --paper: #f2f1eb; --ink: #20241f; --quiet: #5b6057; --faint: #9a9e93;
+          --line: #cecec4; --green: #b7df54; --panel: #e9e9e0; --bar: #cfd1c5; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); }
+  body { font-family: Arial, Helvetica, sans-serif; }
+  .viewport { width: 100%; overflow: hidden; }
+  .poster { width: 1600px; height: 900px; padding: 56px 72px 44px; transform-origin: top left;
+            color: var(--ink); background: var(--paper); position: relative; }
+  .mono { font-family: 'Courier New', monospace; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
+  header { display: flex; align-items: center; justify-content: space-between;
+           border-bottom: 2px solid var(--ink); padding-bottom: 22px; }
+  .eyebrow { font-size: 28px; }
+  .tag { display: flex; align-items: center; gap: 14px; font-size: 30px; font-weight: 600; }
+  .tag i { width: 16px; height: 16px; background: var(--ink); display: block; }
+  main { display: grid; grid-template-columns: 690px 1fr; gap: 56px; padding-top: 50px; }
+  h1 { margin: 0; font-size: 92px; line-height: 1.02; letter-spacing: -4.8px; font-weight: 600; }
+  h1 span { display: block; color: var(--quiet); font-size: 80px; letter-spacing: -3.8px; margin-top: 4px; }
+  .claim { margin-top: 34px; }
+  .claim .label { font-size: 26px; color: var(--quiet); }
+  h2 { font-size: 64px; line-height: 1.05; letter-spacing: -2.4px; font-weight: 500; margin: 10px 0 16px; }
+  /* marker underline: the highlight sits under the text, so the text keeps the left margin */
+  h2 b { font-weight: 700; background: linear-gradient(transparent 56%, var(--green) 56%, var(--green) 94%, transparent 94%); }
+  .description { font-size: 34px; line-height: 1.3; margin: 0; color: var(--quiet); }
+
+  .chart-heading { display: flex; justify-content: space-between; font-size: 27px; color: var(--quiet); margin-bottom: 16px; }
+  .panel { border: 2px solid var(--ink); background: var(--panel); padding: 22px 26px 20px; }
+  .group + .group { margin-top: 18px; padding-top: 16px; border-top: 2px dashed var(--faint); }
+  .group-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .group-title strong { font-size: 38px; letter-spacing: -.8px; }
+  .group-title .mono { font-size: 25px; color: var(--quiet); }
+  .row { display: grid; grid-template-columns: 178px 1fr 88px; align-items: center; gap: 14px; margin-top: 8px; }
+  .row .name { font-size: 29px; color: var(--quiet); }
+  .track { height: 40px; }
+  .fill { height: 100%; background: var(--bar); }
+  .row.adaptive .fill { background: var(--green); }
+  .row.adaptive .name, .row.adaptive .value { color: var(--ink); }
+  .value { font-size: 38px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; color: var(--quiet); }
+  .note { margin-top: 14px; font-size: 27px; color: var(--quiet); }
+
+  footer { position: absolute; left: 72px; right: 72px; bottom: 40px; display: flex; justify-content: space-between;
+           align-items: center; border-top: 2px solid var(--line); padding-top: 22px; }
+  .features { font-size: 28px; color: var(--quiet); font-weight: 600; }
+  .features span { color: var(--faint); margin: 0 12px; }
+  .stack { font-size: 27px; }
+</style>
+</head>
+<body>
+<div class="viewport">
+<div class="poster" id="poster">
+  <header>
+    <div class="eyebrow mono">Local inference / Dual DGX Spark</div>
+    <div class="tag"><i></i>Adaptive speculative depth</div>
+  </header>
+
+  <main>
+    <section>
+      <h1>DeepSeek V4.1<span>on two Sparks.</span></h1>
+      <div class="claim">
+        <div class="label mono">Draft depth follows the text</div>
+        <h2><b>+21% on code.</b><br>No loss on prose.</h2>
+        <p class="description">Drafts 5 tokens ahead when it can,<br>3 when it can't. Same output, faster.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="chart-heading mono"><span>Decode tokens / s</span><span>TP = 2</span></div>
+      <div class="panel">
+        <div class="group">
+          <div class="group-title"><strong>Code</strong><span class="mono">Python module</span></div>
+          <div class="row"><span class="name mono">Depth 3</span><div class="track"><div class="fill" style="width:79.8%"></div></div><span class="value">35.5</span></div>
+          <div class="row"><span class="name mono">Depth 5</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="value">44.5</span></div>
+          <div class="row adaptive"><span class="name mono">Adaptive</span><div class="track"><div class="fill" style="width:96.9%"></div></div><span class="value">43.1</span></div>
+        </div>
+        <div class="group">
+          <div class="group-title"><strong>Prose</strong><span class="mono">Explanation</span></div>
+          <div class="row"><span class="name mono">Depth 3</span><div class="track"><div class="fill" style="width:45.8%"></div></div><span class="value">20.4</span></div>
+          <div class="row"><span class="name mono">Depth 5</span><div class="track"><div class="fill" style="width:40.9%"></div></div><span class="value">18.2</span></div>
+          <div class="row adaptive"><span class="name mono">Adaptive</span><div class="track"><div class="fill" style="width:46.3%"></div></div><span class="value">20.6</span></div>
+        </div>
+        <div class="note">Identical output at every depth.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="features">Native MXFP4<span>/</span>Adaptive experts<span>/</span>Vision<span>/</span>OpenAI API</div>
+    <div class="stack mono">PyTorch / Triton / CUDA</div>
+  </footer>
+</div>
+</div>
+<script>
+  // Scale the fixed 1600 x 900 artwork to the window without changing its composition.
+  function fit() {
+    const p = document.getElementById('poster');
+    const s = Math.min(1, window.innerWidth / 1600);
+    p.style.transform = 'scale(' + s + ')';
+    p.parentElement.style.height = (900 * s) + 'px';
+  }
+  window.addEventListener('resize', fit); fit();
+</script>
+</body>
+</html>
