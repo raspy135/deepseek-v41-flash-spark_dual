@@ -39,6 +39,8 @@ err()  { echo "ERROR: $*" >&2; exit 1; }
 # .env's SPEC=1 -- capture what the caller set, source, then put it back.
 declare -A _CLI=()
 for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT BIND_HOST MIN_FREE_GIB NAME0 NAME1 NCCL_SOCKET_IFNAME \
+         NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE \
+         NCCL_IB_ROCE_VERSION_NUM NCCL_IB_MERGE_NICS NCCL_CROSS_NIC \
          MODELS_DIR MODEL_DIR MODEL_NAME SERVED_MODEL_NAME MAX_SEQ SPEC ARENA_GB TRACE_STATS \
          PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS \
          DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S STOP_TIMEOUT; do
@@ -179,6 +181,16 @@ common_env=(
     -e DEFAULT_THINKING="${DEFAULT_THINKING:-off}"
     -e DEFAULT_EFFORT="${DEFAULT_EFFORT:-75}"
 )
+# RoCE transport selection is separate from the socket/bootstrap interface.  A Spark QSFP
+# port exposes two verbs devices, one behind each PCIe Gen5 x4 path; pinning one HCA leaves
+# half of the physical port idle.  Forward these only when set so the historical one-rail
+# auto-detection remains the fallback on other topologies.  With NCCL_IB_ADDR_RANGE set and
+# NCCL_IB_GID_INDEX unset, NCCL chooses the matching RoCEv2 GID independently on every HCA
+# and rank -- important because table indices are not stable across reboots.
+for v in NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE \
+         NCCL_IB_ROCE_VERSION_NUM NCCL_IB_MERGE_NICS NCCL_CROSS_NIC; do
+    [[ -n "${!v:-}" ]] && common_env+=(-e "$v=${!v}")
+done
 # Tuning knobs: forwarded only when set, so an unset one keeps the image default.
 for v in ARENA_GB TRACE_STATS PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS; do
     [[ -n "${!v:-}" ]] && common_env+=(-e "$v=${!v}")

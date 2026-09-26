@@ -19,6 +19,7 @@ vision, and DSpark speculative decoding. It processes one request at a time.
 - **Vision enabled.** Supports text and image inputs, not just text-only inference.
 - **Adaptive expert loading.** Resident experts change with your workload, using observed routing demand to decide which weights to keep in memory.
 - **One model, two DGX Sparks.** Tensor parallelism splits the same selected experts across both nodes, alongside attention and other model weights.
+- **Dual-rail prefill.** Optionally use both RoCE paths for prompt processing while keeping latency-sensitive decode on one rail. Requires the matching network settings below.
 - **Persistent prefix cache.** Saves prompt prefixes to local disk for reuse across requests and server restarts.
 - **Adaptive speculative depth.** Drafts 5 tokens ahead while the drafter keeps being right (code, markup) and falls back to 3 on prose, per request. Output is unchanged; only speed moves.
 
@@ -40,6 +41,12 @@ Set `MODEL_DIR`, `PEER` (`user@worker-ip`), `MASTER_ADDR` (the head's link IP), 
 `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` (the link interface). The template uses
 the current 768K allocation and TP profile below. Full-length 768K quality has not
 been validated. Keep credentials in `.env`, not the template.
+
+On a two-Spark TP pair with both logical RoCE interfaces configured, the optional
+`DSV41_PREFILL_DUAL_RAIL=1` profile sends prefill collectives across both paths and
+keeps decode on one. Uncomment the accompanying networking settings in `.env.example`
+and use your actual interfaces/subnets. This profile is validated with NCCL 2.29;
+see [the networking measurements and constraints](docs/gotchas.md#a-200gbe-port-is-two-100gbs-logical-rails-and-the-gid-index-moves-across-reboots).
 
 ```bash
 # Run on each node; downloads the full checkpoint to local storage.
@@ -127,6 +134,7 @@ The main capacity and speed controls:
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
+| `DSV41_PREFILL_DUAL_RAIL=1` | Use both RoCE paths for prefill and one for decode. Requires two addressed interfaces and the accompanying NCCL settings in `.env.example`; validated with NCCL 2.29. |
 | `DSV41_PREFILL_FUSED_ATTN=1` | Keep fused prefill attention enabled. |
 | `DSV41_FP4_CUDA=1` | Default native CUDA-core FP4 decode for supported BM=16 shapes. Set `0` to use Triton throughout (also required with `DSV41_FP4_DOT_SCALED=1`). See [measurements](docs/gotchas.md#a-native-cuda-spelling-is-not-automatically-faster-than-triton). |
 | Decode projections | On by default: `DSV41_DECODE_MERGED_PROJ`, `DSV41_FP8_DECODE_BLOCK_N=auto`, `DSV41_PRUNE_MISS_FUSED`. Bit-exact; about 4% less time per verify step. Roll back with `0` (`128` for the tile) on both nodes. See [measurements](docs/decode-projection-fusion.md). |

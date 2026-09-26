@@ -659,6 +659,8 @@ def moe_forward(
 
     inter = arena.w1.shape[1]
     tp = getattr(arena, 'tp_world', 1) > 1
+    if tp:
+        from engine.collective_rails import group as collective_group
     tp_output = getattr(arena, 'tp_output', False)
     reduce_mode = os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce')
     scatter = tp and (reduce_mode == 'scatter' or (reduce_mode == 'auto' and P > 64))
@@ -685,7 +687,7 @@ def moe_forward(
         # intermediate, then compute disjoint output rows. Splitting K changed a
         # borderline nesting decision even with FP32 partial reductions before BF16.
         gathered_h = torch.empty((arena.tp_world * P, inter), dtype=h.dtype, device=dev)
-        torch.distributed.all_gather_into_tensor(gathered_h, h)
+        torch.distributed.all_gather_into_tensor(gathered_h, h, group=collective_group())
         h = gathered_h.view(arena.tp_world, P, inter).transpose(0, 1).reshape(P, INTER)
         down_k = INTER
     if stage_mark is not None:
@@ -708,7 +710,7 @@ def moe_forward(
     if tp_output:
         local = parts.view(K, T, down_n).sum(dim=0).to(out_dtype)
         gathered = torch.empty((arena.tp_world * T, down_n), dtype=out_dtype, device=dev)
-        torch.distributed.all_gather_into_tensor(gathered, local)
+        torch.distributed.all_gather_into_tensor(gathered, local, group=collective_group())
         result = gathered.view(arena.tp_world, T, down_n).transpose(0, 1).reshape(T, DIM)
         if stage_mark is not None:
             stage_mark('output_reduce_gather')
@@ -721,17 +723,18 @@ def moe_forward(
             # BF16 rounding and no change to expert selection; less network traffic.
             world, width = arena.tp_world, DIM // arena.tp_world
             reduced = torch.empty((P, width), dtype=torch.float32, device=dev)
-            torch.distributed.reduce_scatter_tensor(reduced, parts.view(world * P, width))
+            torch.distributed.reduce_scatter_tensor(reduced, parts.view(world * P, width),
+                                                  group=collective_group())
             local = torch.empty((T, width), dtype=out_dtype, device=dev)
             if native_decode:
                 CUDA.round_reduce(reduced, local, K)
             else:
                 _tp_round_reduce[(triton.cdiv(T * width, 1024),)](reduced, local, T * width, K, 1024)
             gathered = torch.empty((world * T, width), dtype=out_dtype, device=dev)
-            torch.distributed.all_gather_into_tensor(gathered, local)
+            torch.distributed.all_gather_into_tensor(gathered, local, group=collective_group())
             result = gathered.view(world, T, width).transpose(0, 1).reshape(T, DIM)
         else:
-            torch.distributed.all_reduce(parts)
+            torch.distributed.all_reduce(parts, group=collective_group())
             result = torch.empty((T, DIM), dtype=out_dtype, device=dev)
             if native_decode:
                 CUDA.round_reduce(parts, result, K)

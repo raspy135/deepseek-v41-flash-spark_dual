@@ -227,7 +227,8 @@ class EngramTable:
                 # -- `n` is derived from the hashes, which both ranks compute identically, so the
                 # skip-on-empty is taken on both or neither.
                 import torch.distributed as _dist
-                _dist.all_reduce(rawt, op=_dist.ReduceOp.SUM)
+                from engine.collective_rails import group as collective_group
+                _dist.all_reduce(rawt, op=_dist.ReduceOp.SUM, group=collective_group())
         else:
             i = self._cur
             self._cur ^= 1  # two buffers: the wait is on the copy from two calls ago

@@ -74,10 +74,16 @@ if [[ "$WORLD_SIZE" != "1" ]]; then
      Run it with --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 --network host,
      or use scripts/dual-up.sh which does. Without verbs NCCL drops to TCP sockets and the
      collective tax goes from ~60 us to ~1.9 ms -- 30x over the Gate G0 budget."
-    # Each rank resolves its OWN RoCE GID index. The two boxes do not agree on them (index 5
-    # here, 6 on the peer, whose 5 is an empty slot), and a wrong index does not degrade to
-    # sockets -- NCCL fails the queue-pair transition outright. See scripts/roce_gid.sh.
-    if [[ -z "${NCCL_IB_GID_INDEX:-}" ]]; then
+    # Dual rail uses NCCL's per-HCA dynamic GID selection. A single NCCL_IB_GID_INDEX cannot
+    # describe two HCAs whose IPv4 entries may occupy different slots, and those slots move
+    # across reboots. NCCL_IB_ADDR_RANGE constrains selection to the two direct-link subnets.
+    if [[ -n "${NCCL_IB_HCA:-}" && -n "${NCCL_IB_ADDR_RANGE:-}" && -z "${NCCL_IB_GID_INDEX:-}" ]]; then
+        export NCCL_IB_ADDR_FAMILY="${NCCL_IB_ADDR_FAMILY:-AF_INET}"
+        export NCCL_IB_ROCE_VERSION_NUM="${NCCL_IB_ROCE_VERSION_NUM:-2}"
+        info "EP2 rank $RANK: RoCE $NCCL_IB_HCA, dynamic GID in $NCCL_IB_ADDR_RANGE"
+    # Single rail keeps the older per-rank explicit lookup. The two boxes need not agree on
+    # the index, and a wrong one fails the QP transition instead of falling back to sockets.
+    elif [[ -z "${NCCL_IB_GID_INDEX:-}" ]]; then
         if read -r _hca _gid < <(/app/scripts/roce_gid.sh ${EP_LOCAL_IP:+"$EP_LOCAL_IP"}); then
             export NCCL_IB_HCA="${NCCL_IB_HCA:-$_hca}" NCCL_IB_GID_INDEX="$_gid"
             info "EP2 rank $RANK: RoCE $NCCL_IB_HCA gid $NCCL_IB_GID_INDEX"

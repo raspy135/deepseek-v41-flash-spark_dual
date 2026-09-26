@@ -8,7 +8,7 @@ Nothing has ever measured this link above 123 KB, and dual prefill is SLOWER tha
 (226 vs 337 tok/s), so the first question is whether the fabric is the reason.
 
 Reports the bus bandwidth an all-reduce achieves: a ring all-reduce moves ~2*(n-1)/n * size per
-rank, so bus GB/s = 2 * size / elapsed for world=2.
+rank, so bus GB/s = size / elapsed for world=2 (not send+receive combined).
 """
 from __future__ import annotations
 import datetime, os, statistics, time
@@ -38,7 +38,7 @@ def main() -> int:
             samples.append(time.perf_counter() - t0)
         med = statistics.median(samples)
         if RANK == 0:
-            gbs = 2 * (n * 4) / med / 1e9
+            gbs = 2 * (WORLD - 1) / WORLD * (n * 4) / med / 1e9
             unit = f"{med*1e6:.0f} us" if med < 1e-3 else f"{med*1e3:.2f} ms"
             print(f"{mb:>8.3f}MB {unit:>10} {gbs:>10.2f}")
         del x

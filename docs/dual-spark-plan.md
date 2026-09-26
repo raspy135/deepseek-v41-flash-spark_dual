@@ -117,7 +117,8 @@ every token, every layer L:
 ```
 
 Traffic per verify block (6 rows × 5120 × fp32 ≈ 123 KB) × 40 layers ≈ **5 MB/token-block**
-over a 25 GB/s link — latency-bound, not bandwidth-bound. Budget **~2–4 ms per generated
+over a ~24.5 GB/s aggregate link (measured; see gotchas.md — each half is behind PCIe Gen5 x4)
+— latency-bound, not bandwidth-bound. Budget **~2–4 ms per generated
 token** for the ~40 small cross-node collectives (measure in Phase 0; if each round trip is
 >100 µs the estimate needs revisiting).
 
@@ -352,7 +353,7 @@ New `start.sh` profiles (documented in README/env.example):
 ## 6. Phase 5 — Stretch (only after 0–4 land)
 
 1. **Peer-RAM tier:** evicted experts from node A's LRU move into a small region of node
-   B's memory (200GbE ≈ 25 GB/s vs local NVMe ≈ 2.5 GB/s effective at decode read sizes ⇒
+   B's memory (200GbE ≈ 24.5 GB/s measured aggregate, vs local NVMe ≈ 2.5 GB/s effective at decode read sizes ⇒
    a remote-RAM hit is ~10× cheaper than an NVMe miss). A three-tier
    LRU: local arena → peer arena → NVMe. This is the main lever that could push **Mode B
    toward pruned-mode speeds at full quality**.

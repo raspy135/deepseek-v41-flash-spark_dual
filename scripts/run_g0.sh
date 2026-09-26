@@ -56,11 +56,17 @@ ssh_peer() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" "$@"; }
 # looked like they licensed -- is correct on rank 0 and points rank 1 at nothing:
 #   ibv_modify_qp failed with 61 ... local GID index 5, local GID ::, remote GID ::ffff:10.0.0.1
 # So each rank derives its own from sysfs. See scripts/roce_gid.sh.
-read -r HCA0 GID0 < <("$ROOT/scripts/roce_gid.sh" "$MASTER_ADDR") \
-    || { echo "cannot resolve the local RoCE GID for $MASTER_ADDR" >&2; exit 1; }
 PEER_IP="${PEER#*@}"
-read -r HCA1 GID1 < <(ssh_peer "cd '$ROOT' && ./scripts/roce_gid.sh '$PEER_IP'") \
-    || { echo "cannot resolve the peer's RoCE GID for $PEER_IP (is the checkout synced? scripts/sync-peer.sh)" >&2; exit 1; }
+if [[ -n "${NCCL_IB_HCA:-}" && -n "${NCCL_IB_ADDR_RANGE:-}" && -z "${NCCL_IB_GID_INDEX:-}" ]]; then
+  # One global GID index is not valid for a multi-HCA configuration in general. Let NCCL
+  # select the RoCEv2/IPv4 entry per HCA within the direct-link address range instead.
+  HCA0="$NCCL_IB_HCA" HCA1="$NCCL_IB_HCA" GID0=auto GID1=auto
+else
+  read -r HCA0 GID0 < <("$ROOT/scripts/roce_gid.sh" "$MASTER_ADDR") \
+      || { echo "cannot resolve the local RoCE GID for $MASTER_ADDR" >&2; exit 1; }
+  read -r HCA1 GID1 < <(ssh_peer "cd '$ROOT' && ./scripts/roce_gid.sh '$PEER_IP'") \
+      || { echo "cannot resolve the peer's RoCE GID for $PEER_IP (is the checkout synced? scripts/sync-peer.sh)" >&2; exit 1; }
+fi
 
 common_env=(
   WORLD_SIZE=2 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$MASTER_PORT"
@@ -70,8 +76,14 @@ common_env=(
   NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
   TORCH_NCCL_ASYNC_ERROR_HANDLING=1 TORCH_NCCL_BLOCKING_WAIT=1
 )
-rank0_env=(NCCL_IB_HCA="$HCA0" NCCL_IB_GID_INDEX="$GID0")
-rank1_env=(NCCL_IB_HCA="$HCA1" NCCL_IB_GID_INDEX="$GID1")
+for v in NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM \
+         NCCL_IB_MERGE_NICS NCCL_CROSS_NIC; do
+  [[ -n "${!v:-}" ]] && common_env+=("$v=${!v}")
+done
+rank0_env=(NCCL_IB_HCA="$HCA0")
+rank1_env=(NCCL_IB_HCA="$HCA1")
+if [[ "$GID0" != auto ]]; then rank0_env+=(NCCL_IB_GID_INDEX="$GID0"); fi
+if [[ "$GID1" != auto ]]; then rank1_env+=(NCCL_IB_GID_INDEX="$GID1"); fi
 
 cleanup() {
   pkill -9 -f 'python.*gate_g.*nccl' 2>/dev/null || true

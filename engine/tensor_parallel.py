@@ -7,6 +7,7 @@ tests. The vocabulary head gathers disjoint logits, without sums.
 import os
 import torch
 import torch.distributed as dist
+from engine.collective_rails import group as collective_group
 
 
 def shard(weight, dim, rank, world):
@@ -45,7 +46,7 @@ class RowParallelWeight:
             if 0 < rows < R.MM_TILE:
                 flat = torch.cat((flat, flat.new_zeros(R.MM_TILE - rows, flat.size(1))))
             partial = torch.mm(flat, weight.t(), out_dtype=torch.float32)[:rows].contiguous()
-        dist.all_reduce(partial)
+        dist.all_reduce(partial, group=collective_group())
         return partial.to(torch.bfloat16).view(*shape[:-1], self.shape[0])
 
 
@@ -74,12 +75,12 @@ class OutputParallelWeight:
         flat = x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous()
         rows, width = flat.shape
         gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
-        dist.all_gather_into_tensor(gathered, flat)
+        dist.all_gather_into_tensor(gathered, flat, group=collective_group())
         full = gathered.view(self.world, rows, width).transpose(0, 1).reshape(rows, self.world * width)
         local = (fp8_linear(full, self.local, act_qdq=True) if act_qdq
                  else R.mm(full, self.local)).contiguous()
         output = torch.empty((self.world * rows, local.shape[-1]), dtype=local.dtype, device=local.device)
-        dist.all_gather_into_tensor(output, local)
+        dist.all_gather_into_tensor(output, local, group=collective_group())
         return output.view(self.world, rows, local.shape[-1]).transpose(0, 1).reshape(
             *shape[:-1], self.shape[0])
 
@@ -130,7 +131,7 @@ class FeatureParallelEmbedding:
         flat = local.reshape(-1, local.shape[-1])
         rows, width = flat.shape
         gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
-        dist.all_gather_into_tensor(gathered, flat)
+        dist.all_gather_into_tensor(gathered, flat, group=collective_group())
         return gathered.view(self.world, rows, width).transpose(0, 1).reshape(
             *local.shape[:-1], self.shape[1])
 
@@ -146,6 +147,6 @@ class VocabParallelHead:
         flat = local.reshape(-1, local.shape[-1])
         gathered = torch.empty((self.world * flat.shape[0], flat.shape[1]),
                                dtype=flat.dtype, device=flat.device)
-        dist.all_gather_into_tensor(gathered, flat)
+        dist.all_gather_into_tensor(gathered, flat, group=collective_group())
         return gathered.view(self.world, flat.shape[0], flat.shape[1]).transpose(0, 1).reshape(
             *x.shape[:-1], self.shape[0])

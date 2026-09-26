@@ -20,6 +20,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+from engine.collective_rails import forward_phase, prefill_phase
 from safetensors import safe_open
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1187,6 +1188,7 @@ class Model:
         return h, pre_mix, topk, cand, self._rep_end - h.size(0)
 
     @torch.inference_mode()
+    @prefill_phase
     def decoder_replay(self, need_logits: bool = True):
         """Decoder SWA Bounded Replay (tech report 2.2 / 3.2.2).
 
@@ -1226,6 +1228,7 @@ class Model:
         return logits, (torch.cat(main_hiddens, dim=-1) if main_hiddens else None), S
 
     @torch.inference_mode()
+    @forward_phase
     def forward(self, ids: torch.Tensor, S: int, prefill: bool, need_logits: bool = True,
                 encoder_only: bool = False, hashes: torch.Tensor | None = None, get_rows=None,
                 token_types: torch.Tensor | None = None, images=None):

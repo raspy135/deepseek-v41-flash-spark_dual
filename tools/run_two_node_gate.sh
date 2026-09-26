@@ -28,6 +28,11 @@ flags=(--rm --network host --gpus all --device /dev/infiniband --cap-add IPC_LOC
        -e WORLD_SIZE=2 -e MASTER_ADDR=10.0.0.1 -e MASTER_PORT=29629
        -e NCCL_SOCKET_IFNAME=enp1s0f1np1 -e GLOO_SOCKET_IFNAME=enp1s0f1np1 -e NCCL_IB_DISABLE=0
        -e DSV41_DIST_TIMEOUT_S=180 -e "MODEL_DIR=/models/$(basename "$MODEL_DIR")")
+# Forward transport configuration to both ranks as well as engine configuration.
+for key in NCCL_IB_HCA NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM \
+           NCCL_IB_MERGE_NICS NCCL_CROSS_NIC; do
+    [[ -n "${!key:-}" ]] && flags+=(-e "$key=${!key}")
+done
 # grep, not rg: rg is often a shell function or alias that a script does not inherit. When it
 # was missing here, the process substitution failed silently and BOTH ranks ran on code
 # defaults (EP2, DSV41_BLOCK=5, no overlap) while .env said TP2/BLOCK=3 -- the boot guard

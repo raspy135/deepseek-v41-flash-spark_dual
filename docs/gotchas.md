@@ -876,3 +876,94 @@ Two traps from 2026-09-23 ([decode projection fusion](decode-projection-fusion.m
   `R.act_qdq_fp8` is replaced by a bf16 cast. Removing its ~13 kernels saved 15–20 µs per call
   in a microbenchmark and exactly nothing in the engine. Count a cost only on the path serving
   actually takes.
+
+## A 200GbE port is two ~100Gb/s logical rails, and the GID index moves across reboots
+
+Two interconnect facts that both read as fabric faults until they are written down.
+
+**PCIe Gen5 x4 is the ceiling per logical rail, not per 200G port.** `ib_write_bw` between
+the two Sparks measures **111.85 Gb/s on either rail alone** (4 QPs) while `ethtool` reports
+`Speed: 200000Mb/s` and `/sys/class/infiniband/rocep1s0f1/ports/1/rate` reads
+`200 Gb/sec (2X NDR)`, `PORT_ACTIVE`. One QSFP port exposes two netdev/RoCE pairs backed by
+independent PCIe Gen5 x4 links. Both CX7 functions sit at `32.0 GT/s`, width `4`, max width
+`4`; x4 is the wired width of each half. PCIe 5.0 x4 is `32 GT/s x 128/130 / 8` ≈ 15.7 GB/s
+theoretical, consistent with the ~14.0 GB/s observed on one rail.
+
+The rejected conclusion was that the physical port therefore tops out at one rail. Running
+both devices concurrently measured **98.02 + 98.02 = 196.04 Gb/s** (**24.5 GB/s**) aggregate.
+Workload: `ib_write_bw` 6.20, 8 MiB messages, 4 QPs per HCA, local-to-peer writes;
+5 seconds per isolated rail and 10 seconds with both running concurrently.
+More QPs do not help one rail, but assigning IPs to both logical netdevs and using both HCAs
+does. Check the two PCIe paths with:
+
+```bash
+for d in 0000:01:00.0 0000:01:00.1 0002:01:00.0 0002:01:00.1; do p=/sys/bus/pci/devices/$d; \
+  echo "$d $(cat $p/current_link_width)/$(cat $p/max_link_width) @ $(cat $p/current_link_speed)"; done
+```
+
+**GID index 6 on the peer was one boot, not a property.** After rebooting 10.0.0.2, the
+RoCEv2 GID for its CX7 port moved from index 6 to index 5 — now the same as 10.0.0.1. The
+index is just where the kernel packed the IPv4 GID in that boot's GID table, so it is not
+stable across reboots, and the two boxes do not differ by design. Always derive it
+(`scripts/roce_gid.sh`); never pin `NCCL_IB_GID_INDEX` or a perftest `-x` across a reboot.
+A stale index fails as `ibv_modify_qp failed with 61 ... local GID ::`, not as a slow link.
+For dual rail, do not set the scalar `NCCL_IB_GID_INDEX`; constrain NCCL's per-HCA dynamic
+selection with `NCCL_IB_ADDR_RANGE=10.0.0.0/23`, `NCCL_IB_ADDR_FAMILY=AF_INET`, and
+`NCCL_IB_ROCE_VERSION_NUM=2`.
+
+**NCCL result, native torch 2.13 / NCCL 2.29.7, Gate G2:** one HCA delivered 12.68 GB/s bus
+bandwidth at the 42 MB prefill payload (3.31 ms); two HCAs delivered 19.00–20.54 GB/s
+(2.21–2.05 ms), a **1.50–1.62x** gain. The 123 KB decode payload measured 63 us on one rail
+and 62/76 us in two dual-rail runs: no established decode win, because that path is latency-
+bound. Keep the second rail for prefill throughput; do not claim it accelerates decode without
+an end-to-end engine measurement.
+
+**The original G2 bus-bandwidth column was 2x too high.** All-reduce bus bandwidth is
+`2*(world-1)/world * bytes/time`; for world=2 the factor is **1**, not 2. The old code
+counted send+receive as bus bandwidth, reporting 25.36 and 38.00–41.07 GB/s. Its timings
+and speedup ratios remain valid; the column and the numbers above are corrected.
+
+**Prefill-only dual rail (2026-09-25):** `DSV41_PREFILL_DUAL_RAIL=1` with
+`NCCL_IB_MERGE_NICS=0`, the two explicit HCAs, dynamic GIDs, and `NCCL_CROSS_NIC=0`.
+`engine/collective_rails.py` initializes a separate prefill group, exports NCCL's discovered
+graph, filters its channels to the first rail for the default/decode group, and warms both
+before arena allocation. This is guarded for NCCL 2.29 and one visible GPU per node. It
+rejects unsupported graphs or conflicting graph/network overrides. Do not substitute
+environment changes between calls: NCCL's HCA list and NETDEVS_POLICY are process-cached.
+The first attempted one-channel shortcut did select one rail, but small-message latency
+was poor (~427 us in that probe); it was rejected. Keep multiple channels on the decode rail.
+
+TP routing covers dense/attention gathers, expert gather/reduce/scatter, embeddings, head,
+and Engram row-split reductions. Explicit prefill scopes restore on return/exception; decode
+and draft graphs capture only the default group. The setting is checked via Gloo BEFORE
+optional group creation on both ranks and again in V41Engine's boot-time config guard.
+
+`tools/bench_collective_rails.py` passed actual TP embedding, all-reduce, all-gather,
+reduce-scatter, and CUDA graph replay with changed inputs after prefill. Per-HCA counters
+confirmed decode RX writes `[1600, 0]` and large prefill `[6400, 6400]` on both nodes.
+For 100 timed 42 MB all-reduces, rank 0 measured **3.34 / 3.15 ms single rail** around the
+**2.19 ms dual-rail** run (12.56–13.32 vs 19.20 GB/s); 123 KB decode measured 54 / 68 us.
+The counter gate needs a barrier after BOTH ranks read counters, otherwise the faster
+rank's next prefill warmup can contaminate its peer's decode sample.
+Raw local measurement logs are in `results/collective-rails-20260925/`.
+
+**Full TP engine check:** `tools/bench_prefill_rails_tp.py` alternated single / dual /
+dual / single prefill on one engine load, with decode always on the default single-rail
+group. Experts, dense layers, attention, embeddings, head, and draft all used the serving
+TP configuration; prefix reuse and ranking adaptation were disabled. The 2,191-token
+Python-function prompt generated 64 greedy tokens with speculative CUDA-graph decode.
+All four runs on both ranks had bit-identical final prefill logits and generated tokens.
+After the first run of each path warmed up, dual prefill took **2.212 s (990.46 tok/s)**
+versus single **2.636 s (831.04 tok/s)**: **16.1% less prefill time** on this one prompt,
+not a broad throughput claim. Decode measured **31.90 vs 32.27 tok/s**, respectively;
+no decode speedup is claimed. The initial single/dual warmup prefills were 4.750/3.840 s
+and are not used for the comparison. Logs and per-rank JSON are under
+`results/prefill-rails-tp-20260925-v2/` on the respective nodes. Reproduce with an
+identical image on both nodes and serving stopped (create
+`results/prefill-rails-tp-check/` in both checkouts first):
+
+```bash
+GATE_IMAGE=<immutable-image-id> GATE_LOG_DIR=results/prefill-rails-tp-check \
+  bash tools/run_two_node_gate.sh bench_prefill_rails_tp.py \
+  --out /app/results/prefill-rails-tp-check
+```

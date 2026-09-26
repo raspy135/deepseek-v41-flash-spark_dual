@@ -26,6 +26,7 @@ import datetime
 import os
 
 import torch
+from engine import collective_rails
 
 try:
     import torch.distributed as dist
@@ -77,6 +78,7 @@ class EPDistributed:
         self.control_value = 0   # rank 0's per-step values from the last control() broadcast
         self.control_flag = 0
         self.tensor_parallel = os.environ.get('DSV41_TP_EXPERTS', '0') == '1'
+        self.prefill_dual_rail = os.environ.get('DSV41_PREFILL_DUAL_RAIL', '0') == '1'
         if self.tensor_parallel and self.world != 2:
             raise ValueError('DSV41_TP_EXPERTS requires two ranks')
         if self.active and not _HAVE_DIST:
@@ -93,7 +95,11 @@ class EPDistributed:
         The mixed backend gives us NCCL for the CUDA all-reduce and Gloo for object
         broadcast (request metadata from rank 0 to rank 1) without a second network stack.
         """
-        if not self.active or dist.is_initialized():
+        if not self.active:
+            return
+        if dist.is_initialized():
+            if self.prefill_dual_rail and collective_rails._prefill_group is None:
+                raise RuntimeError('prefill dual rail must initialize before any external CUDA process group')
             return
         _apply_default_net_env()
         dev = torch.device(device)
@@ -109,9 +115,12 @@ class EPDistributed:
             world_size=self.world,
             timeout=datetime.timedelta(seconds=timeout_s),
         )
+        collective_rails.initialize(self.prefill_dual_rail, dev,
+                                   datetime.timedelta(seconds=timeout_s))
 
     def destroy(self):
         if self.active and _HAVE_DIST and dist.is_initialized():
+            collective_rails.destroy()
             dist.destroy_process_group()
 
     # ------------------------------------------------------------- ownership
@@ -139,7 +148,7 @@ class EPDistributed:
         if not partial.is_cuda:
             # Should not happen on the serving path; keep the assert loud in debug.
             pass
-        dist.all_reduce(partial, op=dist.ReduceOp.SUM)
+        dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=collective_rails.group())
         return partial
 
     def combine_async(self, partial: torch.Tensor, stream: torch.cuda.Stream):
@@ -158,7 +167,8 @@ class EPDistributed:
         current = torch.cuda.current_stream(partial.device)
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
-            return dist.all_reduce(partial, op=dist.ReduceOp.SUM, async_op=True)
+            return dist.all_reduce(partial, op=dist.ReduceOp.SUM, async_op=True,
+                                   group=collective_rails.group())
 
     @staticmethod
     def finish_combine(work):
