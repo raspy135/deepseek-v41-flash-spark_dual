@@ -66,6 +66,16 @@ SHARED_OVERLAP = os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1"
 # bit-identical; the stacked weight replaces the originals' storage (they become views), so no
 # memory is added. Read at call time so the A/B bench can toggle it; the boot guard pins it.
 MERGED_PROJ = os.environ.get("DSV41_DECODE_MERGED_PROJ", "1") == "1"
+# Fewer launches for the same bits (engine/decode_lean.py, docs/decode-launches.md): rmsnorm and
+# the HC coefficients keep their row-padded torch reductions but get static padding buffers and one
+# fused elementwise tail, and the layer writes straight into its static buffers instead of copying
+# fresh results into them. DSV41_DECODE_LEAN=0 restores the previous spelling; the boot guard pins it.
+LEAN = os.environ.get("DSV41_DECODE_LEAN", "1") == "1"
+# Within LEAN: RoPE as one kernel. It must reproduce nvcc's FMA contraction of torch's complex
+# multiply (decode_lean.ROPE_RE/IM), which tools/test_decode_lean.py searches for.
+LEAN_ROPE = os.environ.get("DSV41_DECODE_LEAN_ROPE", "1") == "1"
+# Within LEAN: the torch decode attention's softmax elementwise ops as two kernels around torch's sum.
+LEAN_SOFTMAX = os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1"
 
 
 def merge_decode_projections(weights) -> int:
@@ -179,6 +189,10 @@ class FastDecoder:
         # Before any capture: graphs bake in weight addresses.
         self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
                             if MERGED_PROJ else 0)
+        self.lean = None
+        if LEAN and _HC_OPS and M.HC_FUSED:
+            from engine.decode_lean import LeanOps
+            self.lean = LeanOps(model.dev, R.MM_TILE, R.HC_MM_TILE)
         a = self.a
         dev = self.dev
         self.pend_buf = {L: torch.zeros(2, a.head_dim, dtype=torch.float32, device=dev)
@@ -211,6 +225,9 @@ class FastDecoder:
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
         self._index_cpos = torch.arange(self._n_cache(1), device=dev)
         self.graphs = {}
+        # graph key -> the per-step memo its capture filled (_step_memo); kept alive with the graphs
+        self._memos = {}
+        self._memo = None
         self.draft_graphs = None
         self.pool = None
         # resident mode: (layer, expert) -> arena slot as a device table, so the router's expert ids can be
@@ -296,39 +313,103 @@ class FastDecoder:
 
     def _rope(self, x, fq, inverse=False):
         rd = self.a.rope_head_dim
+        if (self.lean is not None and LEAN_ROPE and x.dtype == torch.bfloat16 and fq.dtype == torch.complex64
+                and x.dim() in (2, 3) and fq.dim() == 2 and fq.shape[0] == x.shape[0]):
+            return self.lean.rope(x, fq, rd, inverse)
         return torch.cat([x[..., :-rd], R.apply_rotary(x[..., -rd:], fq, inverse=inverse)], dim=-1)
 
-    def _hc_mixes(self, x, hc_fn, hc_scale, hc_base):
+    def _hc_mixes(self, x, hc_fn, hc_scale, hc_base, out=None):
         # This projection is numerically load-bearing: an M=6 cuBLAS call does not reduce K in
         # the same order as Model._hc_mixes' fixed padded call. The resulting ~1e-4 change in
         # the 24 HC coefficients is first visible in the post-attention residual and grows until
         # router top-k choices differ.  Calling the model implementation also keeps the RMS
         # reduction and Sinkhorn path identical instead of maintaining a second approximation.
-        return self.m._hc_mixes(x, hc_fn, hc_scale, hc_base)
+        # The lean spelling runs that same padded GEMM and padded reduction (engine/decode_lean.py).
+        # `out=(pre, post, comb)`: write the coefficients into these buffers.
+        if self.lean is not None and self.lean.usable_hc(x, hc_fn):
+            a = self.a
+            return self.lean.hc_mixes(x, hc_fn, hc_scale, hc_base, a.norm_eps, a.hc_mult,
+                                      a.hc_sinkhorn_iters, a.hc_eps, out=out)
+        res = self.m._hc_mixes(x, hc_fn, hc_scale, hc_base)
+        if out is None:
+            return res
+        for dst, src in zip(out, res):
+            dst.copy_(src)
+        return out
+
+    def _rmsnorm(self, x, w, eps):
+        if self.lean is not None and self.lean.usable_rms(x):
+            return self.lean.rmsnorm(x, w, eps)
+        return R.rmsnorm(x, w, eps)
+
+    def _norm_w(self, w):
+        """The fp32 copy of a norm weight for the fused HC kernels, which would otherwise convert
+        the bf16 weight on every call (`w.contiguous().float()` inside hc_ops)."""
+        return self.lean._wf32(w) if self.lean is not None else w
+
+    def _step_memo(self, key, fn):
+        """Per-step values that depend only on the step's positions (and the indexer's topk), made
+        once per verify graph instead of once per layer. `self._memo` is a dict owned by the graph
+        key being captured and kept for as long as its graphs live: later segments' graphs read the
+        tensors the first segment's capture allocated. None (lanes, eager steps) = no memo."""
+        memo = getattr(self, "_memo", None)
+        if memo is None:
+            return fn()
+        v = memo.get(key)
+        if v is None:
+            v = memo[key] = fn()
+        return v
+
+    def _hc_pre_rn(self, h, pre_mix, w, out=None):
+        if self.lean is not None:
+            if out is None:
+                out = torch.empty(h.size(0), h.size(2), dtype=torch.bfloat16, device=h.device)
+            return _hc_pre_rn_fused(h, pre_mix, self._norm_w(w), self.a.norm_eps, out=out)
+        y = _hc_pre_rn_fused(h, pre_mix, w, self.a.norm_eps)
+        if out is not None:
+            out.copy_(y)
+            return out
+        return y
 
     def _shared_ffn(self, y, w):
-        return R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, self.a.swiglu_limit,
-                            w13=getattr(w, "_sh_w13", None) if MERGED_PROJ else None)
+        w13 = getattr(w, "_sh_w13", None) if MERGED_PROJ else None
+        if self.lean is not None and w13 is not None and y.dtype == torch.bfloat16:
+            # v41_ref.expert_ffn with its elementwise middle as one kernel (engine/decode_lean.py)
+            h = self.lean.swiglu(R.qlinear(y, w13), w.sh_w1.N, self.a.swiglu_limit)
+            return R.qlinear(h, w.sh_w2)
+        return R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, self.a.swiglu_limit, w13=w13)
 
     # ------------------------------------------------------------------ attention (decode, T tokens)
     def _attention(self, x, w, L, ring, freqs, pos, sh_state, mtp_last=None):
         a = self.a
         T = x.size(0)
-        fq = freqs[pos]
+        lean_step = self.lean is not None and mtp_last is None
+        fq = (self._step_memo(("fq", freqs.data_ptr()), lambda: freqs[pos]) if lean_step
+              else freqs[pos])
         both = getattr(w, "_wqkv_a", None) if MERGED_PROJ else None
         if both is not None:
             qkv = R.qlinear(x, both)
             # contiguous: the norms' reductions then see exactly the tensors the split path makes
-            q_lin, kv_lin = qkv[:, :w.wq_a.N].contiguous(), qkv[:, w.wq_a.N:].contiguous()
+            q_lin, kv_lin = qkv[:, :w.wq_a.N], qkv[:, w.wq_a.N:]
+            if self.lean is None or not self.lean.usable_rms(q_lin):
+                q_lin, kv_lin = q_lin.contiguous(), kv_lin.contiguous()
         else:
             q_lin, kv_lin = R.qlinear(x, w.wq_a), R.qlinear(x, w.wkv)
-        qr = R.rmsnorm(q_lin, w.q_norm, a.norm_eps)
+        qr = self._rmsnorm(q_lin, w.q_norm, a.norm_eps)
         q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
-        kv = self._rope(R.rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
+        kv = self._rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
         # torch fallback materialises kv_all. The draft's window is a stride-0 broadcast view.
-        if mtp_last is None:
+        if mtp_last is None and lean_step:
+            slot_w, slot_r, wmask = self._step_memo("win", lambda: self._window(pos))
+            ring[slot_w] = kv
+            kv1 = ring[slot_r]
+            kv2 = None
+            mask = wmask
+            if w.ratio:
+                kv2, mask = self._compressed(x, qr, w, L, pos, sh_state, wmask=wmask)
+        elif mtp_last is None:
             wpos = pos[:, None] - self.win_off[None, :]
             ring[pos % M.RING] = kv
             kv1 = ring[wpos.clamp_min(0) % M.RING]
@@ -347,19 +428,47 @@ class FastDecoder:
         if FUSED_ATTN:
             o = decode_attention(q, kv1, kv2, mask, w.attn_sink, scale)
         else:
-            kv_all = kv1 if kv2 is None else torch.cat([kv1, kv2], dim=1)
-            scores = torch.einsum("thd,tnd->thn", q.float(), kv_all.float()) * scale
-            scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
-            mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
-            p = torch.exp(scores - mx)
-            denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
-            o = torch.einsum("thn,tnd->thd", p / denom, kv_all.float()).to(torch.bfloat16)
+            if self.lean is not None:
+                # the fp32 keys once, written piecewise: the same tensor kv_all.float() makes, which
+                # the torch spelling below builds twice (one per einsum) after a bf16 cat
+                n1 = kv1.shape[1]
+                kvf = torch.empty(T, n1 + (0 if kv2 is None else kv2.shape[1]), kv1.shape[2],
+                                  dtype=torch.float32, device=kv1.device)
+                kvf[:, :n1].copy_(kv1)
+                if kv2 is not None:
+                    kvf[:, n1:].copy_(kv2)
+                kvs = (kvf, kvf)
+            else:
+                kv_all = kv1 if kv2 is None else torch.cat([kv1, kv2], dim=1)
+                kvs = (kv_all.float(), None)
+            if self.lean is not None and LEAN_SOFTMAX:
+                probs = self.lean.attn_probs(torch.einsum("thd,tnd->thn", q.float(), kvs[0]),
+                                             mask, w.attn_sink, scale)
+            else:
+                scores = torch.einsum("thd,tnd->thn", q.float(), kvs[0]) * scale
+                scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
+                mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
+                p = torch.exp(scores - mx)
+                denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
+                probs = p / denom
+            o = torch.einsum("thn,tnd->thd", probs,
+                             kvs[1] if kvs[1] is not None else kv_all.float()).to(torch.bfloat16)
         o = self._rope(o, fq, inverse=True).reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
 
-    def _compressed(self, x, qr, w, L, pos, st):
-        """st: dict with 'parity' (python int, S % 2, fixed per graph), 'ckv', 'ik', 'ratio'."""
+    def _window(self, pos):
+        """(ring slot of each query, ring slots of its window, window mask) -- the same for every
+        backbone layer of a step."""
+        wpos = pos[:, None] - self.win_off[None, :]
+        return pos % M.RING, wpos.clamp_min(0) % M.RING, wpos >= 0
+
+    def _compressed(self, x, qr, w, L, pos, st, wmask=None):
+        """st: dict with 'parity' (python int, S % 2, fixed per graph), 'ckv', 'ik', 'ratio'.
+
+        Returns (rows, cmask), or with `wmask` (the lean step) (rows, cat([wmask, cmask])): the
+        concatenated mask and the clamped indices only change when an indexer layer rewrites
+        self.topk, so they are made once per such layer and reused by the layers after it."""
         a = self.a
         r = w.ratio
         c = self.c
@@ -377,17 +486,17 @@ class FastDecoder:
                 else:  # S even: (t0,t1),(t2,t3),..., no pending
                     g_kv = kvl.unflatten(0, (-1, r)); g_sc = sc.unflatten(0, (-1, r))
                 latent = (g_kv * g_sc.softmax(dim=1)).sum(dim=1)
-                latent = R.rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
+                latent = self._rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
                 j0 = (pos[0] - st["parity"]) // r
             else:
-                latent = R.rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
+                latent = self._rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
                 j0 = pos[0]
             nj = latent.size(0)
             jidx = j0 + self._ar_t[:nj]
             fj = self.m.freqs_c[jidx * r]
             if L in self.W.indexers:
                 iw = self.W.indexers[L]
-                k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
+                k = self._rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
                 c.ik[L][jidx] = self._rope(k, fj)
             ckv = self._rope(latent, fj)
             if M.PACKED_KV:
@@ -398,11 +507,20 @@ class FastDecoder:
                     ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
                 c.ckv[L][jidx] = ckv
             st["ckv"], st["ik"], st["ratio"] = c.ckv[L], c.ik[L], r
+        from engine.packed_kv import gather
+        if wmask is not None:
+            if L in self.W.indexers:
+                compress_lens = self._step_memo(("clen", r), lambda: (pos + 1) // r)
+                self.topk.copy_(self._indexer(x, qr, L, pos, compress_lens, st))
+                if getattr(self, "_memo", None) is not None:
+                    self._memo.pop("topk", None)
+            idx_c, mask = self._step_memo("topk", lambda: (
+                self.topk.clamp_min(0), torch.cat([wmask, self.topk >= 0], dim=1)))
+            return gather(st["ckv"], idx_c), mask
         compress_lens = (pos + 1) // r
         if L in self.W.indexers:
             self.topk.copy_(self._indexer(x, qr, L, pos, compress_lens, st))
         idx = self.topk
-        from engine.packed_kv import gather
         rows = gather(st["ckv"], idx.clamp_min(0))
         return rows, idx >= 0
 
@@ -410,7 +528,8 @@ class FastDecoder:
         a = self.a
         iw = self.W.indexers[L]
         T = x.size(0)
-        q = self._rope(R.qlinear(qr, iw.wq_b).view(T, a.index_n_heads, a.index_head_dim), self.m.freqs_c[pos])
+        fq = self._step_memo(("fq", self.m.freqs_c.data_ptr()), lambda: self.m.freqs_c[pos])
+        q = self._rope(R.qlinear(qr, iw.wq_b).view(T, a.index_n_heads, a.index_head_dim), fq)
         wts = R.mm(x, iw.weights_proj).float() * (a.index_head_dim ** -0.5 * a.index_n_heads ** -0.5)
         # CUDA graphs require a fixed N, but scoring all max_seq rows makes every request pay for
         # the configured context capacity.  ``index_bucket`` is fixed for one graph variant and
@@ -456,37 +575,55 @@ class FastDecoder:
         # Same fused stream ops the prefill path uses (engine/hc_ops.py). At T=6 the tensors are
         # small, so the win here is launch count rather than bandwidth: these replace ~10 tiny
         # elementwise kernels per site with one, and a graphed step issues ~1,015 such launches.
-        y = (_hc_pre_rn_fused(h, self.pre_mix, w.attn_norm, a.norm_eps) if _HC_OPS
+        y = (self._hc_pre_rn(h, self.pre_mix, w.attn_norm) if _HC_OPS
              else R.rmsnorm(R.hc_pre(h, self.pre_mix), w.attn_norm, a.norm_eps))
         self._tap('attn_x', L, y)
         y = self._attention(y, w, L, self.c.win[L], self.m.freqs_c if w.ratio else self.m.freqs_w, self.pos, sh_state)
         self._tap('attn_out', L, y)
-        h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
-             else R.hc_post(y, residual, attn_post, attn_comb))
-        self.h.copy_(h)
-        ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-        self.ffn_pre.copy_(ffn_pre); self.ffn_post.copy_(ffn_post); self.ffn_comb.copy_(ffn_comb)
-        y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if _HC_OPS
-             else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
-        self.y.copy_(y)
+        if self.lean is not None:
+            # written in place: hc_post reads a tile's residual streams before it stores the tile
+            h = _hc_post_fused(y, residual, attn_post, attn_comb, out=self.h)
+        else:
+            h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
+                 else R.hc_post(y, residual, attn_post, attn_comb))
+            self.h.copy_(h)
+        self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base,
+                       out=(self.ffn_pre, self.ffn_post, self.ffn_comb))
+        if _HC_OPS:
+            y = self._hc_pre_rn(h, attn_pre, w.ffn_norm, out=self.y)
+        else:
+            y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
+            self.y.copy_(y)
         # fp32, exactly as Model.moe does it. The gate picks 6 of 384 experts and its scores are
         # full of near-ties, so a bf16 GEMM here (which this path used until 2026-09-11) changes
         # 11 % of the picks at layer 0 -- where the inputs are bit-identical -- and up to 31 %
         # deeper in, which is what made the graphed path disagree with the reference at all.
-        scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
-        logits = scores + w.gate_bias
         pm = getattr(self.m, "prune_mask", None)
-        if pm is not None and L in pm:
-            # same accounting as Model.moe: what the router wanted before pruning masked it.
-            # Fixed-shape throughout, and the accumulators are allocated before capture, so this
-            # records correctly from inside the graph.
-            if M.PRUNE_MISS:
-                self.m._record_prune_miss(logits, scores, pm[L], L, a.n_activated_experts, decode=True)
-            logits = logits.masked_fill(~pm[L], float("-inf"))
-        idx = logits.topk(a.n_activated_experts, dim=-1)[1]
-        wts = scores.gather(1, idx)
-        wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
-        self.route_idx.copy_(idx); self.route_w.copy_(wts)
+        keep = pm[L] if pm is not None and L in pm else None
+        if self.lean is not None and self.lean.usable_router(y, w.gate_w):
+            # the same router with its elementwise work fused (engine/decode_lean.py); the gate
+            # GEMM, topk and the k-way sum stay torch ops on the same shapes
+            record = None
+            if keep is not None and M.PRUNE_MISS:
+                def record(lg, sc, _keep=keep, _L=L):
+                    self.m._record_prune_miss(lg, sc, _keep, _L, a.n_activated_experts, decode=True)
+            self.lean.router(y, w.gate_w, w.gate_bias, keep, a.n_activated_experts, a.route_scale,
+                             self.route_idx, self.route_w, record=record)
+            idx = self.route_idx
+        else:
+            scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
+            logits = scores + w.gate_bias
+            if keep is not None:
+                # same accounting as Model.moe: what the router wanted before pruning masked it.
+                # Fixed-shape throughout, and the accumulators are allocated before capture, so this
+                # records correctly from inside the graph.
+                if M.PRUNE_MISS:
+                    self.m._record_prune_miss(logits, scores, keep, L, a.n_activated_experts, decode=True)
+                logits = logits.masked_fill(~keep, float("-inf"))
+            idx = logits.topk(a.n_activated_experts, dim=-1)[1]
+            wts = scores.gather(1, idx)
+            wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+            self.route_idx.copy_(idx); self.route_w.copy_(wts)
         if self.rs_uniq is not None:
             # one-hot the block's k*T expert ids into a [n_routed_experts] table and count the rows
             # that were hit; `index_fill_` writes 1 however many tokens name the same expert.
@@ -524,9 +661,12 @@ class FastDecoder:
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
+        lean = self.lean is not None
         if self.shared_stream is None:
             out = self._routed_experts()
-            _sh = self._shared_ffn(self.y, w).float()
+            _sh = self._shared_ffn(self.y, w)
+            if not lean:
+                _sh = _sh.float()
         else:
             # Both branches read y; neither consumes the other's result. Fork AFTER
             # y is ready and rejoin BEFORE residual update/next layer overwrites it.
@@ -534,7 +674,9 @@ class FastDecoder:
             main = torch.cuda.current_stream(self.dev)
             self.shared_stream.wait_stream(main)
             with torch.cuda.stream(self.shared_stream):
-                _sh = self._shared_ffn(self.y, w).float()
+                _sh = self._shared_ffn(self.y, w)
+                if not lean:
+                    _sh = _sh.float()
             try:
                 out = self._routed_experts()
             finally:
@@ -543,21 +685,29 @@ class FastDecoder:
             # allocator from recycling its storage before the addition completes.
             _sh.record_stream(main)
         # shared expert is replicated and added AFTER the combine, so it is counted once
-        out += _sh
-        h = (_hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb) if _HC_OPS
-             else R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb))
-        self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)
+        if lean and out.dtype == torch.float32 and _sh.shape == out.shape:
+            # hc_post forms (out + _sh.float()).to(bf16) itself, and writes self.h in place
+            _hc_post_fused(out, self.h, self.ffn_post, self.ffn_comb, out=self.h, x2=_sh.contiguous())
+        elif lean:
+            out += _sh.float()
+            _hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb, out=self.h)
+        else:
+            out += _sh
+            h = (_hc_post_fused(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb) if _HC_OPS
+                 else R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb))
+            self.h.copy_(h)
+        self.pre_mix.copy_(self.ffn_pre)
 
     def _final(self):
         a = self.a
-        x = R.rmsnorm(R.hc_pre(self.h, self.pre_mix), self.W.norm, a.norm_eps)
+        x = self._rmsnorm(R.hc_pre(self.h, self.pre_mix), self.W.norm, a.norm_eps)
         self.logits.copy_(R.head_logits(x, self.head))
         # seed the drafter rings for all 6 positions (harmless beyond the accepted ones)
         m0 = self.W.mtp[0]
-        main_x = R.rmsnorm(R.qlinear(self.main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
+        main_x = self._rmsnorm(R.qlinear(self.main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
         fq = self.m.freqs_w[self.pos]
         for k, w in enumerate(self.W.mtp):
-            kv = self._rope(R.rmsnorm(R.qlinear(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
+            kv = self._rope(self._rmsnorm(R.qlinear(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
             self.c.mtp_win[k][self.pos % M.RING] = kv
 
     def _draft(self, greedy: bool):
@@ -572,14 +722,14 @@ class FastDecoder:
         for k, w in enumerate(self.W.mtp):
             residual = h
             attn_pre, attn_post, attn_comb = self._hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
-            y = (_hc_pre_rn_fused(h, pre_mix, w.attn_norm, a.norm_eps) if _HC_OPS
+            y = (self._hc_pre_rn(h, pre_mix, w.attn_norm) if _HC_OPS
                  else R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps))
             y = self._attention(y, w, 40 + k, self.c.mtp_win[k], self.m.freqs_w, pos, None, mtp_last=self.d_last[0])
             h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
              else R.hc_post(y, residual, attn_post, attn_comb))
             residual = h
             ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-            y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if _HC_OPS
+            y = (self._hc_pre_rn(h, attn_pre, w.ffn_norm) if _HC_OPS
                  else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
             scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
             idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
@@ -588,12 +738,16 @@ class FastDecoder:
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
             # TP draft arenas gather complete outputs inside moe_fn. Shared experts remain
             # replicated: another collective here would double their contribution.
-            out += self._shared_ffn(y, w).float()
-            h = (_hc_post_fused(out.to(torch.bfloat16), residual, ffn_post, ffn_comb) if _HC_OPS
-                 else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))
+            sh = self._shared_ffn(y, w)
+            if self.lean is not None and sh.shape == out.shape:
+                h = _hc_post_fused(out, residual, ffn_post, ffn_comb, x2=sh.contiguous())
+            else:
+                out += sh.float()
+                h = (_hc_post_fused(out.to(torch.bfloat16), residual, ffn_post, ffn_comb) if _HC_OPS
+                     else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))
             pre_mix = ffn_pre
         w = self.W.mtp[2]
-        x = R.rmsnorm(R.hc_pre(h, pre_mix), w.norm, a.norm_eps)
+        x = self._rmsnorm(R.hc_pre(h, pre_mix), w.norm, a.norm_eps)
         logits = R.head_logits(x, self.head)  # [T_DRAFT, V]
         prev = self.d_tok[0]
         for i in range(T_DRAFT):
@@ -670,7 +824,11 @@ class FastDecoder:
 
     def _layer_ab(self, L, sh_state):
         self._layer_a(L, sh_state)
-        self.slots.copy_(self.lut[L][self.route_idx])  # -1 never occurs while the LUT is valid
+        # -1 never occurs while the LUT is valid
+        if self.lean is not None:
+            torch.index_select(self.lut[L], 0, self.route_idx.view(-1), out=self.slots.view(-1))
+        else:
+            self.slots.copy_(self.lut[L][self.route_idx])
         self._layer_b(L)
 
     # ------------------------------------------------------------------ gpu timing
@@ -745,20 +903,29 @@ class FastDecoder:
             self.pool = torch.cuda.graph_pool_handle()
         st = {"parity": S_parity, "index_bucket": index_bucket,
               "ckv": None, "ik": None, "ratio": 0}
-        gA, gB = [], []
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             # warm-up run (allocations, triton compiles) on a scratch copy of the state
             saved = [self.h.clone(), self.pre_mix.clone()]
+            self._memo = {} if self.lean is not None else None
             for L in range(self.a.n_layers):
                 self._layer_a(L, st); self._layer_b(L)
+            self._memo = None
             self._final(); self._draft(True); self._draft(False)
             self.h.copy_(saved[0]); self.pre_mix.copy_(saved[1])
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         st = {"parity": S_parity, "index_bucket": index_bucket,
               "ckv": None, "ik": None, "ratio": 0}
+        if self.lean is not None:
+            self._memo = self._memos[key] = {}
+        try:
+            self._capture_layers(key, st)
+        finally:
+            self._memo = None
+
+    def _capture_layers(self, key, st):
         if self.lut is not None and GRAPH_SEGMENTS:
             # Resident mode: routing is a device LUT lookup, so the ONLY host dependency inside a
             # step is the Engram rows of layers 1 and 14. Capture the layers between those
@@ -780,6 +947,7 @@ class FastDecoder:
             self.graphs[key] = (None, None, None, gD, segs)
             torch.cuda.synchronize()
             return
+        gA, gB = [], []
         for L in range(self.a.n_layers):
             if self.lut is not None:
                 g = torch.cuda.CUDAGraph()

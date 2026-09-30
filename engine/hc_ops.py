@@ -35,11 +35,16 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 
 @triton.jit
-def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constexpr):
+def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constexpr,
+                    X2=None, ADD2: tl.constexpr = False):
     t = tl.program_id(0)
     db = tl.program_id(1) * BD + tl.arange(0, BD)
     m = db < D
     x = tl.load(X + t * D + db, mask=m, other=0.0).to(tl.float32)          # [BD]
+    if ADD2:
+        # the decode layer's `(routed_fp32 + shared_bf16.float()).to(bf16)`, then as above
+        x2 = tl.load(X2 + t * D + db, mask=m, other=0.0).to(tl.float32)
+        x = (x + x2).to(tl.bfloat16).to(tl.float32)
     j = tl.arange(0, HC)
     post = tl.load(POST + t * HC + j).to(tl.float32)                        # [HC]
     # y[j] = post[j]*x + sum_i comb[i,j]*res[i]
@@ -56,11 +61,24 @@ def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constex
              mask=m[None, :])
 
 
-def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-    """x [T, D] -> out [T, HC, D]; residual [T, HC, D], post [T, HC], comb [T, HC, HC]."""
+def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+            out: torch.Tensor | None = None, x2: torch.Tensor | None = None):
+    """x [T, D] -> out [T, HC, D]; residual [T, HC, D], post [T, HC], comb [T, HC, HC].
+
+    `out` may be `residual` itself: a program reads every residual stream of its (token, d-block)
+    tile before it writes that same tile, and touches no other tile.
+    `x2`: with an fp32 `x`, the sublayer output is `(x + x2.float()).to(bf16)`, formed in-kernel."""
     T, HC, D = residual.shape
-    out = torch.empty(T, HC, D, dtype=torch.bfloat16, device=x.device)
+    if out is None:
+        out = torch.empty(T, HC, D, dtype=torch.bfloat16, device=x.device)
+    assert out.shape == (T, HC, D) and out.dtype == torch.bfloat16 and out.is_contiguous()
     BD = 1024
+    if x2 is not None:
+        assert x.dtype == torch.float32 and x2.shape == x.shape and x2.is_contiguous()
+        _hc_post_kernel[(T, triton.cdiv(D, BD))](
+            x.contiguous(), residual.contiguous(), post.contiguous().float(), comb.contiguous().float(),
+            out, D, HC=HC, BD=BD, X2=x2, ADD2=True, num_warps=4)
+        return out
     _hc_post_kernel[(T, triton.cdiv(D, BD))](
         x.contiguous(), residual.contiguous(), post.contiguous().float(), comb.contiguous().float(),
         out, D, HC=HC, BD=BD, num_warps=4)
@@ -97,16 +115,22 @@ def _hc_pre_norm_kernel(X, PRE, W, SCRATCH, OUT, D, EPS, HC: tl.constexpr, BD: t
 
 
 def hc_pre_rmsnorm(x: torch.Tensor, pre_mix: torch.Tensor, w: torch.Tensor, eps: float,
-                   *, direct_store: bool | None = None):
-    """hc_pre(x, pre_mix) followed by rmsnorm(., w, eps). x [T, HC, D] -> [T, D] bf16."""
+                   *, direct_store: bool | None = None, out: torch.Tensor | None = None):
+    """hc_pre(x, pre_mix) followed by rmsnorm(., w, eps). x [T, HC, D] -> [T, D] bf16.
+
+    `out` (a contiguous bf16 [T, D]) implies the direct store and is written in place."""
     T, HC, D = x.shape
     scratch = torch.empty(T, D, dtype=torch.float32, device=x.device)
     # Avoid the final FP32 write/read/cast on prefill-sized calls. The FP32 scratch,
     # BF16 hc_pre boundary, and reduction order are unchanged. Measured bit-identical
     # to the old path; small decode batches retain their original allocation/launch path.
+    if out is not None:
+        assert out.shape == (T, D) and out.dtype == torch.bfloat16 and out.is_contiguous()
+        direct_store = True
     if direct_store is None:
         direct_store = T >= 512
-    out = torch.empty(T, D, dtype=torch.bfloat16, device=x.device) if direct_store else scratch
+    if out is None:
+        out = torch.empty(T, D, dtype=torch.bfloat16, device=x.device) if direct_store else scratch
     BD = 1024
     _hc_pre_norm_kernel[(T,)](x.contiguous(), pre_mix.contiguous().float(), w.contiguous().float(),
                               scratch, out, D, eps, HC=HC, BD=BD, num_warps=8)
