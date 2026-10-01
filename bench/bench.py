@@ -294,7 +294,10 @@ def main():
     if served != a.model:
         print(f"note: server serves '{served}', using that")
         a.model = served
-    health = get_json(a.base, "/health", a.api_key)
+    try:
+        health = get_json(a.base, "/health", a.api_key)
+    except Exception:  # a plain OpenAI-compatible server (vLLM) has no /health JSON body
+        health = {}
 
     print(f"== {a.label}: workload={a.workload} isl={a.isl if a.workload == 'random' else 'n/a'} "
           f"osl={a.osl} runs={a.runs} warmup={a.warmup} thinking={a.thinking} engine={health.get('engine')}")
