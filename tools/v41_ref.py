@@ -472,6 +472,16 @@ if HC_MM_TILE not in (16, 32):
 # The quantization happens once, on the GPU, as the weight is loaded. DSV41_HEAD_FP32=1 (the
 # reference's fp32 head) stays available and is checked first; the two cannot be combined.
 _HEAD_FMTS = ("bf16", "fp8", "fp4")
+# DSV41_DRAFT_HEAD_FMT: a second, cheaper copy of head.weight that ONLY the DSpark drafter reads
+# (`off` disables; `fp8` is the default). The verifier keeps the main head, so greedy output is
+# unchanged -- verification still accepts the target's argmax -- but the draft distribution moves,
+# and with it the accepted length, so a pair being measured should compare accept_len_mean and
+# tok/s, not just ms/step. Only built from a plain bf16/fp32 head and only when the requested
+# format is strictly smaller than the verifier's; see make_draft_head.
+_DRAFT_HEAD_FMTS = ("off",) + _HEAD_FMTS
+# stored bytes per weight, so a draft format is only built when it is actually cheaper
+_HEAD_FORMAT_RANK = {"fp4": 0, "fp8": 1, "bf16": 2, "fp32": 3}
+_HEAD_DTYPE_RANK = {torch.float32: 3, torch.bfloat16: 2}
 
 
 def head_fmt() -> str:
@@ -481,6 +491,27 @@ def head_fmt() -> str:
     return v
 
 
+def draft_head_fmt() -> str:
+    v = os.environ.get("DSV41_DRAFT_HEAD_FMT", "fp8").strip().lower() or "fp8"
+    if v not in _DRAFT_HEAD_FMTS:
+        raise ValueError(f"DSV41_DRAFT_HEAD_FMT: {v!r}; use {' / '.join(_DRAFT_HEAD_FMTS)}")
+    return v
+
+
+def _head_in_format(t: torch.Tensor, fmt: str):
+    if fmt == "bf16":
+        return t.to(torch.bfloat16)
+    if fmt == "fp8":
+        if quantize_to_fp8 is None:
+            raise RuntimeError("head format fp8 but tools/fp8_linear.py could not be imported")
+        return quantize_to_fp8(t.to(torch.bfloat16))
+    if fmt == "fp4":
+        if quantize_to_fp4 is None:
+            raise RuntimeError("head format fp4 but tools/fp4_linear.py could not be imported")
+        return quantize_to_fp4(t.to(torch.bfloat16))
+    raise ValueError(fmt)
+
+
 def make_head(t: torch.Tensor):
     """`head.weight` in the format DSV41_HEAD_FMT asks for: a bf16 (or fp32) tensor, an FP8Weight
     or an FP4Weight. Every consumer goes through `head_logits` or `dense`, both of which dispatch
@@ -488,16 +519,23 @@ def make_head(t: torch.Tensor):
     if os.environ.get("DSV41_HEAD_FP32", "0") == "1":
         assert head_fmt() == "bf16", "DSV41_HEAD_FP32=1 and DSV41_HEAD_FMT are mutually exclusive"
         return t.float()
-    fmt = head_fmt()
-    if fmt == "bf16":
-        return t.to(torch.bfloat16)
-    if fmt == "fp8":
-        if quantize_to_fp8 is None:
-            raise RuntimeError("DSV41_HEAD_FMT=fp8 but tools/fp8_linear.py could not be imported")
-        return quantize_to_fp8(t.to(torch.bfloat16))
-    if quantize_to_fp4 is None:
-        raise RuntimeError("DSV41_HEAD_FMT=fp4 but tools/fp4_linear.py could not be imported")
-    return quantize_to_fp4(t.to(torch.bfloat16))
+    return _head_in_format(t, head_fmt())
+
+
+def make_draft_head(head):
+    """The drafter's own copy of the LM head, or None to reuse `head` (the verifier's).
+
+    A quantized or TP-split main head has no cheap bf16 source to copy from, and a draft format
+    that is not strictly smaller than the main one would only add memory, so both return None.
+    DSV41_HEAD_FP32=1 is the named reference path and is left alone."""
+    fmt = draft_head_fmt()
+    if fmt == "off" or not isinstance(head, torch.Tensor):
+        return None
+    if os.environ.get("DSV41_HEAD_FP32", "0") == "1":
+        return None
+    if _HEAD_FORMAT_RANK.get(fmt, 9) >= _HEAD_DTYPE_RANK.get(head.dtype, 9):
+        return None
+    return _head_in_format(head, fmt)
 
 
 def _head_blocked(x: torch.Tensor, head, rows: int = 16384) -> torch.Tensor:

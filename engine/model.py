@@ -266,8 +266,13 @@ class Weights:
             if world != 2 or head.shape[0] % world:
                 raise ValueError('vocabulary TP requires two equal shards')
             self.head = VocabParallelHead(R.make_head(head.chunk(world, dim=0)[rank].to(device)), world)
+            self.draft_head = None  # the drafter has no second vocab shard to run against
         else:
             self.head = R.make_head(head.to(device))
+            # DSV41_DRAFT_HEAD_FMT: the verifier keeps `head`; only the drafter reads the cheaper
+            # copy. None means "reuse the verifier's" (off, already quantized, or FP32 reference).
+            # Gated on load_mtp: diagnostics that never draft should not pay for a second head.
+            self.draft_head = R.make_draft_head(self.head) if load_mtp else None
         del head
         self.norm = get("norm.weight").to(device).to(torch.bfloat16)
         self.layers = []

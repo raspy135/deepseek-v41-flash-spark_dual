@@ -229,6 +229,10 @@ class FastDecoder:
         # Preserve the configured head format.  In particular, DSV41_HEAD_FP32 is a numerical
         # choice and the verifier must not silently narrow it to bf16.
         self.head = self.W.head
+        # The DSpark drafter reads its own, cheaper head when DSV41_DRAFT_HEAD_FMT built one. The
+        # verifier (_final) always reads self.head, so its logits and the accepted tokens are
+        # untouched; only the proposed drafts differ.
+        self.draft_head = getattr(self.W, "draft_head", None) or self.head
         self.gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.layers]
         self.mtp_gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.mtp]
         self.markov_embed_bf16 = self.W.mtp[2].markov_embed.to(torch.bfloat16)
@@ -893,7 +897,7 @@ class FastDecoder:
         # The confidence head reads the UN-normed hc_pre output (as Model.dspark_draft does).
         x_pre = R.hc_pre(h, pre_mix)
         x = self._rmsnorm(x_pre, w.norm, a.norm_eps)
-        logits = R.head_logits(x, self.head)  # [T_DRAFT, V]
+        logits = R.head_logits(x, self.draft_head)  # [T_DRAFT, V]
         prev = self.d_tok[0]
         embeds = []
         for i in range(T_DRAFT):

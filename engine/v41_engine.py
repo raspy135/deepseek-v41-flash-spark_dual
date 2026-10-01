@@ -879,11 +879,13 @@ class V41Engine:
                 "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
-                # Dense/attention re-quantization and the LM head's stored format. Both are read
-                # from the environment at load and change numerics, so a pair started with them
-                # differing would compute different logits with nothing raising.
+                # Dense/attention re-quantization, the LM head's stored format and the drafter's
+                # cheaper head. All are read from the environment at load and change numerics, so
+                # a pair started with them differing would compute different logits or draft
+                # different tokens with nothing raising.
                 "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
                 "head_fmt": R.head_fmt(),
+                "draft_head_fmt": R.draft_head_fmt(),
                 "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
                 "fp4_dot_scaled": self.fp4_dot_scaled,
                 "fp4_cuda": self.fp4_cuda,
@@ -2419,6 +2421,7 @@ class V41Engine:
             # construction, so a difference between them is a desync that nothing else reports.
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
+            "draft_head_fmt": R.draft_head_fmt(),
             "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
             "fp4_dot_scaled": self.fp4_dot_scaled,
             "fp4_cuda": self.fp4_cuda,
