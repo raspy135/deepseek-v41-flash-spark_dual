@@ -461,6 +461,39 @@ DENSE_DEQUANT_CACHE = os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1"
 if HC_MM_TILE not in (16, 32):
     raise ValueError("DSV41_HC_MM_TILE must be 16 or 32")
 
+# DSV41_HC_KERNEL: run the Hyper-Connection mix projection on the split-K fp32 kernel
+# (tools/fp32_skinny.py) instead of the padded cuBLAS GEMM. Off by default -- it changes the HC
+# arithmetic (~1e-6 relative) and the graphed verifier has to reproduce Model.forward, which is why
+# b79092a removed an earlier wiring. Both call sites go through hc_kernel_ok()/hc_linear() so the
+# eager Model path and engine/decode_lean.py's fast path cannot switch independently.
+# DSV41_HC_PREC picks the tl.dot input precision: "ieee" is true fp32 (18 us), "tf32x3" is the
+# 3-pass tensor-core emulation (13 us, ~2.5e-6 vs cuBLAS). See tools/bench_fp32_skinny.py.
+HC_KERNEL = os.environ.get("DSV41_HC_KERNEL", "0") == "1"
+HC_PREC = os.environ.get("DSV41_HC_PREC", "tf32x3")
+try:
+    from fp32_skinny import (BLOCK_MP as _SKINNY_MAX_M, skinny_linear as _skinny_linear,
+                             wins as _skinny_wins)
+except Exception:  # noqa: BLE001
+    _skinny_linear = _skinny_wins = None
+    _SKINNY_MAX_M = 0
+
+
+def hc_kernel_ok(w, m: int) -> bool:
+    """Whether the HC projection for weight `w` with `m` activation rows may use the split-K kernel.
+    The row bound is the kernel's BLOCK_MP, not an assert inside it: DSV41_BLOCK can widen the verify
+    block past it and must fall back to cuBLAS rather than take the pair out of step mid-request."""
+    return (HC_KERNEL and _skinny_linear is not None and m <= _SKINNY_MAX_M
+            and torch.is_tensor(w) and w.dtype == torch.float32 and w.dim() == 2
+            and _skinny_wins(w.size(0)))
+
+
+def hc_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """The HC mix projection: the split-K kernel when configured and the rows fit, else mm()'s
+    padded cuBLAS GEMM. Called from Model._hc_mixes and engine/decode_lean.py::hc_mixes."""
+    if x.dim() == 2 and x.size(1) == w.size(1) and hc_kernel_ok(w, x.size(0)):
+        return _skinny_linear(x, w, prec=HC_PREC)
+    return mm(x, w)
+
 
 # --------------------------------------------------------------------------- the LM head's format
 # DSV41_HEAD_FMT picks the stored format of `head.weight` ([129280, 5120], the one weight that is

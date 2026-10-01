@@ -25,6 +25,11 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+try:  # the HC projection's kernel gate/dispatch (tools/fp32_skinny.py via v41_ref)
+    import v41_ref as _R
+except Exception:  # noqa: BLE001
+    _R = None
+
 
 @triton.jit
 def _rms_apply_kernel(X, MEAN, W, OUT, D, EPS, BD: tl.constexpr, OUT_BF16: tl.constexpr):
@@ -446,8 +451,12 @@ class LeanOps:
         rows = max(self.mm_tile, self.hc_mm_tile)
         pad = self._buf(("hc", T), (rows, hc_fn.shape[1]))
         pad[:T].copy_(x.reshape(T, -1))
-        mm = self._buf(("hc_mm", T), (self.hc_mm_tile, hc_fn.shape[0]))
-        torch.mm(pad[:self.hc_mm_tile], hc_fn.t(), out=mm)
+        if _R is not None and _R.hc_kernel_ok(hc_fn, T):
+            # split-K kernel: a fresh output, and no padded rows -- it is row-invariant on its own
+            mm = _R.hc_linear(pad[:T], hc_fn)
+        else:
+            mm = self._buf(("hc_mm", T), (self.hc_mm_tile, hc_fn.shape[0]))
+            torch.mm(pad[:self.hc_mm_tile], hc_fn.t(), out=mm)
         mean = pad[:self.mm_tile].square().mean(-1, keepdim=True)
         if out is None:
             pre = torch.empty(T, hc, dtype=torch.float32, device=x.device)

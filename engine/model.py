@@ -475,7 +475,7 @@ class Model:
         invariance depends on its fixed-row tiling."""
         a = self.args
         xf = x.flatten(1).float()
-        mixes = R.mm(xf, hc_fn) * R.rms_rsqrt(xf, a.norm_eps)
+        mixes = R.hc_linear(xf, hc_fn) * R.rms_rsqrt(xf, a.norm_eps)
         if HC_FUSED:
             return _hc_sinkhorn_fused(mixes, hc_scale, hc_base, a.hc_mult,
                                       a.hc_sinkhorn_iters, a.hc_eps)
