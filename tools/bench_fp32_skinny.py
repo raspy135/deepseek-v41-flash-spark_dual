@@ -75,8 +75,10 @@ def main(layers):
             flops = 2.0 * 6 * n * k
             for label, fn in (("F.linear", lambda: F.linear(x, w)),
                               ("R.mm padded", lambda: R.mm(x, w)),
-                              (f"skinny{'*' if wins(n) else ''}",
-                               (lambda: skinny_linear(x, w)) if wins(n) else None)):
+                              (f"skinny ieee{'*' if wins(n) else ''}",
+                               (lambda: skinny_linear(x, w, prec="ieee")) if wins(n) else None),
+                              (f"skinny tf32x3{'*' if wins(n) else ''}",
+                               (lambda: skinny_linear(x, w, prec="tf32x3")) if wins(n) else None)):
                 if fn is None:
                     print(f"{name:26} {n:6d}x{k:<6d} {label:>16} {'-- not the kernel shape':>26}")
                     continue
@@ -95,7 +97,9 @@ def main(layers):
     inv = all(torch.equal(R.mm(x[:m], w), full[:m]) for m in (1, 2, 4, 6))
     sk_full = skinny_linear(x, w)          # skinny asserts M <= BLOCK_MP (8)
     sk_inv = all(torch.equal(skinny_linear(x[:m], w), sk_full[:m]) for m in (1, 2, 4, 6))
-    print(f"\nrow invariance  R.mm padded: {inv}   skinny: {sk_inv}")
+    t3_full = skinny_linear(x, w, prec="tf32x3")
+    t3_inv = all(torch.equal(skinny_linear(x[:m], w, prec="tf32x3"), t3_full[:m]) for m in (1, 2, 4, 6))
+    print(f"\nrow invariance  R.mm padded: {inv}   skinny ieee: {sk_inv}   skinny tf32x3: {t3_inv}")
     print("skinny* = wins(N) says this shape should use the kernel")
 
 

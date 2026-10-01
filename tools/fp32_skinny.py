@@ -34,7 +34,7 @@ import triton.language as tl
 def _skinny_kernel(X, W, Y, M, N, K,
                    stride_xm, stride_wn, stride_ys, stride_ym,
                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                   SPLIT_K: tl.constexpr):
+                   SPLIT_K: tl.constexpr, PREC: tl.constexpr = "ieee"):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     rm = tl.arange(0, BLOCK_M)
@@ -52,7 +52,7 @@ def _skinny_kernel(X, W, Y, M, N, K,
                     mask=m_mask[:, None] & km[None, :], other=0.0).to(tl.float32)
         w = tl.load(W + rn[:, None] * stride_wn + kk[None, :],
                     mask=n_mask[:, None] & km[None, :], other=0.0)
-        acc += tl.dot(x, tl.trans(w), input_precision="ieee", out_dtype=tl.float32)
+        acc += tl.dot(x, tl.trans(w), input_precision=PREC, out_dtype=tl.float32)
     tl.store(Y + pid_k * stride_ys + rm[:, None] * stride_ym + rn[None, :], acc,
              mask=m_mask[:, None] & n_mask[None, :])
 
@@ -80,13 +80,13 @@ TARGET_CTAS = 48        # one per SM on the 48-SM GB10; 96 measured slower for t
 MAX_N = int(os.environ.get("DSV41_SKINNY_MAX_N", 64))
 
 
-def _plan(N: int, K: int):
+def _plan(N: int, K: int, block_k: int = BLOCK_K, target_ctas: int = TARGET_CTAS):
     bn = 32
     while bn < N and bn < 128:
         bn *= 2
     n_blocks = triton.cdiv(N, bn)
-    n_kblocks = triton.cdiv(K, BLOCK_K)
-    kb = max(1, -(-n_kblocks // max(1, TARGET_CTAS // n_blocks)))
+    n_kblocks = triton.cdiv(K, block_k)
+    kb = max(1, -(-n_kblocks // max(1, target_ctas // n_blocks)))
     return bn, -(-n_kblocks // kb)   # every program gets kb K-blocks, none idle
 
 
@@ -97,28 +97,37 @@ def wins(N: int) -> bool:
     return N <= MAX_N
 
 
-def skinny_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def skinny_linear(x: torch.Tensor, w: torch.Tensor, block_k: int | None = None,
+                  target_ctas: int | None = None, block_mp: int | None = None,
+                  num_warps: int = 4, num_stages: int = 3, reduce_warps: int = 8,
+                  prec: str = "ieee") -> torch.Tensor:
     """x [M, K] fp32 or bf16, w [N, K] fp32 -> y [M, N] fp32. Same math as F.linear(x.float(), w)
-    up to the K-summation order (fp32 throughout, no tf32, no atomics)."""
+    up to the K-summation order (fp32 throughout, no atomics). The keyword arguments are the tuning
+    knobs (see tools/tune_fp32_skinny.py); None keeps the module defaults. `prec` is the tl.dot
+    input precision: "ieee" is true fp32, "tf32x3" is the 3-pass tensor-core emulation (a precision
+    change -- measure the error, do not assume it)."""
     assert w.dtype == torch.float32 and w.dim() == 2 and x.dim() == 2
     assert x.stride(1) == 1 and w.stride(1) == 1
+    block_k = BLOCK_K if block_k is None else block_k
+    target_ctas = TARGET_CTAS if target_ctas is None else target_ctas
+    block_mp = BLOCK_MP if block_mp is None else block_mp
     M, K = x.shape
     N = w.size(0)
-    assert w.size(1) == K and M <= BLOCK_MP
-    bn, sk = _plan(N, K)
+    assert w.size(1) == K and M <= block_mp
+    bn, sk = _plan(N, K, block_k, target_ctas)
     y = torch.empty(M, N, dtype=torch.float32, device=x.device)
     grid = (triton.cdiv(N, bn), sk)
     if sk == 1:
         _skinny_kernel[grid](x, w, y, M, N, K, x.stride(0), w.stride(0), 0, y.stride(0),
-                             BLOCK_M=BLOCK_M, BLOCK_N=bn, BLOCK_K=BLOCK_K, SPLIT_K=1,
-                             num_warps=4, num_stages=3)
+                             BLOCK_M=BLOCK_M, BLOCK_N=bn, BLOCK_K=block_k, SPLIT_K=1, PREC=prec,
+                             num_warps=num_warps, num_stages=num_stages)
         return y
     nb = bn * triton.cdiv(N, bn)
-    p = torch.empty(sk, BLOCK_MP, nb, dtype=torch.float32, device=x.device)
+    p = torch.empty(sk, block_mp, nb, dtype=torch.float32, device=x.device)
     _skinny_kernel[grid](x, w, p, M, N, K, x.stride(0), w.stride(0), p.stride(0), p.stride(1),
-                         BLOCK_M=BLOCK_M, BLOCK_N=bn, BLOCK_K=BLOCK_K, SPLIT_K=sk,
-                         num_warps=4, num_stages=3)
+                         BLOCK_M=BLOCK_M, BLOCK_N=bn, BLOCK_K=block_k, SPLIT_K=sk, PREC=prec,
+                         num_warps=num_warps, num_stages=num_stages)
     _skinny_reduce[(1,)](p, y, M, N, p.stride(0), p.stride(1), y.stride(0),
-                         sk, SPLIT_P=1 << (sk - 1).bit_length(), BLOCK_M=BLOCK_MP, BLOCK_N=nb,
-                         num_warps=8, num_stages=1)
+                         sk, SPLIT_P=1 << (sk - 1).bit_length(), BLOCK_M=block_mp, BLOCK_N=nb,
+                         num_warps=reduce_warps, num_stages=1)
     return y
