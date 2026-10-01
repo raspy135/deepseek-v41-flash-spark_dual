@@ -890,7 +890,7 @@ class V41Engine:
                 # The transport for the decode-sized all-gathers. A pair split across this would route
                 # different bytes; the RoCE path also agrees its own settings at setup, but the guard
                 # refuses the mismatch at boot instead of after the first probe.
-                "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "nccl"),
+                "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
                 "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
                 "roce_hcas": os.environ.get("DSV41_ROCE_HCAS", "2"),
                 "head_fmt": R.head_fmt(),
@@ -2433,7 +2433,7 @@ class V41Engine:
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
             "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
-            "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "nccl"),
+            "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
             "draft_head_fmt": R.draft_head_fmt(),
             "hc_kernel": R.HC_KERNEL,

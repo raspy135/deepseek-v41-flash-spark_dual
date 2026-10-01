@@ -47,7 +47,7 @@ class _Base:
 
 
 def enabled() -> bool:
-    return os.environ.get("DSV41_COMM_BACKEND", "nccl").strip().lower() == "roce"
+    return os.environ.get("DSV41_COMM_BACKEND", "roce").strip().lower() == "roce"
 
 
 def init(device):
@@ -58,7 +58,11 @@ def init(device):
     if not enabled():
         return
     if _roce is None:
-        raise RuntimeError("DSV41_COMM_BACKEND=roce but tools/roce could not be imported")
+        # Default-on must degrade, not crash: no verbs stack in the image, or the import broke.
+        if os.environ.get("DSV41_ROCE_FALLBACK", "nccl").strip().lower() == "error":
+            raise RuntimeError("DSV41_COMM_BACKEND=roce but tools/roce could not be imported")
+        print("[comm] tools/roce unavailable; serving on NCCL", flush=True)
+        return
     comm = _roce.select(_Base(device))
     _COMM = comm if isinstance(comm, _roce.RoceComm) else None
 

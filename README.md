@@ -308,32 +308,36 @@ The corrected TP path passed nesting depths 4/6/8/10 twice through the live API 
 speculation and adaptation enabled. The second pass restored prefixes from disk.
 That is a regression check, not a general quality guarantee.
 
-Latest native-CUDA decode recheck (`bench/bench.py`, fixed 512-token output, one
-warm-up plus three measured runs) on 2026-09-22:
+Latest decode recheck (`bench/bench.py`, 512-token output, one warm-up plus three
+measured runs of the same prompt) on 2026-10-01:
 
 | workload | prompt tokens | output tokens | decode tok/s | accept | expert hit |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| code | 62 | 512 | 24.23 | 2.97 | 100% |
+| code | 62 | 512 | 37.34 | 3.72 | 100% |
+| prose | 45 | 512 | 23.12 | 1.98 | 100% |
 
 Configuration: TP2, native FP4, native CUDA BM=16 decode with relaxed reduction,
-90.1 GB arena per node, keep 0.61, packed KV, speculation enabled. The three
-measured runs were 24.23, 25.12, and 23.37 tok/s; acceptance varied from 2.81 to
-3.04. The immediately preceding run on an older Triton-only container measured
-24.41 tok/s, but rebuilding changed more than the MoE kernel, so this is not a
-controlled CUDA-versus-Triton comparison. Raw rows are in
-[`results/readme-cuda-rebuilt.json`](results/readme-cuda-rebuilt.json) and
-[`results/readme-cuda.json`](results/readme-cuda.json).
+dense FP4 `attn,wo_a` with the split-K kernel, dynamic depth 3/5, decode all-gathers over
+the one-shot RoCE transport, L2 weight prefetch, 90.1 GB arena per node, keep 0.61, packed
+KV, speculation enabled. Raw rows: `results/readme-20261001-code.json` and
+`results/readme-20261001-prose.json`. The same three runs last read 24.23 (`code`) on
+2026-09-22, before the decode-lean rounds, dense FP4 and the RoCE transport; acceptance is
+what moves most of the difference.
 
-The earlier broader bench suite used the same harness (fixed output length,
-warm-up plus three measured runs, medians). Configuration: TP2, native FP4, 90.1 GB arena per node,
-keep 0.62, packed KV, `DSV41_BLOCK=3`, shared-expert overlap and native Engram
-gather enabled:
+The broader bench suite uses the same harness (fixed output length, warm-up plus
+three measured runs, medians) on 2026-10-01, same configuration as the table above:
 
 | workload | prompt tokens | output tokens | prefill tok/s | decode tok/s | accept |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| code | 62 | 512 | — | 26.3 | 3.10 |
-| random 8K | 8,180 | 512 | 611 | 23.9 | 2.97 |
-| prose | 45 | 512 | — | 16.0 | 1.94 |
+| code | 62 | 512 | — | 37.34 | 3.72 |
+| random 8K | 8,179 | 118–172 (EOS) | 508 | 25.57 | 2.70 |
+| prose | 45 | 512 | — | 23.12 | 1.98 |
+
+The 8K prompt is fresh per run, so that prefill is uncached and its decode median is over a
+short tail (the model stopped on EOS); the short prompts are mostly fixed overhead.
+Acceptance varies on random text. Raw rows: `results/readme-20261001-random8k.json`.
+For comparison, the same suite on 2026-09-22 (`DSV41_BLOCK=3` fixed, no dense FP4, NCCL
+gathers) read code 26.3 / random 23.9 / prose 16.0.
 
 The 8K prompt is fresh per run, so that prefill is uncached; the short prompts are
 mostly fixed overhead. Acceptance varies on random text, so these are medians of a

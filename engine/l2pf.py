@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-MB = int(os.environ.get("DSV41_L2PF_MB", "0"))
+MB = int(os.environ.get("DSV41_L2PF_MB", "2"))
 _SINK = None
 
 
