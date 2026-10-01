@@ -76,6 +76,11 @@ LEAN = os.environ.get("DSV41_DECODE_LEAN", "1") == "1"
 LEAN_ROPE = os.environ.get("DSV41_DECODE_LEAN_ROPE", "1") == "1"
 # Within LEAN: the torch decode attention's softmax elementwise ops as two kernels around torch's sum.
 LEAN_SOFTMAX = os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1"
+# Within LEAN: routed and shared experts share their two TP all-gathers (intermediates, then the
+# summed outputs) instead of four, and hc_post reads the gathered output in place.
+LEAN_MOE = os.environ.get("DSV41_DECODE_LEAN_MOE", "1") == "1"
+# Within LEAN: the torch verify attention gathers its keys straight into fp32 (_attention_lean).
+LEAN_ATTN = os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1"
 
 
 def merge_decode_projections(weights) -> int:
@@ -141,6 +146,11 @@ def _dynamic_depths():
 
 
 DYNAMIC_DEPTHS = _dynamic_depths()
+# DSV41_SPEC_CONF=1: the draft graph also evaluates DSpark's confidence head (per-position
+# conditional acceptance logits, tech report 2.4.3) into FastDecoder.d_conf, and the decode loop
+# records it per step. Observation only: nothing reads it to choose a width yet. Off by default so
+# the served draft graph is unchanged; tools/bench_spec_conf_tp.py collects it.
+SPEC_CONF = os.environ.get("DSV41_SPEC_CONF", "0") == "1"
 T_DRAFT = DYNAMIC_DEPTHS[-1] if DYNAMIC_DEPTHS else _draft_block()
 T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts; the widest verify block
 # Every verify width this process captures graphs and static buffers for.
@@ -208,6 +218,7 @@ class FastDecoder:
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
         self.d_probs = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)
+        self.d_conf = torch.zeros(T_DRAFT, dtype=torch.float32, device=dev)   # raw logits, SPEC_CONF only
         # Mode-independent draft constants.  They used to be rebuilt by captured fill/arange
         # kernels every replay; only element zero of the ids changes with the accepted token.
         self._d_ids = torch.full((T_DRAFT,), a.dspark_noise_token_id, dtype=torch.long, device=dev)
@@ -396,6 +407,9 @@ class FastDecoder:
         else:
             q_lin, kv_lin = R.qlinear(x, w.wq_a), R.qlinear(x, w.wkv)
         qr = self._rmsnorm(q_lin, w.q_norm, a.norm_eps)
+        if (lean_step and LEAN_ATTN and not FUSED_ATTN and LEAN_ROPE and LEAN_SOFTMAX and ring.is_contiguous()
+                and fq.dtype == torch.complex64):
+            return self._attention_lean(x, qr, kv_lin, w, L, ring, fq, pos, sh_state)
         q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
         kv = self._rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
@@ -457,13 +471,37 @@ class FastDecoder:
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
 
+    def _attention_lean(self, x, qr, kv_lin, w, L, ring, fq, pos, sh_state):
+        """The verify branch of _attention's torch path with its fp32 staging written in place:
+        RoPE emits q already widened (`.float()` of the bf16 result), the window and compressed
+        keys are gathered straight into the fp32 key block, and the output RoPE rounds the einsum
+        result to bf16 itself. Same values at every step; 4 launches fewer per layer."""
+        a = self.a
+        T = x.size(0)
+        rd = a.rope_head_dim
+        qf = self.lean.rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim),
+                            fq, rd, out_f32=True)
+        kv = self.lean.rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq, rd)
+        slot_w, slot_r, wmask = self._step_memo("win", lambda: self._window(pos))
+        ring[slot_w] = kv
+        cache = idx = None
+        mask = wmask
+        if w.ratio:
+            (cache, idx), mask = self._compressed(x, qr, w, L, pos, sh_state, wmask=wmask, rows=False)
+        kvf = self.lean.keys_f32(ring, slot_r, cache, idx)
+        probs = self.lean.attn_probs(torch.einsum("thd,tnd->thn", qf, kvf), mask, w.attn_sink,
+                                     a.head_dim ** -0.5)
+        o = self.lean.rope(torch.einsum("thn,tnd->thd", probs, kvf), fq, rd, inverse=True)
+        o = R.wo_a_proj(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1), w.wo_a, tiled=True)
+        return R.qlinear(o.flatten(1), w.wo_b)
+
     def _window(self, pos):
         """(ring slot of each query, ring slots of its window, window mask) -- the same for every
         backbone layer of a step."""
         wpos = pos[:, None] - self.win_off[None, :]
         return pos % M.RING, wpos.clamp_min(0) % M.RING, wpos >= 0
 
-    def _compressed(self, x, qr, w, L, pos, st, wmask=None):
+    def _compressed(self, x, qr, w, L, pos, st, wmask=None, rows: bool = True):
         """st: dict with 'parity' (python int, S % 2, fixed per graph), 'ckv', 'ik', 'ratio'.
 
         Returns (rows, cmask), or with `wmask` (the lean step) (rows, cat([wmask, cmask])): the
@@ -516,6 +554,8 @@ class FastDecoder:
                     self._memo.pop("topk", None)
             idx_c, mask = self._step_memo("topk", lambda: (
                 self.topk.clamp_min(0), torch.cat([wmask, self.topk >= 0], dim=1)))
+            if not rows:
+                return (st["ckv"], idx_c), mask  # the caller gathers straight into fp32
             return gather(st["ckv"], idx_c), mask
         compress_lens = (pos + 1) // r
         if L in self.W.indexers:
@@ -658,9 +698,112 @@ class FastDecoder:
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
         return out
 
+    def _moe_merged_ok(self, w) -> bool:
+        """Whether _moe_merged reproduces _routed_experts + _shared_ffn for layer weights `w`. Fixed
+        per process (config, arena and weight types), so both ranks answer the same."""
+        ok = getattr(self, "_merged_ok", None)
+        if ok is None:
+            ok = self._merged_ok = self._merged_check()
+        return ok and getattr(w, "_sh_w13", None) is not None and self.lut is not None
+
+    def _merged_check(self) -> bool:
+        if self.lean is None or not LEAN_MOE or not MERGED_PROJ:
+            return False
+        store = self.m.store
+        arena = getattr(store, "arena", None)
+        if getattr(store, "null_slot", None) is None or not getattr(arena, "tp_output", False):
+            return False
+        if getattr(arena, "tp_world", 1) != 2 or getattr(self.eng, "kernel", None) != "triton-fp4":
+            return False
+        try:
+            import fp4_moe as K
+        except Exception:  # noqa: BLE001
+            return False
+        if not K.CUDA_DECODE or K.DOT_SCALED or not isinstance(arena, K.ExpertArena):
+            return False
+        if R.act_qdq_fp8 is R._ACT_QDQ_REF:
+            return False  # act_quant on: the shared w2 input would be quantized before its gather
+        from engine.tensor_parallel import OutputParallelWeight
+        from fp8_linear import FP8Weight
+        w = self.W.layers[0]
+        w13 = getattr(w, "_sh_w13", None)
+        return (w13 is not None and isinstance(w.sh_w2, OutputParallelWeight)
+                and type(w.sh_w2.local) is FP8Weight and w.sh_w1.N == arena.w1.shape[1]
+                and w.sh_w2.local.shape[0] == arena.w2.shape[1] and T_VERIFY * self.a.n_activated_experts <= 64)
+
+    def _moe_merged(self, L, w):
+        """_routed_experts() + _shared_ffn() + the add, with two all-gathers instead of four.
+
+        Output-layout TP gathers the routed intermediate [P, 1152] and the shared one [T, 1152]
+        (both this rank's half of 2304 columns), and later the routed and shared outputs (both
+        this rank's 2560 of 5120 hidden columns). Each pair has the same split, so each pair is
+        one collective here: the intermediates stacked, the outputs summed locally in fp32 --
+        `routed + shared.float()` is elementwise, so summing before the gather gives the bits
+        summing after it gave. hc_post reads the gathered [2, T, 2560] as is and rounds to bf16.
+        The native routing is moe_forward's split_decode_null path, with its elementwise
+        prologue/epilogue as two kernels."""
+        import fp4_moe as K
+        import fp4_moe_cuda as CUDA
+        from engine.collective_rails import group as collective_group
+        a = self.a
+        store = self.m.store
+        arena = store.arena
+        null = int(store.null_slot)
+        x = self.y
+        T, k = self.route_idx.shape
+        P = T * k
+        inter = arena.w1.shape[1]
+        world = arena.tp_world
+        side = self.shared_stream
+        main = torch.cuda.current_stream(self.dev)
+        h_all = torch.empty(P + T, inter, dtype=torch.bfloat16, device=x.device)
+
+        def shared_up():
+            gu = R.qlinear(x, w._sh_w13)
+            self.lean.swiglu(gu, w.sh_w1.N, a.swiglu_limit, out=h_all[P:])
+
+        if side is not None:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                shared_up()
+        route = self.lean.route_prep(self.route_idx, self.lut[L], self.slots, null)
+        block_slot, block_pair, block_route, NB = CUDA.build_routing_small(route, 16, k)
+        self.lean.block_null(block_slot, null)
+        CUDA.up(x, arena.w1, arena.s1, arena.w3, arena.s3, h_all[:P], self.route_w.reshape(-1),
+                block_slot, block_route, float(a.swiglu_limit), k, inter, K.DIM, NB, null)
+        if side is not None:
+            main.wait_stream(side)
+        else:
+            shared_up()
+        gathered = torch.empty(world * (P + T), inter, dtype=torch.bfloat16, device=x.device)
+        torch.distributed.all_gather_into_tensor(gathered, h_all, group=collective_group())
+        full = gathered.view(world, P + T, inter).transpose(0, 1).reshape(P + T, world * inter)
+        down_n = arena.w2.shape[1]
+        if side is not None:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                local_s = R.mm(full[P:], w.sh_w2.local)
+        parts = torch.empty(P, down_n, dtype=torch.float32, device=x.device)
+        CUDA.down(full[:P], arena.w2, arena.s2, parts, block_slot, block_pair, k, down_n,
+                  world * inter, T, NB, null, False, 1)
+        local = parts.view(k, T, down_n).sum(dim=0)
+        if side is not None:
+            main.wait_stream(side)
+            local_s.record_stream(main)
+        else:
+            local_s = R.mm(full[P:], w.sh_w2.local)
+        local += local_s
+        out = torch.empty(world * T, down_n, dtype=torch.float32, device=x.device)
+        torch.distributed.all_gather_into_tensor(out, local, group=collective_group())
+        _hc_post_fused(out, self.h, self.ffn_post, self.ffn_comb, out=self.h, split_w=down_n)
+
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
+        if self._moe_merged_ok(w):
+            self._moe_merged(L, w)
+            self.pre_mix.copy_(self.ffn_pre)
+            return
         lean = self.lean is not None
         if self.shared_stream is None:
             out = self._routed_experts()
@@ -747,11 +890,16 @@ class FastDecoder:
                      else R.hc_post(out.to(torch.bfloat16), residual, ffn_post, ffn_comb))
             pre_mix = ffn_pre
         w = self.W.mtp[2]
-        x = self._rmsnorm(R.hc_pre(h, pre_mix), w.norm, a.norm_eps)
+        # The confidence head reads the UN-normed hc_pre output (as Model.dspark_draft does).
+        x_pre = R.hc_pre(h, pre_mix)
+        x = self._rmsnorm(x_pre, w.norm, a.norm_eps)
         logits = R.head_logits(x, self.head)  # [T_DRAFT, V]
         prev = self.d_tok[0]
+        embeds = []
         for i in range(T_DRAFT):
-            bias = _lin(self.markov_embed_bf16[prev.view(1)], self.markov_head_bf16).float()[0]  # 1-d index: a 0-d tensor index syncs
+            e = self.markov_embed_bf16[prev.view(1)]  # 1-d index: a 0-d tensor index syncs
+            embeds.append(e)
+            bias = _lin(e, self.markov_head_bf16).float()[0]
             lg = logits[i] + bias
             if greedy:
                 # Greedy verification never reads q=d_probs.  Avoid five vocabulary-wide
@@ -764,6 +912,10 @@ class FastDecoder:
                 self.d_probs[i].copy_(p)
             self.d_out[i] = nxt
             prev = nxt
+        if SPEC_CONF:
+            # embeds[i] is the Markov embedding of the token before draft i, as in the reference
+            feat = torch.cat([x_pre.float(), torch.cat(embeds).float()], dim=-1)
+            self.d_conf.copy_((feat @ w.conf_proj.T).squeeze(-1))
 
     def _capture_draft_graphs(self):
         """Capture one graph per sampling mode; neither mode pays for the other's dead branch."""
@@ -825,7 +977,9 @@ class FastDecoder:
     def _layer_ab(self, L, sh_state):
         self._layer_a(L, sh_state)
         # -1 never occurs while the LUT is valid
-        if self.lean is not None:
+        if self._moe_merged_ok(self.W.layers[L]):
+            pass  # _moe_merged looks the slots up together with its routing keys
+        elif self.lean is not None:
             torch.index_select(self.lut[L], 0, self.route_idx.view(-1), out=self.slots.view(-1))
         else:
             self.slots.copy_(self.lut[L][self.route_idx])

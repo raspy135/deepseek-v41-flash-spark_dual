@@ -221,6 +221,77 @@ class LeanTest(unittest.TestCase):
             got = self.lean.attn_probs(torch.einsum("thd,tnd->thn", q.float(), kv.float()), mask, sink, scale)
             self.assertTrue(torch.equal(got, ref), (T, H, N, float((got - ref).abs().max())))
 
+    def test_route_prep_and_block_null(self):
+        g = torch.Generator(device="cpu").manual_seed(31)
+        null = 9573
+        lut = torch.randint(0, 9000, (384,), generator=g, dtype=torch.int32).to(DEV)
+        lut[torch.randperm(384, generator=g)[:150].to(DEV)] = null  # pruned / not resident
+        for T in (4, 6):
+            idx = torch.stack([torch.randperm(384, generator=g)[:6] for _ in range(T)]).to(DEV)
+            slots = torch.zeros(T, 6, dtype=torch.int32, device=DEV)
+            route = self.lean.route_prep(idx, lut, slots, null)
+            ref_slots = lut[idx]
+            pair = torch.arange(T * 6, dtype=torch.int32, device=DEV).view_as(ref_slots)
+            ref_route = torch.where(ref_slots == null, null + 1 + pair, ref_slots)
+            self.assertTrue(torch.equal(slots, ref_slots) and torch.equal(route, ref_route), T)
+            bs = torch.randint(0, null + 40, (T * 6,), generator=g, dtype=torch.int32).to(DEV)
+            ref_bs = torch.where(bs > null, torch.full_like(bs, null), bs)
+            self.assertTrue(torch.equal(self.lean.block_null(bs.clone(), null), ref_bs), T)
+
+    def test_hc_post_split_layout(self):
+        T, W = 6, 2560
+        res = _act((T, HC, 5120), 81)
+        gathered = _act((2 * T, W), 82).float() * 7  # [world*T, W] as all_gather_into_tensor leaves it
+        post = torch.rand(T, HC, device=DEV)
+        comb = torch.rand(T, HC, HC, device=DEV)
+        x = gathered.view(2, T, W).transpose(0, 1).reshape(T, 2 * W)
+        ref = hc_post(x.to(torch.bfloat16), res, post, comb)
+        self.assertTrue(torch.equal(hc_post(gathered, res, post, comb, split_w=W), ref))
+        inplace = res.clone()
+        hc_post(gathered, inplace, post, comb, out=inplace, split_w=W)
+        self.assertTrue(torch.equal(inplace, ref))
+
+    def test_routed_shared_sum_before_gather(self):
+        """The merged MoE path sums rank-local column blocks, then gathers; the old one gathered
+        both, then summed. Emulate a two-rank gather and compare what reaches hc_post."""
+        T, W = 6, 2560
+        routed = [_act((T, W), 83 + r).float() * 3 for r in range(2)]
+        shared = [_act((T, W), 85 + r) for r in range(2)]
+        full_r = torch.stack(routed).transpose(0, 1).reshape(T, 2 * W)
+        full_s = torch.stack(shared).transpose(0, 1).reshape(T, 2 * W)
+        old = (full_r + full_s.float()).to(torch.bfloat16)
+        new = torch.cat([routed[r] + shared[r] for r in range(2)])  # [2*T, W], gather layout
+        new = new.view(2, T, W).transpose(0, 1).reshape(T, 2 * W).to(torch.bfloat16)
+        self.assertTrue(torch.equal(old, new))
+
+    def test_keys_f32(self):
+        from engine.packed_kv import gather, write
+        g = torch.Generator(device="cpu").manual_seed(37)
+        ring = _act((128, 512), 101)
+        cache = torch.zeros(4096, 36, dtype=torch.int64, device=DEV)  # 512 values = 32 words + 4 scale words
+        vals = _act((4096, 512), 102)
+        vals[5, :7] = -0.0  # negative zeros survive only if the sign is set on the bf16 bits
+        write(cache, vals, 0)
+        for T, n2 in ((6, 512), (4, 512), (6, 0)):
+            slot_r = torch.randint(0, 128, (T, 128), generator=g).to(DEV)
+            if n2:
+                idx = torch.randint(0, 4096, (T, n2), generator=g).to(DEV)
+                idx[0, :3] = 5
+                ref = torch.cat([ring[slot_r], gather(cache, idx)], dim=1).float()
+                got = self.lean.keys_f32(ring, slot_r, cache, idx)
+            else:
+                ref = ring[slot_r].float()
+                got = self.lean.keys_f32(ring, slot_r)
+            self.assertTrue(torch.equal(got, ref), (T, n2))
+            self.assertTrue(torch.equal(torch.signbit(got), torch.signbit(ref)), (T, n2))
+
+    def test_rope_f32_modes(self):
+        rope = lambda x, f, inv: torch.cat([x[..., :-64], R.apply_rotary(x[..., -64:], f, inverse=inv)], -1)
+        for x, f, inv, ref in self._rope_cases():
+            self.assertTrue(torch.equal(self.lean.rope(x, f, 64, inv, out_f32=True), ref.float()))
+            x32 = x.float() * 1.001  # not bf16-representable: the kernel must round it first
+            self.assertTrue(torch.equal(self.lean.rope(x32, f, 64, inv), rope(x32.to(torch.bfloat16), f, inv)))
+
     def _rope_cases(self):
         fw = R.precompute_freqs_cis(64, 600_000, 0, 10000, 16, 32, 1, DEV)
         fc = R.precompute_freqs_cis(64, 600_000, 65536, 160000, 16, 32, 1, DEV)

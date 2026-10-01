@@ -79,12 +79,95 @@ includes profiler overhead and is only comparable between arms.
 Token hashes (`df46ab5e`, `73a30f4e`, `285bf77a`) are identical in every arm. Results:
 `results/kernels-20260930/`.
 
-## What is left in a layer (80 kernels)
+## Round 3: shared collectives (`DSV41_DECODE_LEAN_MOE`)
 
-- the kept cores: 2 x (padded GEMM + split-K reduce + square + mean) for HC, 2 x (square + mean)
-  per norm;
-- five NCCL all-gathers, each followed by a reorder copy (routed intermediate and output, shared
-  intermediate and output, `wo_b` input and output). The routed/shared pairs share a column split,
-  so they can be one collective each with the same bits;
-- ~5 small kernels around the native MoE routing call (null-slot keys);
-- the torch attention's fp32 staging: `q.float()`, ring and compressed-row gathers, their copies.
+Output-layout TP gathered the routed intermediate [P, 1152] and the shared-expert intermediate
+[T, 1152] separately, then the routed and shared outputs separately: four all-gathers and four
+reorder copies per layer. Both pairs have the same column split, so `_moe_merged` stacks the two
+intermediates into one gather, sums the two outputs locally in fp32 before one gather
+(`routed + shared.float()` is elementwise, so the order of sum and gather does not matter), and
+`hc_post(split_w=2560)` reads the gathered [2, T, 2560] as is. The native routing prologue and
+epilogue (null-slot keys, block remap) became two kernels. `tools/test_decode_lean.py` covers the
+pieces; the two-node run covers the collectives:
+
+| Arm | html tok/s | python tok/s | explain tok/s | kernels / step | NCCL / step |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| merged | 43.99 | 45.42 | 22.69 | 3,715 | 170 (7.9 ms) |
+| separate | 41.70 | 44.72 | 22.18 | 4,115 | 250 (8.9 ms) |
+| merged | 43.90 | 45.22 | 22.77 | 3,715 | |
+| separate | 43.62 | 45.20 | 22.55 | 4,115 | |
+
+Token hashes identical. The gain is ~1 ms per step and within the noise of the second pair:
+80 fewer collectives saved only ~1 ms of NCCL time, because the remaining ones wait longer. The
+collective cost here is latency and rank skew, not bytes -- merging more of them will not buy much.
+
+## Attention staging (`DSV41_DECODE_LEAN_ATTN`): exact, fewer launches, no measurable gain
+
+`_attention_lean` has RoPE emit q already widened to fp32, gathers the window and compressed keys
+straight into the fp32 key block (`keys_f32`: the packed-KV decode reproduced bit for bit,
+negative zero included), and has the output RoPE round the einsum result itself. 158 fewer
+kernels per step, same token hashes -- and no speed change:
+
+| Arm | html tok/s | python tok/s | explain tok/s | kernels / step |
+| --- | ---: | ---: | ---: | ---: |
+| on | 44.42 | 46.01 | 22.81 | 3,557 |
+| off | 45.18 | 46.83 | 23.16 | 3,715 |
+| on | 45.92 | 47.44 | 23.67 | 3,557 |
+| off | 44.66 | 46.92 | 23.26 | 3,715 |
+
+The removed kernels were copies, and writing the gathered keys as fp32 moves the same bytes the
+copies did. Kept on because it is exact and costs nothing; do not count it as a speedup.
+
+## Routed-expert kernels: v2 (`DSV41_FP4_CUDA_V2`, default on)
+
+Distinct routed experts per layer per verify step (`DSV41_ROUTE_STATS=1`, 256 greedy tokens):
+python 21.7, html 20.3, explain 16.5 (the last mostly at depth 3). At TP2 a slot is 6.27 MB for
+`up` (w1, w3, scales) and 3.13 MB for `down`, so python reads ~136 + 68 MB per layer.
+
+`tools/bench_fp4_moe_decode.py` (one GPU, L2-cold calls, graph replay) put v1 at 150-185 GB/s at
+these U against a 205-225 GB/s plain read of the same bytes; below U = 14 it fell to 80-160. v1
+gives each lane 2 bytes of a 64-byte warp tile per K step and walks the row again for each routed
+pair. v2 gives each lane whole 32-value scale groups (one 16-byte load per matrix), keeps the row
+in registers across the pairs, and replays v1's relaxed reduction exactly: each group's 8 virtual
+lane partials with v1's fma pattern and shuffle tree, then each subgroup's running sum as a
+sequential chain through shared memory. `tools/test_fp4_moe_v2.py`: bit-identical on TP and
+single-box shapes, T = 4 and 6, U = 6..36, with and without null-slot pairs. (Whether v1's
+`p *= scale; acc += p` was contracted into an fma does not matter: UE8M0 scales are powers of two.)
+
+| U | up v1 -> v2 (us) | GB/s | down v1 -> v2 (us) | GB/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 14 | 554 -> 409 | 159 -> 214 | 312 -> 299 | 140 -> 147 |
+| 20 | 680 -> 599 | 184 -> 209 | 364 -> 303 | 172 -> 207 |
+| 26 | 820 -> 760 | 199 -> 214 | 417 -> 391 | 195 -> 209 |
+
+In the engine (alternating, token hashes identical):
+
+| Arm | html tok/s | python tok/s | explain tok/s | up / down per layer |
+| --- | ---: | ---: | ---: | --- |
+| v2 | 45.87 | 48.22 | 23.99 | 709 / 355 us |
+| v1 | 44.55 | 45.98 | 22.98 | 842 / 380 us |
+| v2 | 46.75 | 48.18 | 24.00 | 730 / 355 us |
+| v1 | 45.88 | 47.68 | 23.73 | 770 / 360 us |
+
++2.4 to +2.9 % (-2.5 to -3 ms per step), less than the microbenchmark promised, and the reason is
+the ceiling: in the engine the shared expert's w1||w3 (~12 MB) streams on the side stream during
+`moe_up`, so `moe_up`'s window moves ~148 MB in ~710 us, ~208 GB/s. **The routed experts are now
+at the DRAM ceiling in situ.** What is left of their ~46 ms per step is bytes -- ~22 distinct
+experts x 9.4 MB x 40 layers -- and only fewer or smaller expert reads will move it, not a kernel.
+v2's own weak spot, many pairs on few experts (U < 14), is not where serving runs; batching the
+chain replay across pairs would fix it and was not done.
+
+## What is left in a layer (~66 kernels)
+
+- the kept cores: 2 x (padded GEMM + split-K reduce + square + mean) for HC, square + mean per
+  norm, topk and the k-way sum in the router, the softmax sum;
+- three all-gathers (MoE intermediates, MoE outputs, and the `wo_b` input/output pair), two
+  reorder copies;
+- the matmuls themselves.
+
+Further exact trims exist -- the ring write folded into the kv RoPE, the HC and router padding
+copies written by the kernel before them, `hc_post` reading the `wo_b` gather in place -- and add
+up to well under 1 ms per step. The time is elsewhere now (per step, python prompt, profiled):
+routed experts ~50 ms (the native `moe_up`/`moe_down` at an estimated 165-180 GB/s against a
+~235 GB/s streaming ceiling), dense fp8 projections ~30 ms, fp32 GEMMs ~10 ms (HC, router gate,
+torch attention), the bf16 LM head ~7.7 ms (read twice per step), NCCL ~7.9 ms.

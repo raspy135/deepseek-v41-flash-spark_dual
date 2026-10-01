@@ -74,3 +74,47 @@ alternating every step, pinned 3, pinned 5, and adaptive. All matched.
 
 **Not measured:** thinking-mode traces (the policy should keep them at 3 if they accept like
 prose), long contexts, and requests that switch between code and prose several times.
+
+## Idea, not built: per-step depth from the DSpark confidence head (2026-09-29)
+
+DSpark has a confidence head that predicts the conditional acceptance of each draft position
+(V4.1 tech report 2.4.3; DeepSeek's scheduler turns it into a per-step verify length).
+TensorFold's CUDA engine does the same for Qwen3.8 Flash Next's MTP head (`--mtp-confidence`,
+default 0.30). This engine chooses depth per request only, so the question was whether the head
+is good enough to choose it per step.
+
+`DSV41_SPEC_CONF=1` (off by default) makes the draft graph compute the head's logits and
+records `(depth, leading accepts, logits[5])` per step in `last_stats["spec_conf"]`. It is
+observation only: nothing reads it back, and it adds no collective. Collect with
+`tools/bench_spec_conf_tp.py` (verification pinned at depth 5, so no draft's outcome is hidden),
+then replay the policies with `tools/analyze_spec_conf.py`. Data: `results/spec-conf-on/`,
+image `e47eb4e9152b`.
+
+The head is informative. Its rank AUC against the real conditional acceptance is 0.86-0.97 on
+code and 0.61-0.84 on prose. Replaying the logged steps with fixed step costs of 88/106/124 ms
+for depths 1/3/5 gives these gains over the better fixed depth per workload. They are rates of
+a model, not engine measurements:
+
+| Workload (steps) | Confidence rule, depths 3/5 | Confidence rule, depths 1/3/5 | Perfect predictor, 1/3/5 |
+| --- | ---: | ---: | ---: |
+| python (99) | +0.6% | +0.7% | +4.8% |
+| html (106) | +2.9% | +3.6% | +6.9% |
+| explain (221) | +1.0% | +3.2% | +15% |
+| story (245) | -0.1% | +5.5% | +17% |
+| story, temperature 0.7 (253) | +0.3% | +8.5% | +18% |
+| prose with code (181) | +5.1% | +6.0% | +19% |
+
+- With the existing 3/5 graphs, the gain is too small to pay for the extra collective a
+  per-step width needs. Today rank 0 broadcasts depth before drafting; a confidence-based depth
+  is only known after it.
+- Most of the value needs depth 1, which means width-2 graphs as well. The confidence rule gets
+  about a third of the perfect-predictor ceiling on prose. Tuning a logit offset on the same
+  data barely helps, so the head's ranking accuracy is the limit, not its calibration.
+- Reading the logits costs no extra wait: the host already waits for the draft graph at the
+  n-gram hash D2H.
+- Greedy and seeded sampled output were token-identical with the flag on and off, and on both
+  ranks. The on/off decode rates differed by 5-16% in the flag-on run's favour on all six
+  prompts. That is run-to-run variation, not an effect of the flag, so its overhead remains
+  unmeasured.
+- One prompt per workload. A prototype still has to beat adaptive depth in alternating
+  full-engine runs, net of the per-step broadcast.

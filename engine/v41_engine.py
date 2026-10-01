@@ -517,12 +517,16 @@ class V41Engine:
             self.batched_verify_source = source_digest()
             log("DSV41_BATCHED_VERIFY=1: batched sampled verifier (different RNG sequence)")
         self.fp4_cuda_relaxed = False
+        self.fp4_cuda_v2 = False
         self.fp4_cuda_source = None
         if self.fp4_cuda and self.fp4_dot_scaled:
             raise ValueError("DSV41_FP4_CUDA and DSV41_FP4_DOT_SCALED are separate arithmetic arms")
         if self.fp4_cuda:
             import fp4_moe_cuda as native_fp4
             self.fp4_cuda_relaxed = native_fp4.RELAXED_REDUCE
+            # v2 replays the relaxed reduction; with DSV41_FP4_CUDA_RELAXED=0 v1 keeps serving.
+            self.fp4_cuda_v2 = native_fp4.V2 and native_fp4.RELAXED_REDUCE
+            native_fp4.V2 = self.fp4_cuda_v2
             self.fp4_cuda_source = native_fp4.source_digest()
             log(f"DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode "
                 f"(relaxed reduction={self.fp4_cuda_relaxed})")
@@ -884,6 +888,7 @@ class V41Engine:
                 "fp4_dot_scaled": self.fp4_dot_scaled,
                 "fp4_cuda": self.fp4_cuda,
                 "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
+                "fp4_cuda_v2": self.fp4_cuda_v2,
                 "fp4_cuda_source": self.fp4_cuda_source,
                 "batched_verify": self.batched_verify,
                 "batched_verify_source": self.batched_verify_source,
@@ -906,6 +911,8 @@ class V41Engine:
                 "decode_lean": os.environ.get("DSV41_DECODE_LEAN", "1") == "1",
                 "decode_lean_rope": os.environ.get("DSV41_DECODE_LEAN_ROPE", "1") == "1",
                 "decode_lean_softmax": os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1",
+                "decode_lean_moe": os.environ.get("DSV41_DECODE_LEAN_MOE", "1") == "1",
+                "decode_lean_attn": os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1",
                 "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
                 "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
                 "moe_fallback": self.kernel == "dequant-fallback",
@@ -1366,6 +1373,7 @@ class V41Engine:
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
+                "spec_conf": _st.get("conf"),
                 "spec_depth": (self.depth_policy.report() if getattr(self, "depth_policy", None) is not None
                                else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
@@ -2068,6 +2076,10 @@ class V41Engine:
         n_out = 1
         pos = P  # position of `tok` (not yet forwarded)
         accepted_hist = []
+        # DSV41_SPEC_CONF=1: per step (verified depth, leading accepts, confidence logits [T_DRAFT]).
+        # Rank-local observation; it never feeds back into the step, so the ranks cannot diverge on it.
+        from engine.fastdecode import SPEC_CONF
+        conf_hist = [] if (SPEC_CONF and self.spec and self.fast is not None) else None
         ph = StepPhases() if STEP_TIMING else None
         if self.fast is not None:
             # the engram row wait and the graph queueing both live inside the "step" phase; record
@@ -2075,7 +2087,8 @@ class V41Engine:
             # it is a dict of four floats, and decode_accounting below needs it to say anything
             # true about the graphed path, which is where all of decode's time actually goes.
             out_st["fd0"] = dict(self.fast.stats)
-        out_st.update(n_out=1, steps=0, accepted=accepted_hist, t_decode0=time.perf_counter(), phases=ph)
+        out_st.update(n_out=1, steps=0, accepted=accepted_hist, conf=conf_hist, t_decode0=time.perf_counter(),
+                      phases=ph)
         steps = 0
         # The gate cannot be constraining anything yet (it engages on a marker that takes several
         # tokens to write), but it has to see every settled token to stay in step with the stream.
@@ -2224,6 +2237,8 @@ class V41Engine:
                     if ph is not None:
                         ph.mark("rollback")
                     accepted_hist.append(a)
+                    if conf_hist is not None:
+                        conf_hist.append((depth, a, self.fast.d_conf.tolist()))
                     emitted = list(new)
                     if bonus is not None:
                         emitted.append(bonus)
@@ -2305,6 +2320,8 @@ class V41Engine:
                 if ph is not None:
                     ph.mark("rollback")
                 accepted_hist.append(a)
+                if conf_hist is not None:
+                    conf_hist.append((depth, a, self.fast.d_conf.tolist()))
                 emitted = list(new)
                 if bonus is not None:
                     emitted.append(bonus)
@@ -2406,6 +2423,7 @@ class V41Engine:
             "fp4_dot_scaled": self.fp4_dot_scaled,
             "fp4_cuda": self.fp4_cuda,
             "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
+            "fp4_cuda_v2": self.fp4_cuda_v2,
             "fp4_cuda_source": self.fp4_cuda_source,
             "batched_verify": self.batched_verify,
             "batched_verify_source": self.batched_verify_source,

@@ -60,8 +60,11 @@ def main():
         _, ids[name], _, _ = build_chat_prompt({'messages': [{'role': 'user', 'content': prompt}]},
                                                enc, tok, False, 75, e)
     report = dict(config=e.config(), max_tokens=args.max_tokens, runs={})
+    fd = e.fast
     for p in range(2):
         for name, _ in greedy:
+            if fd.rs_uniq is not None:
+                fd.route_stats_reset()  # DSV41_ROUTE_STATS=1: distinct routed experts per layer
             out = []
             for burst in e.generate(ids[name], max_tokens=args.max_tokens, temperature=0,
                                     seed=42, stop_token_ids={eos}):
@@ -70,19 +73,23 @@ def main():
             item = dict(sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest(), tokens=out,
                         completion_tokens=len(out), decode_tok_s=st.get('decode_tok_s'),
                         steps=st.get('steps'), accept_len_mean=st.get('accept_len_mean'),
-                        ms_per_step=1000 * st['decode_s'] / st['steps'] if st.get('steps') else None)
+                        ms_per_step=1000 * st['decode_s'] / st['steps'] if st.get('steps') else None,
+                        route_stats=fd.route_stats_report() if fd.rs_uniq is not None else None)
             if p:
                 item['repeat_exact'] = report['runs'][name]['sha256'] == item['sha256']
             report['runs'][name] = item
             print('DECODE_KERNELS_RUN ' + json.dumps(dict(rank=e.ep.rank, workload=name, measured=bool(p),
-                  **{k: v for k, v in item.items() if k != 'tokens'})), flush=True)
+                  **{k: v for k, v in item.items() if k not in ('tokens', 'route_stats')})), flush=True)
+            if item['route_stats']:
+                rs = item['route_stats']
+                print('DECODE_ROUTE_STATS ' + json.dumps(dict(rank=e.ep.rank, workload=name, steps=rs['steps'],
+                      mean=round(rs['mean'], 2), per_layer=rs['per_layer'])), flush=True)
 
     gen = e.generate(ids['python'], max_tokens=args.max_tokens, temperature=0, seed=42,
                      stop_token_ids={eos})
     got = 0
     while got < args.warmup_tokens:
         got += len(next(gen))
-    fd = e.fast
     steps0 = fd.stats['steps']
     prof = profile(activities=[ProfilerActivity.CUDA], record_shapes=False, with_stack=False)
     prof.start()

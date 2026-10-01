@@ -36,11 +36,20 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 @triton.jit
 def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constexpr,
-                    X2=None, ADD2: tl.constexpr = False):
+                    X2=None, ADD2: tl.constexpr = False, SPLIT_W: tl.constexpr = 0, NT=0,
+                    ROUND: tl.constexpr = False):
     t = tl.program_id(0)
     db = tl.program_id(1) * BD + tl.arange(0, BD)
     m = db < D
-    x = tl.load(X + t * D + db, mask=m, other=0.0).to(tl.float32)          # [BD]
+    if SPLIT_W > 0:
+        # x as all_gather_into_tensor left it: [world, NT, SPLIT_W], column block r from rank r
+        x = tl.load(X + (db // SPLIT_W) * (NT * SPLIT_W) + t * SPLIT_W + db % SPLIT_W,
+                    mask=m, other=0.0).to(tl.float32)
+    else:
+        x = tl.load(X + t * D + db, mask=m, other=0.0).to(tl.float32)      # [BD]
+    if ROUND:
+        # an fp32 sublayer output rounded to bf16 first, as `.to(bf16)` before hc_post would
+        x = x.to(tl.bfloat16).to(tl.float32)
     if ADD2:
         # the decode layer's `(routed_fp32 + shared_bf16.float()).to(bf16)`, then as above
         x2 = tl.load(X2 + t * D + db, mask=m, other=0.0).to(tl.float32)
@@ -62,17 +71,27 @@ def _hc_post_kernel(X, RES, POST, COMB, OUT, D, HC: tl.constexpr, BD: tl.constex
 
 
 def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
-            out: torch.Tensor | None = None, x2: torch.Tensor | None = None):
+            out: torch.Tensor | None = None, x2: torch.Tensor | None = None, split_w: int = 0):
     """x [T, D] -> out [T, HC, D]; residual [T, HC, D], post [T, HC], comb [T, HC, HC].
 
     `out` may be `residual` itself: a program reads every residual stream of its (token, d-block)
     tile before it writes that same tile, and touches no other tile.
-    `x2`: with an fp32 `x`, the sublayer output is `(x + x2.float()).to(bf16)`, formed in-kernel."""
+    `x2`: with an fp32 `x`, the sublayer output is `(x + x2.float()).to(bf16)`, formed in-kernel.
+    `split_w`: x is fp32 [world, T, split_w] straight from an all-gather of column blocks; it is read
+    in that layout and rounded to bf16, i.e. hc_post(x.view(...).transpose(0, 1).reshape(T, D)
+    .to(bf16), ...) without the reorder copy or the cast."""
     T, HC, D = residual.shape
     if out is None:
         out = torch.empty(T, HC, D, dtype=torch.bfloat16, device=x.device)
     assert out.shape == (T, HC, D) and out.dtype == torch.bfloat16 and out.is_contiguous()
     BD = 1024
+    if split_w:
+        assert x2 is None and x.dtype == torch.float32 and x.is_contiguous() and D % split_w == 0
+        assert x.numel() == T * D
+        _hc_post_kernel[(T, triton.cdiv(D, BD))](
+            x, residual.contiguous(), post.contiguous().float(), comb.contiguous().float(),
+            out, D, HC=HC, BD=BD, SPLIT_W=split_w, NT=T, ROUND=True, num_warps=4)
+        return out
     if x2 is not None:
         assert x.dtype == torch.float32 and x2.shape == x.shape and x2.is_contiguous()
         _hc_post_kernel[(T, triton.cdiv(D, BD))](

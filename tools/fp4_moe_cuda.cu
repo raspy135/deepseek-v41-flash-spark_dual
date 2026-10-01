@@ -274,6 +274,212 @@ __global__ void moe_down_bm16(
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// v2: the same arithmetic as moe_up_bm16 / moe_down_bm16 with FP4_RELAXED_REDUCE=1, re-laid out for
+// memory-level parallelism. v1 gives each lane 2 bytes of a 64-byte warp tile per K step and walks
+// the row once per routed pair; v2 gives each lane whole 32-value scale groups (one 16-byte load per
+// matrix), keeps the row in registers across the pairs, and replays v1's reduction exactly:
+//   per group:   8 "virtual lane" partials s_l = fma(x2,w2,fma(x0,w0,0)) + fma(x3,w3,fma(x1,w1,0)),
+//                tree ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)) as subgroup8_sum left it, times the scale;
+//   per row:     subgroup i's running sum over K steps q = 0..: G_i += P[4q + i], in q order,
+//                then ((G0 + G1) + G2) + G3 as ordered_quad_sum.
+// The running sums need their q order, so the group partials go through shared memory and four
+// lanes per matrix replay the chains. FP4_V2_FMA_SCALE selects how v1's `p *= scale; acc += p`
+// compiled (plain or contracted into one fma); the unit test finds which one v1 is.
+#ifndef FP4_V2_FMA_SCALE
+#define FP4_V2_FMA_SCALE 0
+#endif
+constexpr int kV2MaxGroups = 160;  // k <= 5120
+
+__device__ __forceinline__ void load_activation32(const __nv_bfloat16 *p, float *xv) {
+    // 32 consecutive BF16 activations with v1's load_activation4 conversion (BF16 -> FP16 -> FP32).
+    const uint4 *q = reinterpret_cast<const uint4 *>(p);
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const uint4 v = q[c];
+        const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            xv[c * 8 + w * 2] = __half2float(__float2half_rn(
+                __bfloat162float(__ushort_as_bfloat16(words[w] & 0xffff))));
+            xv[c * 8 + w * 2 + 1] = __half2float(__float2half_rn(
+                __bfloat162float(__ushort_as_bfloat16(words[w] >> 16))));
+        }
+    }
+}
+
+__device__ __forceinline__ float group_partial(const uint4 packed, const float *xv) {
+    // v1's per-K-step lane work for the 8 lanes of one scale subgroup, and its subgroup8_sum tree.
+    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    float s[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t two = (words[l >> 1] >> ((l & 1) * 16)) & 0xffff;
+        float we0, wo0, we1, wo1;
+        decode_e2m1x2(static_cast<uint8_t>(two), we0, wo0);
+        decode_e2m1x2(static_cast<uint8_t>(two >> 8), we1, wo1);
+        float pe = 0.0f, po = 0.0f;
+        pe = fmaf(xv[4 * l + 0], we0, pe); pe = fmaf(xv[4 * l + 2], we1, pe);
+        po = fmaf(xv[4 * l + 1], wo0, po); po = fmaf(xv[4 * l + 3], wo1, po);
+        s[l] = pe + po;
+    }
+    return ((s[0] + s[4]) + (s[2] + s[6])) + ((s[1] + s[5]) + (s[3] + s[7]));
+}
+
+__device__ __forceinline__ float ordered_chain(const float *part, const float *scale, int groups, int i) {
+    // Subgroup i's running sum of v1: acc starts at 0 and adds group 4q + i for q = 0, 1, ...
+    float acc = 0.0f;
+    for (int g = i; g < groups; g += 4) {
+#if FP4_V2_FMA_SCALE
+        acc = fmaf(part[g], scale[g], acc);
+#else
+        acc += part[g] * scale[g];
+#endif
+    }
+    return acc;
+}
+
+__global__ void moe_up_bm16_v2(
+    const __nv_bfloat16 *__restrict__ x,
+    const uint8_t *__restrict__ w1, const uint8_t *__restrict__ s1,
+    const uint8_t *__restrict__ w3, const uint8_t *__restrict__ s3,
+    __nv_bfloat16 *__restrict__ h, const float *__restrict__ route_weight,
+    const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
+    int64_t stride_x, int64_t stride_h, float limit,
+    int topk, int n, int k, int null_slot) {
+    constexpr int kPerLane = kV2MaxGroups / 32;
+    __shared__ float part_s[kWarps][2][kV2MaxGroups];
+    __shared__ float scale_s[kWarps][2][kV2MaxGroups];
+    __shared__ float chain_s[kWarps][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0 || slot_i == null_slot) return;
+    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    if (out_n >= n) return;
+    const int groups = k >> 5;
+    const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+    const uint8_t *w1_row = w1 + row * (k >> 1);
+    const uint8_t *w3_row = w3 + row * (k >> 1);
+    // The whole row, loaded once: this lane's groups g = lane + 32 r.
+    uint4 p1[kPerLane], p3[kPerLane];
+#pragma unroll
+    for (int r = 0; r < kPerLane; ++r) {
+        const int g = lane + 32 * r;
+        if (g < groups) {
+            p1[r] = reinterpret_cast<const uint4 *>(w1_row)[g];
+            p3[r] = reinterpret_cast<const uint4 *>(w3_row)[g];
+            scale_s[warp][0][g] = ue8m0(s1[row * groups + g]);
+            scale_s[warp][1][g] = ue8m0(s3[row * groups + g]);
+        }
+    }
+    for (int m = 0; m < kBlockM; ++m) {
+        const int route = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+        if (route < 0) break;
+        const int pair = route & 0xffff;
+        const __nv_bfloat16 *x_row = x + static_cast<int64_t>(route >> 16) * stride_x;
+#pragma unroll
+        for (int r = 0; r < kPerLane; ++r) {
+            const int g = lane + 32 * r;
+            if (g < groups) {
+                float xv[32];
+                load_activation32(x_row + g * 32, xv);
+                part_s[warp][0][g] = group_partial(p1[r], xv);
+                part_s[warp][1][g] = group_partial(p3[r], xv);
+            }
+        }
+        __syncwarp();
+        if (lane < 8) chain_s[warp][lane] = ordered_chain(part_s[warp][lane >> 2], scale_s[warp][lane >> 2],
+                                                          groups, lane & 3);
+        __syncwarp();
+        if (lane == 0) {
+            const float *c = chain_s[warp];
+            const float gate = ((c[0] + c[1]) + c[2]) + c[3];
+            const float up = ((c[4] + c[5]) + c[6]) + c[7];
+            float g = __bfloat162float(__float2bfloat16_rn(gate));
+            float u = __bfloat162float(__float2bfloat16_rn(up));
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+            const float silu = silu_like_triton(g);
+            const float value = silu * u * route_weight[pair];
+            h[static_cast<int64_t>(pair) * stride_h + out_n] = __float2bfloat16_rn(value);
+        }
+        __syncwarp();
+    }
+}
+
+__global__ void moe_down_bm16_v2(
+    const __nv_bfloat16 *__restrict__ h,
+    const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
+    float *__restrict__ y, const int32_t *__restrict__ block_slot,
+    const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    constexpr int kPerLane = kV2MaxGroups / 32;
+    __shared__ float part_s[kWarps][kV2MaxGroups];
+    __shared__ float scale_s[kWarps][kV2MaxGroups];
+    __shared__ float chain_s[kWarps][4];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0) return;
+    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    if (out_n >= n) return;
+    const int groups = k >> 5;
+    const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+    const bool real = slot_i != null_slot;
+    uint4 pw[kPerLane];
+    if (real) {
+        const uint8_t *w2_row = w2 + row * (k >> 1);
+#pragma unroll
+        for (int r = 0; r < kPerLane; ++r) {
+            const int g = lane + 32 * r;
+            if (g < groups) {
+                pw[r] = reinterpret_cast<const uint4 *>(w2_row)[g];
+                scale_s[warp][g] = ue8m0(s2[row * groups + g]);
+            }
+        }
+    }
+    for (int m = 0; m < kBlockM; ++m) {
+        const int pair = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+        if (pair < 0) break;
+        float acc = 0.0f;
+        if (real) {
+            const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pair) * stride_h;
+#pragma unroll
+            for (int r = 0; r < kPerLane; ++r) {
+                const int g = lane + 32 * r;
+                if (g < groups) {
+                    float xv[32];
+                    load_activation32(h_row + g * 32, xv);
+                    part_s[warp][g] = group_partial(pw[r], xv);
+                }
+            }
+            __syncwarp();
+            if (lane < 4) chain_s[warp][lane] = ordered_chain(part_s[warp], scale_s[warp], groups, lane);
+            __syncwarp();
+            const float *c = chain_s[warp];
+            acc = ((c[0] + c[1]) + c[2]) + c[3];
+        }
+        if (lane == 0) {
+            const int local_n = n / parts_world;
+            const int token = pair / topk;
+            const int expert_k = pair % topk;
+            const int64_t out_row = static_cast<int64_t>(expert_k) * ntok + token;
+            int64_t offset;
+            if (parts_world > 1) {
+                offset = ((out_n / local_n) * static_cast<int64_t>(topk * ntok) + out_row)
+                         * local_n + out_n % local_n;
+            } else {
+                offset = out_row * stride_y + out_n;
+            }
+            float value = slot_i == null_slot ? 0.0f : acc;
+            if (!partial) value = __bfloat162float(__float2bfloat16_rn(value));
+            y[offset] = value;
+        }
+        __syncwarp();
+    }
+}
+
 __global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
                                  int32_t *block_pair, int32_t *block_route,
                                  int pairs, int topk) {
@@ -353,6 +559,37 @@ extern "C" int fp4_moe_cuda_down(
     int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
     dim3 grid(nb, (n + kRowsPerBlock - 1) >> kRowsPerBlockShift);
     moe_down_bm16<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
+        static_cast<const uint8_t *>(s2), static_cast<float *>(y),
+        static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_up_v2(
+    void *stream, const void *x, const void *w1, const void *s1, const void *w3, const void *s3,
+    void *h, const void *route_weight, const void *block_slot, const void *block_pair,
+    int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
+    int null_slot) {
+    if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+    moe_up_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
+        static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
+        static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
+        static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),
+        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k,
+        null_slot);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_down_v2(
+    void *stream, const void *h, const void *w2, const void *s2, void *y,
+    const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
+    if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+    moe_down_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),

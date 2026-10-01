@@ -94,7 +94,8 @@ def _swiglu_kernel(GU, H, N, LIMIT, BN: tl.constexpr, CLAMP: tl.constexpr):
 
 @triton.jit
 def _rope_kernel(X, F, OUT, H, D: tl.constexpr, RD: tl.constexpr, BD: tl.constexpr,
-                 CONJ: tl.constexpr, RE: tl.constexpr, IM: tl.constexpr):
+                 CONJ: tl.constexpr, RE: tl.constexpr, IM: tl.constexpr,
+                 IN_F32: tl.constexpr = False, OUT_F32: tl.constexpr = False):
     """One row of cat([x[:D-RD], rotate(x[D-RD:])]) as v41_ref.apply_rotary makes it: fp32 pairs
     times the complex factor, rounded to bf16. RE / IM pick the multiply's FMA contraction
     (0: none, 1: fma on the first product, 2: fma on the second) -- whichever reproduces torch's
@@ -103,11 +104,16 @@ def _rope_kernel(X, F, OUT, H, D: tl.constexpr, RD: tl.constexpr, BD: tl.constex
     t = row // H
     d = tl.arange(0, BD)
     keep = d < D - RD
-    x = tl.load(X + row * D + d, mask=keep, other=0.0)
-    tl.store(OUT + row * D + d, x, mask=keep)
+    # IN_F32: x is an fp32 tensor that the torch spelling rounds to bf16 before rotating.
+    # OUT_F32: store the bf16 result widened to fp32 (what `.float()` of it would give).
+    x = tl.load(X + row * D + d, mask=keep, other=0.0).to(tl.bfloat16)
+    if OUT_F32:
+        tl.store(OUT + row * D + d, x.to(tl.float32), mask=keep)
+    else:
+        tl.store(OUT + row * D + d, x, mask=keep)
     i = tl.arange(0, RD // 2)
-    a = tl.load(X + row * D + (D - RD) + 2 * i).to(tl.float32)
-    b = tl.load(X + row * D + (D - RD) + 2 * i + 1).to(tl.float32)
+    a = tl.load(X + row * D + (D - RD) + 2 * i).to(tl.bfloat16).to(tl.float32)
+    b = tl.load(X + row * D + (D - RD) + 2 * i + 1).to(tl.bfloat16).to(tl.float32)
     c = tl.load(F + t * RD + 2 * i)
     dd = tl.load(F + t * RD + 2 * i + 1)
     if CONJ:
@@ -124,8 +130,13 @@ def _rope_kernel(X, F, OUT, H, D: tl.constexpr, RD: tl.constexpr, BD: tl.constex
         im = tl.fma(a, dd, b * c)
     else:
         im = tl.fma(b, c, a * dd)
-    tl.store(OUT + row * D + (D - RD) + 2 * i, re.to(tl.bfloat16))
-    tl.store(OUT + row * D + (D - RD) + 2 * i + 1, im.to(tl.bfloat16))
+    re = re.to(tl.bfloat16)
+    im = im.to(tl.bfloat16)
+    if OUT_F32:
+        re = re.to(tl.float32)
+        im = im.to(tl.float32)
+    tl.store(OUT + row * D + (D - RD) + 2 * i, re)
+    tl.store(OUT + row * D + (D - RD) + 2 * i + 1, im)
 
 
 @triton.jit
@@ -188,6 +199,64 @@ def _softmax_post_kernel(P, PSUM, MX, SINK, OUT, H, N, BN: tl.constexpr):
     tl.store(OUT + row * N + n, libdevice.div_rn(p, denom), mask=m)
 
 
+@triton.jit
+def _route_prep_kernel(IDX, LUT, SLOTS, ROUTE, P, NULL, PB: tl.constexpr):
+    """slots = lut[idx] (int32), and the routing keys moe_forward's split_decode_null path makes:
+    route = slots, except a null-slot pair gets the unique key null + 1 + pair."""
+    p = tl.arange(0, PB)
+    m = p < P
+    s = tl.load(LUT + tl.load(IDX + p, mask=m, other=0), mask=m, other=0)
+    tl.store(SLOTS + p, s, mask=m)
+    tl.store(ROUTE + p, tl.where(s == NULL, NULL + 1 + p, s), mask=m)
+
+
+@triton.jit
+def _block_null_kernel(BS, NB, NULL, NBB: tl.constexpr):
+    """block_slot = where(block_slot > null, null, block_slot), in place."""
+    b = tl.arange(0, NBB)
+    m = b < NB
+    v = tl.load(BS + b, mask=m, other=0)
+    tl.store(BS + b, tl.where(v > NULL, NULL, v), mask=m)
+
+
+@triton.jit
+def _ring_gather_f32_kernel(RING, SLOT, OUT, N1, NTOT, D: tl.constexpr):
+    """out[t, n, :] = ring[slot[t, n], :].float() for n < N1, in a [T, NTOT, D] fp32 buffer."""
+    r = tl.program_id(0)
+    t = r // N1
+    n = r % N1
+    d = tl.arange(0, D)
+    src = tl.load(SLOT + r)
+    tl.store(OUT + (t * NTOT + n) * D + d, tl.load(RING + src * D + d).to(tl.float32))
+
+
+@triton.jit
+def _packed_gather_f32_kernel(Cache, Ids, Out, N, N2, N1, NTOT, D: tl.constexpr,
+                              STRIDE: tl.constexpr, BLOCK: tl.constexpr):
+    """engine/packed_kv._gather with fp32 output rows placed at out[t, N1 + j, :] of a
+    [T, NTOT, D] buffer (row = t * N2 + j). The value is built exactly as there -- magnitude times
+    the e4m3 scale, rounded to bf16, sign set on the bf16 bits -- and then widened."""
+    group = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, col = group // (D // 16), group % (D // 16)
+    idx = tl.load(Ids + row, row < N, 0)
+    word = tl.load(Cache + idx * STRIDE + col, row < N, 0).to(tl.uint64)
+    j = tl.arange(0, 16)
+    code = ((word[:, None] >> (j[None, :] * 4)) & 15).to(tl.int32)
+    mag = code & 7
+    value = tl.where(mag < 2, mag * .5,
+                    tl.where(mag < 4, mag * .5,
+                             tl.where(mag < 6, mag - 2., 2. * mag - 8.)))
+    sw = tl.load(Cache + idx * STRIDE + D // 16 + col // 8, row < N, 0).to(tl.uint64)
+    sb = ((sw >> ((col % 8) * 8)) & 255).to(tl.uint8)
+    scale = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    bits = (value * scale[:, None]).to(tl.bfloat16).to(tl.uint16, bitcast=True)
+    bits = bits | ((code >= 8).to(tl.uint16) << 15)
+    v = bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+    t = row // N2
+    dst = (t * NTOT + N1 + row % N2) * D + col * 16
+    tl.store(Out + dst[:, None] + j[None, :], v, row[:, None] < N)
+
+
 # The FMA contraction of torch's complex multiply (c10::complex<float> operator* as nvcc compiled
 # it in this torch build): re = fma(a, c, -(b*d)), im = fma(b, c, a*d). Measured on 4.2M fp32
 # products, 0 mismatches; every other pairing mismatches 24-33 % of them
@@ -246,30 +315,35 @@ class LeanOps:
             OUT_BF16=x.dtype == torch.bfloat16, num_warps=4, enable_fp_fusion=False, enable_reflect_ftz=False)
         return out
 
-    def swiglu(self, gu, n: int, limit: float):
+    def swiglu(self, gu, n: int, limit: float, out=None):
         """The elementwise middle of v41_ref.expert_ffn with a merged w1||w3 output `gu` [T, 2n]
-        bf16: 1 launch instead of 7."""
+        bf16: 1 launch instead of 7. `out`: a contiguous bf16 [T, n] to write into."""
         T = gu.numel() // gu.shape[-1]
         assert gu.dtype == torch.bfloat16 and gu.shape[-1] == 2 * n and gu.is_contiguous()
-        h = torch.empty(*gu.shape[:-1], n, dtype=torch.bfloat16, device=gu.device)
+        h = torch.empty(*gu.shape[:-1], n, dtype=torch.bfloat16, device=gu.device) if out is None else out
+        assert h.is_contiguous() and h.numel() == T * n
         BN = 1024
         _swiglu_kernel[(T, triton.cdiv(n, BN))](gu, h, n, float(limit), BN=BN, CLAMP=limit > 0,
                                                 num_warps=4, enable_fp_fusion=False, enable_reflect_ftz=False)
         return h
 
-    def rope(self, x, fq, rd: int, inverse: bool = False, re: int | None = None, im: int | None = None):
-        """torch.cat([x[..., :-rd], v41_ref.apply_rotary(x[..., -rd:], fq, inverse)], -1) for a
-        contiguous bf16 x of shape [T, D] or [T, H, D] and fq complex64 [T, rd/2]: 1 launch."""
-        assert x.dtype == torch.bfloat16 and fq.dtype == torch.complex64
+    def rope(self, x, fq, rd: int, inverse: bool = False, re: int | None = None, im: int | None = None,
+             out_f32: bool = False):
+        """torch.cat([x[..., :-rd], v41_ref.apply_rotary(x[..., -rd:], fq, inverse)], -1) for x of
+        shape [T, D] or [T, H, D] and fq complex64 [T, rd/2]: 1 launch. An fp32 x is rounded to
+        bf16 first (the torch spelling's `.to(bf16)` before it); `out_f32` returns the bf16
+        result as fp32 (its `.float()` after it)."""
+        assert x.dtype in (torch.bfloat16, torch.float32) and fq.dtype == torch.complex64
         x = x.contiguous()
         D = x.shape[-1]
         T = x.shape[0]
         H = x.numel() // (T * D)
         f = torch.view_as_real(fq.contiguous())
         assert f.shape == (T, rd // 2, 2), (f.shape, T, rd)
-        out = torch.empty_like(x)
+        out = torch.empty(x.shape, dtype=torch.float32 if out_f32 else torch.bfloat16, device=x.device)
         _rope_kernel[(T * H,)](x, f, out, H, D=D, RD=rd, BD=triton.next_power_of_2(D), CONJ=inverse,
                                RE=ROPE_RE if re is None else re, IM=ROPE_IM if im is None else im,
+                               IN_F32=x.dtype == torch.float32, OUT_F32=out_f32,
                                num_warps=4, enable_fp_fusion=False, enable_reflect_ftz=False)
         return out
 
@@ -321,6 +395,41 @@ class LeanOps:
         out = torch.empty_like(p)
         _softmax_post_kernel[(T * H,)](p, psum, mx, sink, out, H, N, BN=BN, num_warps=4,
                                        enable_fp_fusion=False, enable_reflect_ftz=False)
+        return out
+
+    def route_prep(self, idx, lut_row, slots_out, null: int):
+        """(slots, route keys) for moe_forward's native decode path; 1 launch instead of ~6."""
+        P = idx.numel()
+        route = torch.empty(P, dtype=torch.int32, device=idx.device)
+        _route_prep_kernel[(1,)](idx, lut_row, slots_out, route, P, int(null),
+                                 PB=triton.next_power_of_2(P), num_warps=1)
+        return route.view(idx.shape)
+
+    def block_null(self, block_slot, null: int):
+        n = block_slot.numel()
+        _block_null_kernel[(1,)](block_slot, n, int(null), NBB=triton.next_power_of_2(n), num_warps=1)
+        return block_slot
+
+    def keys_f32(self, ring, slot_r, cache=None, idx=None):
+        """The fp32 key block of the torch decode attention, [T, N1 (+ N2), D]: window rows
+        ring[slot_r] and (optionally) the compressed rows gather(cache, idx), written in place
+        instead of gathered as bf16, concatenated and converted. 1-2 launches instead of 4."""
+        T, n1 = slot_r.shape
+        D = ring.shape[-1]
+        n2 = 0 if idx is None else idx.shape[1]
+        out = torch.empty(T, n1 + n2, D, dtype=torch.float32, device=ring.device)
+        assert ring.dtype == torch.bfloat16 and ring.is_contiguous() and slot_r.is_contiguous()
+        _ring_gather_f32_kernel[(T * n1,)](ring, slot_r, out, n1, n1 + n2, D=D, num_warps=4)
+        if idx is not None:
+            if cache.dtype == torch.int64:
+                idx = idx.contiguous()
+                d = cache.shape[1] * 128 // 9
+                assert d == D
+                _packed_gather_f32_kernel[(triton.cdiv(idx.numel() * (D // 16), 128),)](
+                    cache, idx, out, idx.numel(), n2, n1, n1 + n2, D=D, STRIDE=cache.shape[1],
+                    BLOCK=128, num_warps=4)
+            else:
+                out[:, n1:].copy_(cache[idx])
         return out
 
     def usable_hc(self, x, hc_fn) -> bool:
