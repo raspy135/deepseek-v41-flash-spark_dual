@@ -258,3 +258,36 @@ in `gotchas.md` (a nesting-depth probe) still applies, so the default stays `off
 - `bench_decode_kernels_tp.py` gained the missing `os.makedirs(args.out, exist_ok=True)`: the gate
   creates `GATE_LOG_DIR` on rank 0 only, so a fresh results directory made rank 1 fail on the final
   write after every measurement had already run.
+
+## The decode all-gather goes over RoCE (`DSV41_COMM_BACKEND=roce`): −5.5 ms/step, bits identical
+
+The step's ~170 decode-sized all-gathers were NCCL. Captured in a CUDA graph on this pair NCCL's
+all-gather costs 44-70 us whatever the payload, because its kernel hands the send to NCCL's network
+proxy thread; tools/bench_roce_gather.py measures a one-shot host-staged RoCE all-gather at 12.7 (16
+KiB) / 15.5 (48 KiB) / 19.9 (96 KiB) us, bits equal. `tools/roce/` is that transport (ported from
+TensorFold 0230 / b12x "RoCEnante", Apache-2.0); engine/comm.py routes a contiguous decode shard of
+at most DSV41_ROCE_MAX_KB through it and everything else through torch.distributed, and comm.check()
+turns a run-time timeout into a diagnosis.
+
+Gate A/B, image 136c549d, off/on arms, all other settings identical (dense_fp4=attn,wo_a, hc_kernel=0,
+draft_head_fmt=off). **Token hashes are identical in every arm** (`bad8285e` html, `91d2b6e0` python,
+`ee1b74b4` explain) -- the transport moves the same bytes:
+
+| arm | html ms/step (tok/s) | python | explain |
+| --- | ---: | ---: | ---: |
+| nccl (2 runs) | 94.6 / 96.3 (46.1) | 96.3 / 96.3 (50.9) | 86.9 / 86.9 (23.3) |
+| roce (2 runs) | 91.7 / 88.1 (48.9) | 93.1 / 88.5 (54.1) | 83.9 / 79.6 (24.8) |
+| roce + `DSV41_L2PF_MB=2` | 89.4 (49.2) | 88.8 (55.3) | 80.6 (25.1) |
+
+- **roce vs nccl: -5.5 ms/step, +6.2 % tok/s** (5.15-5.55 ms across the three workloads), the
+  projection from the microbench.
+- **L2PF on top: another ~0.5-1.1 ms.** `DSV41_L2PF_MB=2` reads the next layer's weights on a side
+  stream during the MoE all-gather; the 2 MB budget is what fits the ~15 us RoCE window
+  (tools/bench_l2_prefetch.py has the rule -- more than the window and the join delays the read).
+  It competes with RoCE for the same window, so it is smaller than it was on NCCL.
+- Results: `results/roce-20261001/`. Off switch: `DSV41_COMM_BACKEND=nccl`.
+
+Two bugs the run found, both in the wiring rather than the transport: the peer's v41_ref.py has to
+carry the boot-guard keys (a stale tree crashes rank 1 on a missing attribute and rank 0 as a
+connection reset, which reads like a fabric failure), and `import roce` resolves `tools/roce/` as a
+namespace package unless `tools/roce` itself is on sys.path.
