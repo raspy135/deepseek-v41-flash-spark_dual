@@ -24,12 +24,19 @@
   main { display: grid; grid-template-columns: 690px 1fr; gap: 56px; padding-top: 50px; }
   h1 { margin: 0; font-size: 92px; line-height: 1.02; letter-spacing: -4.8px; font-weight: 600; }
   h1 span { display: block; color: var(--quiet); font-size: 80px; letter-spacing: -3.8px; margin-top: 4px; }
-  .claim { margin-top: 34px; }
-  .claim .label { font-size: 26px; color: var(--quiet); }
-  h2 { font-size: 64px; line-height: 1.05; letter-spacing: -2.4px; font-weight: 500; margin: 10px 0 16px; }
+  .claim { margin-top: 26px; }
+  .claim .label { font-size: 25px; color: var(--quiet); }
+  h2 { font-size: 58px; line-height: 1.05; letter-spacing: -2.2px; font-weight: 500; margin: 10px 0 14px; }
   /* marker underline: the highlight sits under the text, so the text keeps the left margin */
   h2 b { font-weight: 700; background: linear-gradient(transparent 56%, var(--green) 56%, var(--green) 94%, transparent 94%); }
-  .description { font-size: 34px; line-height: 1.3; margin: 0; color: var(--quiet); }
+  .description { font-size: 30px; line-height: 1.3; margin: 0; color: var(--quiet); }
+
+  .capabilities { display: grid; grid-template-columns: 335px 335px; gap: 16px; margin-top: 22px; }
+  .capability { padding: 14px 18px 15px; border: 2px solid var(--ink); }
+  .capability.native { background: var(--green); border-color: var(--green); }
+  .capability strong { display: block; font-size: 28px; line-height: 1.1; letter-spacing: -1.1px; font-weight: 600; }
+  .capability span { display: block; margin-top: 6px; font-size: 19px; color: var(--quiet);
+                     font-family: 'Courier New', monospace; text-transform: uppercase; letter-spacing: .5px; }
 
   .chart-heading { display: flex; justify-content: space-between; font-size: 27px; color: var(--quiet); margin-bottom: 16px; }
   .panel { border: 2px solid var(--ink); background: var(--panel); padding: 22px 26px 20px; }
@@ -68,7 +75,11 @@
       <div class="claim">
         <div class="label mono">512-token output / TP = 2 / thinking off</div>
         <h2><b>+54% decode.</b><br>Same checkpoint.</h2>
-        <p class="description">8,457 → 3,557 kernels a step, the dense<br>projections in FP4, and the cross-node<br>gather on a one-shot RoCE transport.</p>
+        <p class="description">8,457 → 3,557 kernels a step, dense FP4,<br>and the cross-node gather on one-shot RoCE.</p>
+      </div>
+      <div class="capabilities">
+        <div class="capability native"><strong>Native MXFP4</strong><span>Original checkpoint</span></div>
+        <div class="capability"><strong>Adaptive experts</strong><span>Weights follow demand</span></div>
       </div>
     </section>
 
@@ -91,7 +102,7 @@
   </main>
 
   <footer>
-    <div class="features">Native MXFP4<span>/</span>FP4 dense<span>/</span>RoCE all-gather<span>/</span>OpenAI API</div>
+    <div class="features">Native MXFP4<span>/</span>Adaptive expert loading<span>/</span>RoCE all-gather<span>/</span>OpenAI API</div>
     <div class="stack mono">PyTorch / Triton / CUDA</div>
   </footer>
 </div>
