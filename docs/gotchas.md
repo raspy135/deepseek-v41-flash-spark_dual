@@ -837,10 +837,14 @@ two-node `bench_decode_kernels_tp.py` gate runs, arms alternating, native FP4 ex
 `DSV41_TP_ATTN=1`, draft head off, 256 greedy tokens: `off` python 49.2/48.4 tok/s, `attn,wo_a`
 48.8/48.6, `attn` 49.8, `wo_a` 49.3 -- every arm inside the 8-10% spread, and the profiled
 dense-projection family stayed at ~30 ms/step in all six even though the fp4 weights are half the
-bytes. At M=6 these kernels are latency/launch-bound, not byte-bound, so there is no bandwidth to
-reclaim; the fp8 decode scheduling of 2026-09-23 is the likely reason the 2026-09-11 gain is no
-longer visible, but it was not isolated. Full table: `decode-launches.md`. It also changes tokens,
-so it is cost without benefit and stays off. (`DSV41_DENSE_FP4` could not even load under TP
+bytes. The aggregate hides a bimodal kernel: at M=6 the fp4 kernel reaches 199-217 GB/s on wide-N
+(`wq_b`, `w2`, 1.6x faster) but collapses to 33-67 GB/s on narrow-N (`wkv`, `wq_a`, `w1`) against
+fp8's 120-204 GB/s on the same shapes. That is a parallelism bug -- `BLOCK_N=32` starves `wkv` to 16
+CTAs for 48 SMs and a sweep of block/warps/stages does not fix it -- and the fix is a split-K with a
+fixed-order reduction, which is not built. `attn` is mostly the narrow shapes, so it nets out;
+`wo_a`'s grouped kernel has G=8 for parallelism and is the one real win (~1 ms). Full table and
+bandwidth numbers: `decode-launches.md`. It also changes tokens, so enabling `attn` today is a wash
+that costs quality. (`DSV41_DENSE_FP4` could not even load under TP
 attention before this date -- `FP4Weight` had no `.shard()` and `shard_attention` had no
 `FP4GroupedWeight` branch; both added.)
 

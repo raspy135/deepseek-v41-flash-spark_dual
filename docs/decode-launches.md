@@ -188,13 +188,32 @@ Measured 2026-10-01 on the round-3/v2 build, TP2, native FP4 experts, `DSV41_TP_
 | wo_a | 1 | 49.3 | 103.5 | 43.3 | 22.1 | 30.6 |
 
 Every arm is inside the build's 8-10 % run-to-run spread, and the profiled dense family stays near
-30 ms/step even though the fp4 weights are ~half the bytes. At M=6 these projections are
-latency/launch-bound, not byte-bound, so halving the read does not halve the time -- the same reason
-the dense-TP experiment moved nothing. `docs/gotchas.md` reached the same conclusion on the slower
-pre-round-3 build (attn,wo_a 170.9 vs the fp8-head 171.0 ms/step); the fp8 decode scheduling of
-2026-09-23 is the likely reason the earlier 134.4 -> 125.6 ms gain is no longer visible, but that was
-not isolated here. Dense fp4 also changes tokens (it is a re-quantization), so it is a cost with no
-benefit and stays off.
+30 ms/step even though the fp4 weights are ~half the bytes -- but the aggregate hides a bimodal
+kernel. Achieved bandwidth at M=6 (L2-cold, real weights, `tools/test_fp4_linear.py` method):
+
+| weight | N x K | fp8 GB/s | fp4 GB/s | fp4 time / fp8 |
+| --- | --- | ---: | ---: | ---: |
+| wq_b | 32768x1280 | 224-231 | 199-217 | 0.62 |
+| shared w2 | 5120x2304 | 214-218 | 162-174 | 0.67-0.70 |
+| wo_b | 5120x8192 | 197 | 105-111 | 0.94-1.00 |
+| shared w1 | 2304x5120 | 160-204 | 113 | 0.96 |
+| wq_a | 1280x5120 | 185-190 | 67 | 1.47 |
+| wkv | 512x5120 | 120-131 | 33 | 1.81-2.11 |
+
+The format is fine: on wide N the fp4 kernel reaches 199-217 GB/s against the fp8 kernel's 224-231
+and is 1.6x faster, essentially the 0.53 byte ratio. On narrow N it collapses to 33-67 GB/s against
+fp8's 120-190 on the same shape and bytes. That is a parallelism bug in the fp4 kernel, not a
+property of 4 bits: `BLOCK_N=32` gives `wkv` 16 CTAs for 48 SMs with a 40-iteration serial K loop of
+8 dependent dots each, and a sweep of `BLOCK_N` x `num_warps` x `num_stages` does not lift it (best
+still 35 GB/s for `wkv`, 68 for `wq_a`). `attn` is mostly these narrow shapes, so its wide-N win
+cancels their loss; `wo_a`'s grouped kernel has a G=8 group axis for parallelism, which is why it is
+the one clear win (~1 ms). The fix is a split-K variant with a fixed-order reduction -- named as the
+gap in the 2026-09-11 notes and still not built -- not a different launch config.
+
+The earlier pre-round-3 gain (134.4 -> 125.6 ms step) is therefore not "gone"; it was measured on a
+build whose narrow shapes were equally starved, and the intervening fp8 decode scheduling moved the
+baseline under it. Dense fp4 also changes tokens (it is a re-quantization), so enabling `attn` today
+is a wash that costs quality; `wo_a` alone is the honest subset.
 
 Two notes from the exercise:
 
@@ -203,5 +222,6 @@ Two notes from the exercise:
   `FP4GroupedWeight` branch for `wo_a`. Added (`tools/fp4_linear.py`,
   `engine/tensor_parallel.py`), with a dequant-equals-slice check in `tools/test_fp4_linear.py`.
   The gate arms above load and pass with it.
-- The four small-N decode shapes are the ones that do not pay; a split-K variant with a fixed-order
-  reduction is the change that would move this, and it is not built.
+- The narrow-N shapes are the ones that lose, and it is a missing split-K, not the format: the
+  same kernel reaches 199-217 GB/s on `wq_b`/`w2`. A split-K with a fixed-order reduction is the
+  change that would move this, and it is not built. `wo_a` (grouped, G=8) already works and is ~1 ms.
