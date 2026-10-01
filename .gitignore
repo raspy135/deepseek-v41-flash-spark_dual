@@ -34,3 +34,6 @@ models/
 *.swp
 *.swo
 *~
+
+# torch cpp_extension build cache for tools/roce (host-mounted for fast iteration)
+.roce-ext/

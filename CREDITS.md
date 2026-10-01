@@ -43,6 +43,16 @@ rules (usage-based token counts, fresh verified prompts, label-salted seeds, `ig
 `bench/bench.py` here is an adaptation of that harness, so rows from the two are directly
 comparable.
 
+## The one-shot RoCE all-gather
+
+`tools/roce/` is a port of the RoCE all-gather in **[TensorFold](https://github.com/ashhart/TensorFold)**
+(patch 0230), which in turn adapted **b12x**'s "RoCEnante"
+(https://github.com/local-inference-lab/b12x, `b12x/comm/roce`) — Copyright 2026 Luke Alonso and the
+b12x contributors, and the TensorFold contributors, Apache-2.0. It replaces NCCL for the decode-sized
+all-gathers: on this pair a captured NCCL all-gather costs 44-70 us whatever the payload, and this costs
+12.7-19.9 us with identical bits (`tools/bench_roce_gather.py`). The full notice is in
+`tools/roce/NOTICE`; the only changes are the `GLM53_TF_*` -> `DSV41_*` knobs and the engine integration.
+
 ## The platform and the tools
 
 **NVIDIA** — the DGX Spark / GB10, the CUDA 13 container images, and PyTorch's cu130

@@ -1,0 +1,13 @@
+tools/roce/ is a port of the one-shot RoCE all-gather in TensorFold's patch 0230
+(https://github.com/ashhart/TensorFold), which adapted b12x's "RoCEnante"
+(https://github.com/local-inference-lab/b12x, b12x/comm/roce).
+
+  Copyright 2026 Luke Alonso and the b12x contributors
+  Copyright 2026 the TensorFold contributors
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+Changes from TensorFold's version: environment knobs renamed GLM53_TF_* -> DSV41_*; the extension is named
+dsv41_roce_v1; the GLM-5.3/comm integration is replaced by tools/bench_roce_gather.py and the engine's
+collective path. See tools/bench_roce_gather.py for the two-node NCCL comparison.

@@ -49,6 +49,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #
 # The RDMA userspace stack is what makes the dual-Spark (EP2) mode work:
 #   libibverbs1        the verbs library NCCL dlopens for the IB/RoCE transport
+#   libibverbs-dev      headers + the libibverbs.so symlink, so the one-shot RoCE all-gather
+#                      (tools/roce/) can build its torch extension inside the container
 #   ibverbs-providers  the mlx5 provider -- WITHOUT it verbs opens zero devices and NCCL
 #                      silently falls back to TCP sockets, which is ~30x slower per
 #                      collective (1.9 ms vs 60 us measured) and blows the Gate G0 budget
@@ -60,7 +62,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # time -- see scripts/dual-up.sh for the device and capability flags that expose it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-dev ca-certificates curl procps \
-        libibverbs1 ibverbs-providers librdmacm1 ibverbs-utils iproute2 \
+        libibverbs1 libibverbs-dev ibverbs-providers librdmacm1 ibverbs-utils iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv \
@@ -75,7 +77,8 @@ RUN pip install "torch==${TORCH_VERSION}+cu130" --index-url https://download.pyt
 # Everything else from PyPI. safetensors reads the checkpoint headers (the engine parses
 # the shard headers itself and then reads spans with O_DIRECT); tokenizers/transformers
 # load tokenizer.json; sympy and numpy are used by the reference math in tools/v41_ref.py;
-# huggingface_hub is only for scripts/download-model.sh.
+# huggingface_hub is only for scripts/download-model.sh. ninja builds the RoCE all-gather's
+# torch extension (tools/roce/) at first use inside the container.
 RUN pip install \
         "transformers>=4.57" \
         "tokenizers>=0.21" \
@@ -83,6 +86,7 @@ RUN pip install \
         "numpy>=1.26" \
         "sympy>=1.13" \
         "huggingface_hub>=0.35" \
+        "ninja>=1.11" \
         "Pillow>=10.0"
 
 WORKDIR /app
