@@ -462,15 +462,15 @@ if HC_MM_TILE not in (16, 32):
     raise ValueError("DSV41_HC_MM_TILE must be 16 or 32")
 
 # DSV41_HC_KERNEL: run the Hyper-Connection mix projection on the split-K fp32 kernel
-# (tools/fp32_skinny.py) instead of the padded cuBLAS GEMM. ON by default; DSV41_HC_KERNEL=0 restores
-# padded cuBLAS. It changes the HC arithmetic (~1e-6 relative), so it is a numerics default, not a
-# free speedup: b79092a removed an earlier wiring when it was reached only from the fast path and the
-# graphed verifier stopped reproducing Model.forward. Both call sites now go through
-# hc_kernel_ok()/hc_linear(), so the eager and lean paths switch together. Run the pair A/B and the
-# quality probes before trusting it; ~1.7 ms/step projected cold.
+# (tools/fp32_skinny.py) instead of the padded cuBLAS GEMM. OFF by default; =1 tries it.
+# It is faster per STEP but not per SECOND: the gate A/B (docs/decode-fp32-experiments.md 2026-10-01,
+# results/hc-kernel-b/) has the step 1.9-2.9 ms faster and acceptance 0.07-0.10 tokens/step lower, so
+# tok/s is a wash (explain went backwards) and every workload's tokens change. That is a numerics
+# change (~1e-6), not a speedup, and it is why b79092a removed the earlier wiring. Do not flip this
+# without the pair A/B and the quality probes.
 # DSV41_HC_PREC picks the tl.dot input precision: "ieee" is true fp32 (19.6 us cold), "tf32x3" is
 # the 3-pass tensor-core emulation (13.4 us, ~2.5e-6 vs cuBLAS). See tools/bench_fp32_skinny.py.
-HC_KERNEL = os.environ.get("DSV41_HC_KERNEL", "1") == "1"
+HC_KERNEL = os.environ.get("DSV41_HC_KERNEL", "0") == "1"
 HC_PREC = os.environ.get("DSV41_HC_PREC", "tf32x3")
 try:
     from fp32_skinny import (BLOCK_MP as _SKINNY_MAX_M, skinny_linear as _skinny_linear,
