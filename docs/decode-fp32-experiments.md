@@ -112,3 +112,32 @@ serving dependency and is not copied into the repository or container image.
 The initial microbench attempt omitted cropping padded output columns in its
 comparison and raised a shape error; `decode-fp32-layouts-fixed` is the completed
 run. No serving process was affected.
+
+## 2026-10-01 — the split-K HC kernel is faster per step and not faster per second
+
+`tools/fp32_skinny.py` was wired back in (both HC call sites through `R.hc_linear`, so the eager and
+lean paths cannot diverge -- the b79092a failure), behind `DSV41_HC_KERNEL`, with a `tf32x3` dot.
+Cold microbench (cycle 24 layer weights, or the 1.97 MB weight is L2-resident and reports 8.2 us
+where the engine sees 13.4): padded cuBLAS 32.9 us, skinny ieee 19.6, skinny tf32x3 13.4.
+
+Gate A/B, image `1bb773c8`, dense_fp4=attn,wo_a in both arms, off/on/on/off, greedy 256 tokens:
+
+| workload | HC kernel | ms/step | tok/s | accept | token sha |
+| --- | --- | ---: | ---: | ---: | --- |
+| html | off | 93.6 | 47.0 | 4.41 | `bad8285e` |
+| html | on | 90.7 | 47.7 | 4.32 | `3c24bbca` |
+| python | off | 94.9 | 51.7 | 4.90 | `91d2b6e0` |
+| python | on | 93.0 | 51.8 | 4.83 | `bf2937e0` |
+| explain | off | 85.2 | 23.8 | 2.03 | `ee1b74b4` |
+| explain | on | 83.4 | 23.2 | 1.93 | `801590df` |
+
+**It is faster per step and not faster per second.** The step drops 1.9-2.9 ms (2-3 %, matching the
+cold projection), but acceptance drops 0.07-0.10 tokens/step because the HC projection's ~1e-6
+change moves the trajectory -- both runs of an arm give identical hashes and identical acceptance,
+so it is the kernel, not run noise. tok/s is a wash (html +1.5 %, python +0.1 %, explain -2.4 %),
+and every workload's tokens change. Results: `results/hc-kernel-b/`.
+
+This is the same shape of outcome the 2026-09-11 entry above records for the same kernel. A per-step
+latency win that yields fewer tokens is not a win, and it changes outputs; the default belongs off.
+So this entry is also the answer to the question it looks like it settles: the fp32 block is not a
+place to look for throughput, whatever `DSV41_HC_PREC` is set to.
