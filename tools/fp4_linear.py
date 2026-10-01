@@ -134,6 +134,28 @@ class FP4Weight:
     def dequant(self) -> torch.Tensor:
         return dequant_fp4_packed(self.w, self.s)
 
+    def shard(self, dim: int, rank: int, world: int) -> "FP4Weight":
+        """One rank's slice of this weight, codes and scales included (the TP attention path).
+
+        `dim=0` splits output rows, `dim=1` input columns. The fp4 scales are one per 32 K
+        elements OF A ROW, so a row slice takes the same row range of both tables, and a K slice
+        takes K/2 codes and K/32 scales and only lands on a scale boundary when K/world is a
+        multiple of 32 -- asserted, because a scale group that straddles the split is silently
+        wrong. Same rule as `fp8_linear.FP8Weight.shard`, except the fp8 block table is 32x32 and
+        needs the row index divided by 32."""
+        if world <= 1:
+            return self
+        if dim == 0:
+            n = self.N // world
+            assert self.N % world == 0, (self.N, world)
+            return FP4Weight(self.w[rank * n:(rank + 1) * n].clone(),
+                             self.s[rank * n:(rank + 1) * n].clone(), n, self.K)
+        k = self.K // world
+        assert self.K % world == 0 and k % 32 == 0, (self.K, world)
+        return FP4Weight(self.w[:, rank * (k // 2):(rank + 1) * (k // 2)].contiguous(),
+                         self.s[:, rank * (k // 32):(rank + 1) * (k // 32)].contiguous(),
+                         self.N, k)
+
 
 def _round_e2m1(a: torch.Tensor) -> torch.Tensor:
     """|a| in [0, 6] -> index into FP4_GRID, round-to-nearest with ties to even (= the code whose

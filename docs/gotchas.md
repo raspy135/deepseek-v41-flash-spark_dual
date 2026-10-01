@@ -832,6 +832,18 @@ Two results, both negative:
 The lesson matches the entry above: on this model the levers that move are residency and the expert
 bytes, not the dense ones, and "it looks right" is not the quality these near-tie probes measure.
 
+**Confirmed on the decode-lean build, 2026-10-01, and the speed gap is now completely gone.** Six
+two-node `bench_decode_kernels_tp.py` gate runs, arms alternating, native FP4 experts,
+`DSV41_TP_ATTN=1`, draft head off, 256 greedy tokens: `off` python 49.2/48.4 tok/s, `attn,wo_a`
+48.8/48.6, `attn` 49.8, `wo_a` 49.3 -- every arm inside the 8-10% spread, and the profiled
+dense-projection family stayed at ~30 ms/step in all six even though the fp4 weights are half the
+bytes. At M=6 these kernels are latency/launch-bound, not byte-bound, so there is no bandwidth to
+reclaim; the fp8 decode scheduling of 2026-09-23 is the likely reason the 2026-09-11 gain is no
+longer visible, but it was not isolated. Full table: `decode-launches.md`. It also changes tokens,
+so it is cost without benefit and stays off. (`DSV41_DENSE_FP4` could not even load under TP
+attention before this date -- `FP4Weight` had no `.shard()` and `shard_attention` had no
+`FP4GroupedWeight` branch; both added.)
+
 `dense_fp4` and `head_fmt` are now in the EP2 boot config guard: they are load-time numerics
 choices read from the environment, so a pair split across them would diverge silently.
 

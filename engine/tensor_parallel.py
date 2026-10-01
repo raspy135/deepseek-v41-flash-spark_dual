@@ -87,6 +87,7 @@ class OutputParallelWeight:
 
 def shard_attention(weight, args, rank, world):
     from fp8_linear import FP8GroupedWeight
+    from fp4_linear import FP4GroupedWeight
     if world != 2 or not 0 <= rank < world:
         raise ValueError('attention TP currently requires two ranks')
     if args.n_heads % world or args.o_groups % world:
@@ -100,10 +101,16 @@ def shard_attention(weight, args, rank, world):
         lo, hi = rank * rows, (rank + 1) * rows
         weight.wo_a = FP8GroupedWeight(wo.w[lo:hi].clone(), wo.s[lo//32:hi//32].clone(),
                                       wo.G // world, wo.R)
+    elif isinstance(wo, FP4GroupedWeight):
+        rows = wo.G * wo.R // world
+        lo, hi = rank * rows, (rank + 1) * rows
+        # fp4 scales are one per row, not a 32x32 block, so both tables slice the row range
+        weight.wo_a = FP4GroupedWeight(wo.w[lo:hi].clone(), wo.s[lo:hi].clone(),
+                                      wo.G // world, wo.R, wo.K)
     elif isinstance(wo, torch.Tensor):
         weight.wo_a = shard(wo, 0, rank, world)
     else:
-        raise ValueError('attention TP supports native FP8 or BF16 wo_a only')
+        raise ValueError('attention TP supports native FP8, FP4 or BF16 wo_a only')
     layout = os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output')
     if layout == 'output':
         weight.wo_b = OutputParallelWeight(shard(weight.wo_b, 0, rank, world), world)

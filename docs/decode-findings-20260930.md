@@ -57,7 +57,11 @@ The gap wasn't one thing:
 The step is now set by data moved per step, so further gains mean reading less:
 
 - **Expert data:** the ~46 ms above, set by how many experts each step reads.
-- **FP8 dense weights:** about 30 ms, already near memory speed. Moving to 4-bit is a quality decision.
+- **FP8 dense weights:** about 30 ms. Moving to 4-bit was measured 2026-10-01 and is **not**
+  faster: at M=6 these projections are latency-bound, not byte-bound, and the profiled dense family
+  did not move in any arm. It also changes tokens, so it is cost without benefit; stays off. The
+  table and the one code fix it needed (fp4 `shard()` under TP attention) are in
+  [decode-launches.md](decode-launches.md#dense-fp4-dsv41_dense_fp4-no-decode-gain-on-this-build-null-result).
 - **BF16 LM head:** about 7.7 ms. Giving the draft its own cheaper head saves about 3 ms without
   changing output.
 - **FP32 matmuls and torch attention:** about 10 ms. Speeding these up changes numerics, so it needs

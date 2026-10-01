@@ -57,6 +57,19 @@ def main(names):
               f"({b4/b8:.4f}x)   weight rel err {rel_w:.4f}   per-32-group rel err "
               f"mean {float(g.mean()):.4f} p99 {float(g.quantile(0.99)):.4f} max {float(g.max()):.4f}")
         ref_bf = W4.dequant()
+        # TP attention shard (fp4_linear.FP4Weight.shard): a rank's slice must dequantize to the
+        # matching chunk of the whole weight. fp4 scales are one per 32 K of a row, so a K slice
+        # moves the row and the scale together; fp8's 32x32 block table does not.
+        shard_ok = True
+        for dim in (0, 1):
+            n = W4.N // 2 if dim == 0 else W4.N
+            k = W4.K if dim == 0 else W4.K // 2
+            for r in range(2):
+                sh = W4.shard(dim, r, 2)
+                exp = ref_bf[r * n:(r + 1) * n] if dim == 0 else ref_bf[:, r * k:(r + 1) * k]
+                shard_ok &= torch.equal(sh.dequant(), exp)
+        ok &= shard_ok
+        print(f"  shard dim=0/1 x2 dequant equals the slice: {shard_ok}")
         for M in (1, 6, 16, 64, 2048):
             x = (torch.randn(M, W4.K, device="cuda") * 0.5).to(torch.bfloat16)
             y = fp4_linear(x, W4)

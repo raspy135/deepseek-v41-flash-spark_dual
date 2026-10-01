@@ -171,3 +171,37 @@ up to well under 1 ms per step. The time is elsewhere now (per step, python prom
 routed experts ~50 ms (the native `moe_up`/`moe_down` at an estimated 165-180 GB/s against a
 ~235 GB/s streaming ceiling), dense fp8 projections ~30 ms, fp32 GEMMs ~10 ms (HC, router gate,
 torch attention), the bf16 LM head ~7.7 ms (read twice per step), NCCL ~7.9 ms.
+
+## Dense FP4 (`DSV41_DENSE_FP4`): no decode gain on this build (null result)
+
+Measured 2026-10-01 on the round-3/v2 build, TP2, native FP4 experts, `DSV41_TP_ATTN=1`,
+`DSV41_DRAFT_HEAD_FMT=off` (to isolate the variable), greedy, 256 tokens, arms alternating. Six
+`bench_decode_kernels_tp.py` gate runs:
+
+| dense_fp4 | run | python tok/s | python ms/step | html tok/s | explain tok/s | profiled dense ms/step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | 1 | 49.2 | 101.6 | 44.8 | 22.1 | 29.5 |
+| attn,wo_a | 1 | 48.8 | 102.4 | 45.4 | 22.1 | 30.2 |
+| attn,wo_a | 2 | 48.6 | 102.8 | 45.5 | 22.1 | 29.5 |
+| off | 2 | 48.4 | 103.4 | 43.3 | 21.5 | 30.9 |
+| attn | 1 | 49.8 | 102.4 | 46.0 | 22.3 | 31.1 |
+| wo_a | 1 | 49.3 | 103.5 | 43.3 | 22.1 | 30.6 |
+
+Every arm is inside the build's 8-10 % run-to-run spread, and the profiled dense family stays near
+30 ms/step even though the fp4 weights are ~half the bytes. At M=6 these projections are
+latency/launch-bound, not byte-bound, so halving the read does not halve the time -- the same reason
+the dense-TP experiment moved nothing. `docs/gotchas.md` reached the same conclusion on the slower
+pre-round-3 build (attn,wo_a 170.9 vs the fp8-head 171.0 ms/step); the fp8 decode scheduling of
+2026-09-23 is the likely reason the earlier 134.4 -> 125.6 ms gain is no longer visible, but that was
+not isolated here. Dense fp4 also changes tokens (it is a re-quantization), so it is a cost with no
+benefit and stays off.
+
+Two notes from the exercise:
+
+- `DSV41_DENSE_FP4` could not load under TP attention before this date: `shard_attention` called
+  `.shard()` on `wq_b`/`wo_b`, which `FP4Weight` did not implement, and it had no
+  `FP4GroupedWeight` branch for `wo_a`. Added (`tools/fp4_linear.py`,
+  `engine/tensor_parallel.py`), with a dequant-equals-slice check in `tools/test_fp4_linear.py`.
+  The gate arms above load and pass with it.
+- The four small-N decode shapes are the ones that do not pay; a split-K variant with a fixed-order
+  reduction is the change that would move this, and it is not built.

@@ -47,6 +47,9 @@ def main():
     ap.add_argument('--bursts', type=int, default=8)
     ap.add_argument('--warmup-tokens', type=int, default=64)
     args = ap.parse_args()
+    # The gate only creates GATE_LOG_DIR on rank 0; rank 1's results mount does not have it, and
+    # without this the final kernels-seq write fails after every measurement has already run.
+    os.makedirs(args.out, exist_ok=True)
     V.save_prune_db = lambda *a, **kw: None
     root = os.environ['MODEL_DIR']
     e = V.V41Engine(root, max_seq=524288, arena_gb=90,
