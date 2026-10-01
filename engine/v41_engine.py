@@ -609,6 +609,8 @@ class V41Engine:
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3"), expert_format
             self.ep.init(device)
+            from engine import comm as _comm
+            _comm.init(device)   # DSV41_COMM_BACKEND=roce: build the one-shot RoCE runtime or stay on NCCL
             if self.ep.tensor_parallel:
                 log(f'TP2 up: rank {self.ep.rank}; each arena slot holds half an expert')
             else:
@@ -885,6 +887,12 @@ class V41Engine:
                 # different tokens with nothing raising.
                 "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
                 "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
+                # The transport for the decode-sized all-gathers. A pair split across this would route
+                # different bytes; the RoCE path also agrees its own settings at setup, but the guard
+                # refuses the mismatch at boot instead of after the first probe.
+                "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "nccl"),
+                "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
+                "roce_hcas": os.environ.get("DSV41_ROCE_HCAS", "2"),
                 "head_fmt": R.head_fmt(),
                 "draft_head_fmt": R.draft_head_fmt(),
                 "hc_kernel": R.HC_KERNEL,
@@ -2425,6 +2433,8 @@ class V41Engine:
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
             "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
+            "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "nccl"),
+            "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
             "draft_head_fmt": R.draft_head_fmt(),
             "hc_kernel": R.HC_KERNEL,
             "hc_prec": R.HC_PREC,

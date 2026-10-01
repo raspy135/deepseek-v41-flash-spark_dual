@@ -31,6 +31,8 @@ import torch.nn.functional as F
 
 from engine import model as M
 from engine.model import HC_OPS as _HC_OPS, _hc_post_fused, _hc_pre_rn_fused
+from engine import comm as _comm
+from engine import l2pf
 import v41_ref as R
 
 try:
@@ -196,6 +198,8 @@ class FastDecoder:
         self.c = model.c
         self.use_graphs = use_graphs
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
+        # DSV41_L2PF_MB: prefetch the next layer's weights during the MoE all-gather (engine/l2pf.py)
+        self.l2pf_side = torch.cuda.Stream(device=self.dev) if l2pf.enabled() else None
         # Before any capture: graphs bake in weight addresses.
         self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
                             if MERGED_PROJ else 0)
@@ -780,7 +784,12 @@ class FastDecoder:
         else:
             shared_up()
         gathered = torch.empty(world * (P + T), inter, dtype=torch.bfloat16, device=x.device)
-        torch.distributed.all_gather_into_tensor(gathered, h_all, group=collective_group())
+        if self.l2pf_side is not None:
+            self.l2pf_side.wait_stream(main)
+            l2pf.touch(self.l2pf_side, self._l2pf_targets(L), l2pf.budget_bytes())
+        _comm.all_gather_fast(gathered, h_all, group=collective_group())
+        if self.l2pf_side is not None:
+            main.wait_stream(self.l2pf_side)   # the budget is what keeps this join off the critical path
         full = gathered.view(world, P + T, inter).transpose(0, 1).reshape(P + T, world * inter)
         down_n = arena.w2.shape[1]
         if side is not None:
@@ -798,8 +807,17 @@ class FastDecoder:
             local_s = R.mm(full[P:], w.sh_w2.local)
         local += local_s
         out = torch.empty(world * T, down_n, dtype=torch.float32, device=x.device)
-        torch.distributed.all_gather_into_tensor(out, local, group=collective_group())
+        _comm.all_gather_fast(out, local, group=collective_group())
         _hc_post_fused(out, self.h, self.ffn_post, self.ffn_comb, out=self.h, split_w=down_n)
+
+    def _l2pf_targets(self, L):
+        """The next backbone layer's attention/HC/shared weights: what the kernels after this gather read."""
+        if L + 1 >= len(self.W.layers):
+            return []
+        nxt = self.W.layers[L + 1]
+        names = ("wq_a", "wkv", "wq_b", "wo_b", "wo_a", "hc_attn_fn", "hc_ffn_fn",
+                 "sh_w1", "sh_w2", "sh_w3")
+        return [getattr(nxt, n) for n in names if getattr(nxt, n, None) is not None]
 
     def _layer_b(self, L):
         a = self.a
