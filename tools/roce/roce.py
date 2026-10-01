@@ -317,6 +317,11 @@ def _ext():
         from torch.utils.cpp_extension import load
 
         here = Path(__file__).parent
+        # Keep the built extension out of the container's ephemeral home so a gate run reuses it:
+        # /app/.triton is the host-mounted cache, tools/roce/.build the native/host case.
+        if not os.environ.get("TORCH_EXTENSIONS_DIR"):
+            os.environ["TORCH_EXTENSIONS_DIR"] = (str(Path("/app/.triton/roce-ext"))
+                                                  if Path("/app/.triton").is_dir() else str(here / ".build"))
         _EXT = load(name="dsv41_roce_v1", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],
                     extra_cflags=["-O2"], extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
     return _EXT

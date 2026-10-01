@@ -17,8 +17,12 @@ import torch
 import torch.distributed as dist
 
 _TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
-if _TOOLS not in sys.path:
-    sys.path.insert(0, _TOOLS)
+_ROCE_DIR = os.path.join(_TOOLS, "roce")
+# tools/roce on the path BEFORE tools/: `import roce` must find tools/roce/roce.py, not resolve
+# tools/roce/ itself as a namespace package.
+for _p in (_TOOLS, _ROCE_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 try:
     import roce as _roce  # tools/roce/roce.py
 except Exception:  # noqa: BLE001
