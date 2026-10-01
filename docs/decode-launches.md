@@ -172,11 +172,14 @@ routed experts ~50 ms (the native `moe_up`/`moe_down` at an estimated 165-180 GB
 ~235 GB/s streaming ceiling), dense fp8 projections ~30 ms, fp32 GEMMs ~10 ms (HC, router gate,
 torch attention), the bf16 LM head ~7.7 ms (read twice per step), NCCL ~7.9 ms.
 
-## Dense FP4 (`DSV41_DENSE_FP4`): no decode gain on this build (null result)
+## Dense FP4 (`DSV41_DENSE_FP4`): a starved kernel, fixed with split-K
 
 Measured 2026-10-01 on the round-3/v2 build, TP2, native FP4 experts, `DSV41_TP_ATTN=1`,
-`DSV41_DRAFT_HEAD_FMT=off` (to isolate the variable), greedy, 256 tokens, arms alternating. Six
-`bench_decode_kernels_tp.py` gate runs:
+`DSV41_DRAFT_HEAD_FMT=off` (to isolate the variable), greedy, 256 tokens.
+
+### The first A/B was flat
+
+Six `bench_decode_kernels_tp.py` gate runs before the fix, arms alternating:
 
 | dense_fp4 | run | python tok/s | python ms/step | html tok/s | explain tok/s | profiled dense ms/step |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -184,12 +187,12 @@ Measured 2026-10-01 on the round-3/v2 build, TP2, native FP4 experts, `DSV41_TP_
 | attn,wo_a | 1 | 48.8 | 102.4 | 45.4 | 22.1 | 30.2 |
 | attn,wo_a | 2 | 48.6 | 102.8 | 45.5 | 22.1 | 29.5 |
 | off | 2 | 48.4 | 103.4 | 43.3 | 21.5 | 30.9 |
-| attn | 1 | 49.8 | 102.4 | 46.0 | 22.3 | 31.1 |
-| wo_a | 1 | 49.3 | 103.5 | 43.3 | 22.1 | 30.6 |
 
-Every arm is inside the build's 8-10 % run-to-run spread, and the profiled dense family stays near
-30 ms/step even though the fp4 weights are ~half the bytes -- but the aggregate hides a bimodal
-kernel. Achieved bandwidth at M=6 (L2-cold, real weights, `tools/test_fp4_linear.py` method):
+The profiled dense family stayed at ~30 ms/step even though the fp4 weights are ~half the bytes.
+
+### Why: the kernel is starved on narrow N
+
+L2-cold achieved bandwidth at M=6, real weights (`tools/test_fp4_linear.py` method):
 
 | weight | N x K | fp8 GB/s | fp4 GB/s | fp4 time / fp8 |
 | --- | --- | ---: | ---: | ---: |
@@ -200,28 +203,58 @@ kernel. Achieved bandwidth at M=6 (L2-cold, real weights, `tools/test_fp4_linear
 | wq_a | 1280x5120 | 185-190 | 67 | 1.47 |
 | wkv | 512x5120 | 120-131 | 33 | 1.81-2.11 |
 
-The format is fine: on wide N the fp4 kernel reaches 199-217 GB/s against the fp8 kernel's 224-231
-and is 1.6x faster, essentially the 0.53 byte ratio. On narrow N it collapses to 33-67 GB/s against
-fp8's 120-190 on the same shape and bytes. That is a parallelism bug in the fp4 kernel, not a
-property of 4 bits: `BLOCK_N=32` gives `wkv` 16 CTAs for 48 SMs with a 40-iteration serial K loop of
-8 dependent dots each, and a sweep of `BLOCK_N` x `num_warps` x `num_stages` does not lift it (best
-still 35 GB/s for `wkv`, 68 for `wq_a`). `attn` is mostly these narrow shapes, so its wide-N win
-cancels their loss; `wo_a`'s grouped kernel has a G=8 group axis for parallelism, which is why it is
-the one clear win (~1 ms). The fix is a split-K variant with a fixed-order reduction -- named as the
-gap in the 2026-09-11 notes and still not built -- not a different launch config.
+Wide N reaches the fp8 kernel's bandwidth (the 0.53 byte ratio delivered). Narrow N collapses to
+33-67 GB/s: `BLOCK_N=32` gives `wkv` 16 CTAs for 48 SMs with a 40-iteration serial K loop of 8
+dependent dots, and a sweep of `BLOCK_N` x `num_warps` x `num_stages` does not lift it. That is a
+parallelism bug, not a property of 4 bits. `attn` is mostly the narrow shapes, so before the fix its
+wide-N win cancelled their loss; `wo_a`'s grouped kernel has a G=8 axis and was already fine.
 
-The earlier pre-round-3 gain (134.4 -> 125.6 ms step) is therefore not "gone"; it was measured on a
-build whose narrow shapes were equally starved, and the intervening fp8 decode scheduling moved the
-baseline under it. Dense fp4 also changes tokens (it is a re-quantization), so enabling `attn` today
-is a wash that costs quality; `wo_a` alone is the honest subset.
+### Fix: split-K with a fixed-order combine
 
-Two notes from the exercise:
+`DSV41_FP4_DENSE_SPLIT` (`auto`, default; an integer forces S; 1 restores the unsplit kernel). At
+M <= 16 `pick_split_k` targets ~8 CTAs per SM, capped at 8 splits and at KQ/4 so each slice keeps
+real work. `_fp4_linear_split_kernel` partitions the K quads into contiguous slices
+`[s*KQ/S, (s+1)*KQ/S)` and writes fp32 partials; `_fp4_combine_kernel` adds the planes in split
+order. Splitting changes the fp32 summation order, so a decode call and a >16-row prefill call can
+differ in the last bits -- but `pick_split_k` is constant over M <= 16, so the invariance the engine
+relies on (sequential M=1 vs the M=6 verify block) holds. `tools/test_fp4_linear.py` checks
+split-vs-unsplit (~1e-7 relative, fp32 re-association only) and decode row invariance.
 
-- `DSV41_DENSE_FP4` could not load under TP attention before this date: `shard_attention` called
+Bandwidth after (best S, L2-cold, 3 reps each):
+
+| weight | fp8 GB/s | fp4 before | fp4 split-K | time fp4/fp8 |
+| --- | ---: | ---: | ---: | ---: |
+| wkv | 125 | 35 | 61 | 1.09 |
+| wq_a | 157-190 | 66 | 143 | 0.58 |
+| shared w1 | 205 | 113 | 175 | 0.62 |
+| shared w2 | 218 | 162-174 | 171 | 0.68 |
+| wo_b | 197 | 105-111 | 158 | 0.66 |
+| wq_b | 229 | 199-217 | 205-210 | 0.58 |
+
+Every slim shape is now 1.5-1.7x faster than fp8; `wkv` (N=512) only reaches parity and is the one
+shape a wider split would need to fix.
+
+### End to end (`attn,wo_a`), off run bracketed between the two fp4 runs
+
+| arm | python ms/step | html ms/step | explain ms/step | dense ms/step | kernels/step |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 106.1 | 103.9 | 91.9 | 30.6 | 3536 |
+| attn,wo_a | 97.6 | 95.3 | 86.1 | 24.6 | 3735 |
+| attn,wo_a | 99.9 | 97.5 | 87.4 | 25.6 | 3735 |
+| all | 98.4 | 96.3 | 87.3 | 20.6 | 4565 |
+| shared | 102.8 | 101.1 | 91.8 | 28.4 | 4366 |
+
+`attn,wo_a` is ~5-8 ms/step faster (~7 %) than the contemporaneous `off`; the pre-fix fp4 arms were
+at parity (python 102.4/102.8 ms). `all` drives the dense family lower (20.6 ms) but adds ~800
+combine launches, which land in the profiler's "small" family and cancel the gain, and the shared
+experts are the quality-sensitive group. `attn,wo_a` is the setting worth having; the quality caveat
+in `gotchas.md` (a nesting-depth probe) still applies, so the default stays `off`.
+
+### Two code fixes it needed
+
+- `DSV41_DENSE_FP4` could not even load under TP attention before this: `shard_attention` called
   `.shard()` on `wq_b`/`wo_b`, which `FP4Weight` did not implement, and it had no
-  `FP4GroupedWeight` branch for `wo_a`. Added (`tools/fp4_linear.py`,
-  `engine/tensor_parallel.py`), with a dequant-equals-slice check in `tools/test_fp4_linear.py`.
-  The gate arms above load and pass with it.
-- The narrow-N shapes are the ones that lose, and it is a missing split-K, not the format: the
-  same kernel reaches 199-217 GB/s on `wq_b`/`w2`. A split-K with a fixed-order reduction is the
-  change that would move this, and it is not built. `wo_a` (grouped, G=8) already works and is ~1 ms.
+  `FP4GroupedWeight` branch for `wo_a`. Added (`tools/fp4_linear.py`, `engine/tensor_parallel.py`).
+- `bench_decode_kernels_tp.py` gained the missing `os.makedirs(args.out, exist_ok=True)`: the gate
+  creates `GATE_LOG_DIR` on rank 0 only, so a fresh results directory made rank 1 fail on the final
+  write after every measurement had already run.

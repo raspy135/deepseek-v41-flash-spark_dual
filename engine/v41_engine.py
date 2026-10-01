@@ -884,6 +884,7 @@ class V41Engine:
                 # a pair started with them differing would compute different logits or draft
                 # different tokens with nothing raising.
                 "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
+                "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
                 "head_fmt": R.head_fmt(),
                 "draft_head_fmt": R.draft_head_fmt(),
                 "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
@@ -2421,6 +2422,7 @@ class V41Engine:
             # construction, so a difference between them is a desync that nothing else reports.
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
+            "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
             "draft_head_fmt": R.draft_head_fmt(),
             "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
             "fp4_dot_scaled": self.fp4_dot_scaled,

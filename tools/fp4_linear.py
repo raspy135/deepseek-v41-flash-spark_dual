@@ -222,9 +222,73 @@ def pick_block_n(N: int, M: int, BLOCK_M: int) -> int:
     return 32 if BLOCK_M <= 16 else 128
 
 
+# DSV41_FP4_DENSE_SPLIT: the K-split used at decode M ('auto' or an integer 1..KQ). At M <= 16 the
+# N axis is the only parallelism the unsplit kernel has, so a slim weight (wkv N=512 / BLOCK_N=32 is
+# 16 CTAs for 48 SMs) runs its 40-quad serial K loop latency-bound at a third of the bandwidth the
+# wide shapes reach. Splitting K across CTAs and adding the partials in split order fixes it; 1
+# restores the unsplit kernel. Split-K changes the fp32 summation order (not the row-invariance).
+_DENSE_SPLIT = os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto")
+
+
+@triton.jit
+def _fp4_linear_split_kernel(X, W, S, P, M, N, KQ, stride_xm, stride_wn, stride_sn,
+                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, USE_F16: tl.constexpr,
+                             SPLIT: tl.constexpr):
+    """One K-slice of `_fp4_linear_kernel`, writing an fp32 partial to P[pid_s, :, :].
+
+    The K quads are partitioned [s*KQ/SPLIT, (s+1)*KQ/SPLIT) -- whole 128-wide quads, contiguous,
+    in order -- and `_fp4_combine_kernel` sums the planes in split order, so a row's value does not
+    depend on M or on its offset (the same property the unsplit kernel has)."""
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = rn < N
+    rn_ = tl.where(n_mask, rn, 0)
+    m_mask = (rm < M)[:, None]
+    rm_ = tl.where(rm < M, rm, 0)
+    xk = 2 * tl.arange(0, 16)[None, :]
+    x_base = X + rm_[:, None] * stride_xm
+    w_tile = W + rn_[:, None] * stride_wn + tl.arange(0, 64)[None, :]
+    s_tile = S + rn_[:, None] * stride_sn + tl.arange(0, 4)[None, :]
+    q0 = (pid_s * KQ) // SPLIT
+    q1 = ((pid_s + 1) * KQ) // SPLIT
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for q in range(q0, q1):
+        acc += _quad_dot(x_base + q * 128, xk, m_mask, w_tile + q * 64, s_tile + q * 4,
+                         BLOCK_N, USE_F16)
+    tl.store(P + pid_s * M * N + rm[:, None] * N + rn[None, :], acc,
+             mask=m_mask & n_mask[None, :])
+
+
+@triton.jit
+def _fp4_combine_kernel(P, Y, total, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    """Y[i] = bf16(sum over SPLIT of P[s, i]), added in split order."""
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < total
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(SPLIT):
+        acc += tl.load(P + s * total + i, mask=m, other=0.0)
+    tl.store(Y + i, acc.to(tl.bfloat16), mask=m)
+
+
+def pick_split_k(N: int, M: int, BLOCK_M: int, BLOCK_N: int, KQ: int) -> int:
+    """K-splits that bring the decode grid to a few CTAs per SM, capped so each slice keeps real
+    work. Tuned by sweeping S on the slim shapes (see tools/test_fp4_linear.py)."""
+    if _DENSE_SPLIT not in ("auto", ""):
+        return max(1, min(int(_DENSE_SPLIT), KQ))
+    if M > 16:
+        return 1  # prefill: the M axis already fills the grid, split-K only adds a combine pass
+    base = triton.cdiv(N, BLOCK_N) * triton.cdiv(M, BLOCK_M)
+    s = max(1, triton.cdiv(384, base))       # aim for ~8 CTAs per SM on 48 SMs
+    return max(1, min(s, max(1, KQ // 4), 8))  # keep >= 4 quads per slice; cap the combine cost
+
+
 def fp4_linear(x: torch.Tensor, W: FP4Weight, use_f16: bool | None = None,
-               block_n: int | None = None, num_warps: int = 4, num_stages: int = 3) -> torch.Tensor:
-    """x bf16 [..., K] -> bf16 [..., N]."""
+               block_n: int | None = None, num_warps: int = 4, num_stages: int = 3,
+               split_k: int | None = None) -> torch.Tensor:
+    """x bf16 [..., K] -> bf16 [..., N]. `split_k` overrides DSV41_FP4_DENSE_SPLIT for tuning."""
     shape = x.shape
     x2 = x.reshape(-1, W.K)
     if x2.dtype != torch.bfloat16:
@@ -234,12 +298,25 @@ def fp4_linear(x: torch.Tensor, W: FP4Weight, use_f16: bool | None = None,
     y = torch.empty(M, W.N, dtype=torch.bfloat16, device=x.device)
     BLOCK_M = 16 if M <= 16 else 64
     BLOCK_N = pick_block_n(W.N, M, BLOCK_M) if block_n is None else block_n
-    grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
-    _fp4_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K // 128,
-                             x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
-                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                             USE_F16=USE_F16_DEFAULT if use_f16 is None else use_f16,
-                             num_warps=num_warps, num_stages=num_stages)
+    KQ = W.K // 128
+    S = pick_split_k(W.N, M, BLOCK_M, BLOCK_N, KQ) if split_k is None else max(1, min(split_k, KQ))
+    use_f16 = USE_F16_DEFAULT if use_f16 is None else use_f16
+    if S > 1:
+        P = torch.empty((S, M, W.N), dtype=torch.float32, device=x.device)
+        _fp4_linear_split_kernel[(triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M), S)](
+            x2, W.w, W.s, P, M, W.N, KQ, x2.stride(0), W.w.stride(0), W.s.stride(0),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, USE_F16=use_f16, SPLIT=S,
+            num_warps=num_warps, num_stages=num_stages)
+        total = M * W.N
+        BLOCK = 1024
+        _fp4_combine_kernel[(triton.cdiv(total, BLOCK),)](P, y, total, SPLIT=S, BLOCK=BLOCK,
+                                                          num_warps=4)
+    else:
+        _fp4_linear_kernel[(triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))](
+            x2, W.w, W.s, y, M, W.N, KQ,
+            x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, USE_F16=use_f16,
+            num_warps=num_warps, num_stages=num_stages)
     return y.view(*shape[:-1], W.N)
 
 

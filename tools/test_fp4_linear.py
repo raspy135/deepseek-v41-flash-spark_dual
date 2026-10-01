@@ -88,14 +88,30 @@ def main(names):
             print(f"  M={M:5d}: rel vs fp4 ref {rel:.2e}  max abs {mx:.2e}   vs fp32(fp4) "
                   f"kernel {rel32:.2e} / cuBLAS-bf16 {relc:.2e}   rel vs fp8 ref {rel8:.4f}"
                   + ("   <-- FAIL" if bad else ""))
-        # row-count / row-offset invariance
+        # Row-count / row-offset invariance. Split-K (M <= 16) re-associates the fp32 K sum, so a
+        # decode call and a >16-row prefill call may differ in the last bits. The invariance the
+        # engine relies on -- sequential M=1 vs the verify block M=6, via R.mm's row padding -- is
+        # within the decode range, where pick_split_k is constant for a given N,K. Check both: the
+        # unsplit prefill call against itself, and the split-K decode rows against a decode-sized
+        # call.
         x = (torch.randn(2048, W4.K, device="cuda") * 0.5).to(torch.bfloat16)
-        full = fp4_linear(x, W4)
+        full = fp4_linear(x, W4, split_k=1)
         for lo, hi in ((0, 6), (7, 13), (1000, 1006), (0, 1), (0, 16)):
-            sub = fp4_linear(x[lo:hi].contiguous(), W4)
+            sub = fp4_linear(x[lo:hi].contiguous(), W4, split_k=1)
             same = bool((sub == full[lo:hi]).all())
             ok &= same
-            print(f"  rows[{lo}:{hi}] identical to the 2048-row call: {same}")
+            print(f"  prefill rows[{lo}:{hi}] identical to the 2048-row unsplit call: {same}")
+        xd = x[:16].contiguous()
+        fulld = fp4_linear(xd, W4)
+        for lo, hi in ((0, 1), (0, 6), (3, 9), (6, 16)):
+            sub = fp4_linear(xd[lo:hi].contiguous(), W4)
+            same = bool((sub == fulld[lo:hi]).all())
+            ok &= same
+            print(f"  decode rows[{lo}:{hi}] identical to the 16-row split-K call: {same}")
+        unsplit = fp4_linear(xd, W4, split_k=1).float()
+        rel_sk = float((fulld.float() - unsplit).norm() / unsplit.norm())
+        ok &= rel_sk < 1e-4                      # fp32 re-association, far below the fp4 weight error
+        print(f"  split-K vs unsplit relative L2 at M=16: {rel_sk:.2e}")
         # Bandwidth at M=6, against the fp8 kernel on the same weight. Steady state: the call is
         # cycled over ~300 MB worth of copies of the weight, so nothing is L2-resident and -- unlike
         # an explicit L2 flush -- no flush write competes for DRAM bandwidth. `hot` (one copy,

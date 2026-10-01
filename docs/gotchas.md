@@ -840,11 +840,12 @@ dense-projection family stayed at ~30 ms/step in all six even though the fp4 wei
 bytes. The aggregate hides a bimodal kernel: at M=6 the fp4 kernel reaches 199-217 GB/s on wide-N
 (`wq_b`, `w2`, 1.6x faster) but collapses to 33-67 GB/s on narrow-N (`wkv`, `wq_a`, `w1`) against
 fp8's 120-204 GB/s on the same shapes. That is a parallelism bug -- `BLOCK_N=32` starves `wkv` to 16
-CTAs for 48 SMs and a sweep of block/warps/stages does not fix it -- and the fix is a split-K with a
-fixed-order reduction, which is not built. `attn` is mostly the narrow shapes, so it nets out;
-`wo_a`'s grouped kernel has G=8 for parallelism and is the one real win (~1 ms). Full table and
-bandwidth numbers: `decode-launches.md`. It also changes tokens, so enabling `attn` today is a wash
-that costs quality. (`DSV41_DENSE_FP4` could not even load under TP
+CTAs for 48 SMs and a sweep of block/warps/stages does not fix it. A split-K with a fixed-order
+reduction (`DSV41_FP4_DENSE_SPLIT`) is now built: `wq_a` 66 -> 143 GB/s, `w1` 113 -> 175, `wo_b`
+105 -> 158, and the same end-to-end pair run gives `attn,wo_a` ~7 % fewer ms/step than `off`
+(python 106 -> 98) where before the fix it was at parity. `wkv` (N=512) still only reaches parity.
+The quality cost this entry records is unchanged, so the default stays `off`. Full tables:
+`decode-launches.md`. (`DSV41_DENSE_FP4` could not even load under TP
 attention before this date -- `FP4Weight` had no `.shard()` and `shard_attention` had no
 `FP4GroupedWeight` branch; both added.)
 
