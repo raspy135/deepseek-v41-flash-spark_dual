@@ -267,45 +267,26 @@ the server logs it separately as `prefix_response`. Restart both nodes to enable
 
 ### Decode, 2026-10-01
 
-The served configuration after this round. Two-node gate (greedy, 256 tokens, rank 0) for the
-per-change A/Bs, `bench/bench.py` (512-token output, one warm-up plus three runs of the same prompt)
-for the live numbers. Setup: TP2, native FP4 with the v2 CUDA decode kernel, dense FP4 `attn,wo_a`
-with the split-K kernel, dynamic depth 3/5, decode all-gathers over the one-shot RoCE transport, L2
-weight prefetch, 90.1 GB arena, keep 0.61, packed KV, prefix caches on where noted.
+Served configuration after this round (TP2, native FP4, dense FP4 `attn,wo_a`, dynamic depth 3/5,
+RoCE all-gathers, L2 prefetch, 90.1 GB arena, keep 0.61); each change A/B'd in alternating arms.
 
-Every change below was A/B'd in alternating arm order. "Identical" means the token hashes matched on
-every measured workload:
-
-| change | measured effect | bits |
+| change | effect | bits |
 | --- | --- | :---: |
-| decode-lean rounds 1-2 (fused norms/mixing/RoPE/router/SwiGLU, static buffers) | 8,457 → 6,385 kernels, +5.8-8.7% tok/s | identical |
-| round 3 (merged MoE collectives, attention staging) + v2 expert kernel | 3,557 kernels, +2.4-2.9% | identical |
-| dense FP4 `attn,wo_a` with split-K | dense 30.6 → 24.6 ms/step, step −7% | **output-changing** |
-| RoCE one-shot all-gather | −5.5 ms/step, +6.2% tok/s | identical |
-| L2 prefetch, 2 MB | −0.5 to −1.1 ms/step | identical |
-| split-K fp32 HC kernel | −1.9 to −2.9 ms/step **but** acceptance −0.07..−0.10, so tok/s a wash | output-changing; stays off |
+| decode-lean rounds 1-2 | 8,457 → 6,385 kernels, +5.8-8.7% | identical |
+| round 3 + v2 expert kernel | 3,557 kernels, +2.4-2.9% | identical |
+| dense FP4 `attn,wo_a` + split-K | dense 30.6 → 24.6 ms/step, step −7% | output-changing |
+| RoCE all-gather | −5.5 ms/step, +6.2% tok/s | identical |
+| L2 prefetch 2 MB | −0.5 to −1.1 ms/step | identical |
+| fp32 HC kernel (off) | −1.9 to −2.9 ms/step, acceptance −0.07..−0.10, tok/s a wash | output-changing |
 
-Live decode (`bench/bench.py`, warm-up + 3 runs of the same prompt):
+| live (`bench.py`, warm-up + 3 runs) | prefill tok/s | decode tok/s | accept |
+| --- | ---: | ---: | ---: |
+| code | — | 37.34 | 3.72 |
+| prose | — | 23.12 | 1.98 |
+| random 8K | 508 | 25.57 | 2.70 |
 
-| workload | prompt tokens | output tokens | prefill tok/s | decode tok/s | accept |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| code | 62 | 512 | — | **37.34** | 3.72 |
-| prose | 45 | 512 | — | **23.12** | 1.98 |
-| random 8K | 8,179 | 118-172 (EOS) | 508 | **25.57** | 2.70 |
-
-- **What is left is expert bytes.** The routed experts are ~48 ms of a ~98 ms step, half of it, and
-  run at ~208 GB/s against the ~235 GB/s the box streams. The kernel is at the ceiling; only fewer or
-  smaller expert reads move it, and that is a model/quality decision, not tuning.
-- **Dense FP4 changes tokens.** It is throughput-positive (~7%) and carries the nesting-probe quality
-  cost recorded in [gotchas](docs/gotchas.md); `DSV41_DENSE_FP4=off` reverts.
-- **The RoCE transport has operational surface**: a ~1-minute extension build on first boot (cached
-  after), one busy-spinning proxy thread, a pinned host region, and a fallback to NCCL on any setup
-  failure. `DSV41_COMM_BACKEND=nccl` reverts.
-- **The 8K random prefill reads 508 tok/s, below the 611 of 2026-09-22** and not explained; the
-  decode median there is over a short EOS-truncated tail, so treat that row as indicative only.
-- **Not measured this round:** thinking-mode traces, `DSV41_MAX_CONCURRENCY > 1`, and long contexts.
-- The same three code runs read 24.23 tok/s on 2026-09-22, so the table above is not a single change;
-  much of the `code` difference is acceptance (dynamic depth plus the numerics), not step time.
+Limits: experts are ~48 ms of the ~98 ms step at ~208 of ~235 GB/s; random-8K prefill (508) is below
+2026-09-22's 611; thinking, `DSV41_MAX_CONCURRENCY > 1` and long context are unmeasured.
 
 ### Decode, 2026-09-23
 
