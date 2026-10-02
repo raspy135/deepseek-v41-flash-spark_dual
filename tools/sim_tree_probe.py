@@ -32,14 +32,14 @@ def chain_tokens(cand, top2, depth):
     return acc + 1
 
 
-def tree_tokens(cand, top2, depth):
+def tree_tokens(cand, top2, depth, sib):
     path = 0
     for i in range(depth):
         if i >= len(cand):
             break
         if cand[i] == top2[i][0]:
             path += 1
-        elif cand[i] == top2[i][1]:
+        elif i in sib and cand[i] == top2[i][1]:
             return path + 2          # sibling accepted (path + 1) and its bonus token
         else:
             break
@@ -53,24 +53,30 @@ def main():
     rep = json.load(open(args.report))
     assert rep.get("tree_probe"), "collect with DSV41_TREE_PROBE=1"
     ms = lambda rows: 59.0 + 6.65 * rows
-    shapes = [("chain1", "c", 1, 3), ("chain3", "c", 3, 4), ("chain5", "c", 5, 6),
-              ("tree1", "t", 1, 3), ("tree2", "t", 2, 5), ("tree3", "t", 3, 6)]
-    print(f"{'workload':10} {'steps':>6} | " + " ".join(f"{n:>7}" for n, _, _, _ in shapes) + "   (tok/s)")
-    rate = {n: [0.0, 0] for n, _, _, _ in shapes}
+    # (name, chain?, depth, sibling levels, rows). rows = depth + 1 + len(sibling levels).
+    shapes = [("chain1", "c", 1, (), 2), ("chain3", "c", 3, (), 4), ("chain5", "c", 5, (), 6),
+              ("tree3_rb", "t", 3, (0, 1), 6),      # a2 and b2 only -- the proposal
+              ("tree3_all", "t", 3, (0, 1, 2), 7),  # + a c2 sibling
+              ("tree5_rb", "t", 5, (0, 1), 8)]
+    print(f"{'workload':10} {'steps':>6} | " + " ".join(f"{n:>7}" for n, *_ in shapes) + "   (tok/s)")
+    rate = {n: [0.0, 0] for n, *_ in shapes}
     for run in rep["runs"]:
         log = run.get("tree_log") or []
         if not log:
             continue
         cells = []
-        for name, kind, depth, rows in shapes:
-            fn = chain_tokens if kind == "c" else tree_tokens
-            tok = sum(fn(c, t, depth) for _d, _a, c, t in log) / len(log)
+        for name, kind, depth, sib, rows in shapes:
+            if kind == "c":
+                fn = lambda c, t, d=depth: chain_tokens(c, t, d)
+            else:
+                fn = lambda c, t, d=depth, s=sib: tree_tokens(c, t, d, s)
+            tok = sum(fn(c, t) for _d, _a, c, t in log) / len(log)
             rate[name][0] += tok * len(log)
             rate[name][1] += len(log)
             cells.append(f"{tok / (ms(rows) / 1000):7.2f}")
         print(f"{run['workload']:10} {len(log):6d} | " + " ".join(cells))
     print(f"{'ALL':10} {'':>6} | " +
-          " ".join(f"{rate[n][0] / rate[n][1] / (ms(r) / 1000):7.2f}" for n, _, _, r in shapes))
+          " ".join(f"{rate[n][0] / rate[n][1] / (ms(r) / 1000):7.2f}" for n, _, _, _, r in shapes))
     print("\nchainN = chain of N drafts; treeN = chainN + a runner-up sibling at every level")
 
 

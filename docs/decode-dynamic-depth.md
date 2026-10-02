@@ -130,19 +130,25 @@ adds a single token and stops.
 depth-5 chain across the five workloads (816 steps); `tools/sim_tree_probe.py` replays the shapes
 against the measured row-cost curve (`59.0 + 6.65 x rows` ms, fit to the BLOCK 3/5/7 sweep):
 
-| workload | chain3 | chain5 | tree3 (chain3 + a runner-up sibling at each level) |
+| workload | chain3 | chain5 | tree3_rb (chain3 + a2 + b2) |
 | --- | ---: | ---: | ---: |
-| html | 41.40 | **49.87** | 37.30 |
-| python | 43.99 | **54.54** | 38.72 |
-| explain | **23.55** | 21.17 | 23.14 |
-| story | **22.24** | 19.57 | 21.71 |
-| mixed | 32.94 | **33.40** | 30.53 |
-| all | 29.59 | **30.53** | 27.74 |
+| html | 41.40 | **49.87** | 36.81 |
+| python | 43.99 | **54.54** | 38.62 |
+| explain | **23.55** | 21.17 | 22.69 |
+| story | **22.24** | 19.57 | 21.52 |
+| mixed | 32.94 | **33.40** | 29.81 |
+| all | 29.59 | **30.53** | 27.35 |
 
-tok/s. The tree carries +9.5 % / +10.9 % tokens per step over chain5 on prose, and still loses:
-the two extra rows cost more than the rescued tokens, so it is behind chain3 -- the arm the policy
-already picks for prose -- and well behind chain5 on code. Every free-sibling shape tested is worse
-than the existing `DSV41_BLOCK_DYNAMIC=3,5`.
+tok/s. The tree carries the sibling at the first two levels (`a2`, `b2`); the first version of the
+simulation gave it 6 rows but let its token model take a third-level sibling the block did not
+contain, which overstated it slightly -- the numbers above are the corrected ones. It gains tokens
+per step over chain5 on prose and still loses, to chain3, because the two extra rows cost more than
+the rescued tokens: a row is ~2.7 distinct experts and ~6.65 ms, and a tree uses exactly as many rows
+as a chain of the same width. The sibling changes *which* tokens are verified, not how many bytes
+are read.
+
+A 7-row tree (with the third sibling) and an 8-row tree5 are worse still (26.00 and 28.44 all-mean).
+Every free-sibling shape tested is behind the existing `DSV41_BLOCK_DYNAMIC=3,5`.
 
 To beat it, a tree needs a **deeper branch**, which means a second draft chain (or a tree-shaped
 draft pass, EAGLE-style) plus tree attention on the verify side: a tree buffer instead of the
