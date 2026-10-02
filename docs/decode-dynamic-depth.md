@@ -194,27 +194,46 @@ position-indexed ring (siblings share a position), per-node RoPE positions, and 
 compressor forked per branch. The measured upside for the free part is ~0.10 tokens/step pooled
 (0.15 prose, 0.04 code), so that build starts from a negative and was not attempted.
 
-### The sibling row cost, measured (2026-10-02)
+### The sibling row cost, corrected measurement (2026-10-02)
 
-The replay above could only assume a sibling costs `6.65 ms` like any row. That assumption is the
-whole verdict, so it was measured: `tools/bench_sibling_experts.py` records `route_idx` from a plain
-causal forward. A candidate's routing depends only on its ancestors, so a forward reproduces the row
-a tree would compute exactly, and batching the rows in one load would not change any row's expert
-set -- only its timing. So the overlap measured here is what the one-load implementation would see.
+The first version of `tools/bench_sibling_experts.py` was wrong in three ways: it chose `a1/a2`
+and `b1/b2` from the target model rather than DSpark, evaluated `a2` after `a1,a2` instead of
+on its real sibling prefix, and inferred the block cost from pairwise overlap instead of measuring
+the complete six-row union. Its “~6 % discount” result must not be used.
 
-30 positions x 40 layers, k=6, production prune (keep 0.61):
+The corrected microbenchmark takes the production FastDecoder's actual DSpark chain and runner-ups,
+reproduces the production prefill/replay state, and routes exactly these blocks:
 
-| pair | union | marginal experts/layer | jaccard | vs a chain row |
-| --- | ---: | ---: | ---: | ---: |
-| root sibling `a1 -> a2` | 9.69 | 3.69 | 0.262 | **1.02** |
-| deep sibling `b1 -> b2` | 9.12 | 3.12 | 0.365 | **0.86** |
-| chain neighbour `x_{p+1} -> x_{p+2}` | 9.61 | 3.61 | 0.272 | 1.00 |
+* depth-3 chain: `root,a1,b1,c1` (4 rows)
+* depth-5 chain: `root,a1,b1,c1,d1,e1` (6 rows)
+* free-sibling tree: `root,a1,b1,c1,a2,b2` (6 rows), with `a2` under `root` and `b2`
+  under `root,a1`
 
-The root sibling adds exactly as many new experts as a chain row; the deep sibling saves 14 %. A
-combined ~6 % is far short of the ~26 % the tree needed to convert its +11.5 % prose tokens into
-tok/s. Two tokens that share a parent are not meaningfully cheaper to route than two consecutive
-tokens, because the token identity dominates the router, not the context.
+32 positions x 40 layers, k=6, production prune (keep 0.61):
 
-This closes the free-sibling tree as a measured negative rather than an assumed one. It does not
-close a *tree-shaped draft pass* (a second draft chain under the branch), which would buy depth
-rather than breadth -- but that is the EAGLE-style build, and nothing measured here argues for it.
+| shape | distinct experts/layer | marginal over depth-3 |
+| --- | ---: | ---: |
+| depth-3 chain (4 rows) | 16.277 | -- |
+| depth-5 chain (6 rows) | 21.403 | 5.126 |
+| free-sibling tree (6 rows) | **20.522** | **4.245** |
+
+The sibling pair is genuinely cheaper: it adds 17.2 % fewer experts than the two ordinary tail
+rows, and the complete tree reads 4.1 % fewer expert weights than the complete depth-5 chain. That
+reverses the old explanation that token identity erased nearly all sibling reuse.
+
+It is still not the same memory load as depth 3. The tree adds 4.245 distinct experts/layer, taking
+the expert-weight union from 16.277 to 20.522 (+26.1 %) for the measured +11.5 % prose
+tokens/step. Even an optimistic estimate that applies the entire 17.2 % expert discount to the
+measured `6.65 ms/row` marginal gives `85.6 + 2 * 6.65 * 0.828 = 96.6 ms`: `2.190 / 96.6 ms =
+22.67 tok/s`, just below depth 3's `1.963 / 85.6 ms = 22.93 tok/s`. Compute slack at concurrency
+1 can hide the added arithmetic, but it cannot hide the measured extra expert-weight traffic.
+
+That estimate is close enough that only an actual tree-forward timing can settle a roughly one-percent
+decision, but the route microbenchmark does **not** establish a free lunch. It says the build starts
+near break-even, not clearly ahead.
+
+The rerun also exposed an observation bug: on an exact logit tie, `topk(2)` and `argmax()` can
+order the same two tokens differently (2 of 160 observed draft positions). `TREE_PROBE` now pins
+column 0 to the greedy-selected token and column 1 to the other top-2 token. Existing acceptance
+logs predate that fix; recollect them before using a one-percent throughput margin to justify the
+tree.

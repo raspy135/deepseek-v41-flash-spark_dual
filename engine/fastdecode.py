@@ -929,12 +929,22 @@ class FastDecoder:
             embeds.append(e)
             bias = _lin(e, self.markov_head_bf16).float()[0]
             lg = logits[i] + bias
+            # Sampling does not need a vocabulary-wide argmax unless the observation-only tree
+            # probe asks for the ranked pair.  Keep the production sampled graph at its old work.
+            best = lg.argmax() if (greedy or TREE_PROBE) else None
             if TREE_PROBE:
-                self.d_top2[i].copy_(lg.topk(2).indices)
+                # topk() does not promise the same tie ordering as argmax().  The tree replay
+                # treats column 0 as the token the greedy drafter actually selected and column 1
+                # as its alternative, so pin that order explicitly.  An exact tie used to swap
+                # these columns occasionally and made both chain acceptance and the alleged
+                # runner-up route wrong in observation logs.
+                pair = lg.topk(2).indices
+                self.d_top2[i, 0] = best
+                self.d_top2[i, 1] = torch.where(pair[0] == best, pair[1], pair[0])
             if greedy:
                 # Greedy verification never reads q=d_probs.  Avoid five vocabulary-wide
                 # softmax/log/Gumbel passes that the old dynamic torch.where computed anyway.
-                nxt = lg.argmax()
+                nxt = best
             else:
                 temp = self.d_temp[0]
                 p = torch.softmax(lg / temp.clamp_min(1e-5), dim=-1)
