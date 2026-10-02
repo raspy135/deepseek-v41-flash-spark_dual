@@ -286,5 +286,5 @@ proposal was accepted. The median paired improvement from skipping all 21 DSpark
 in decode throughput and 9.7% in request-level throughput including prefill. A second correctness
 case planted a continuation whose first token the target rejected; it then mixed 5 lookup hits with
 11 DSpark misses and still matched lookup-off output on both ranks. Real gains scale with exact-match
-and acceptance rates, so the feature remains off by default until measured on representative
-traffic. `N=16` is the conservative starting point for copy-heavy prompts.
+and acceptance rates. Exact-16 is enabled by default for concurrency 1 so those rates can be
+measured on representative traffic; set `DSV41_LOOKUP_DRAFT_NGRAM=0` for the immediate rollback.

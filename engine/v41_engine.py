@@ -78,8 +78,8 @@ PREFILL_SWAP_MIN_MISS = ADAPT.swap_prefill_min_miss
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 # Request-local prompt-lookup drafting.  A value N >= 2 uses an exact N-token suffix match to
 # propose a previously seen continuation and skips DSpark for that greedy step.  Zero disables it.
-# Default off until the full-engine A/B establishes a win on more than a copy-heavy microbenchmark.
-LOOKUP_DRAFT_NGRAM = int(os.environ.get("DSV41_LOOKUP_DRAFT_NGRAM", "0") or "0")
+# Exact-16 is the measured default; zero is the explicit rollback for traffic without useful matches.
+LOOKUP_DRAFT_NGRAM = int(os.environ.get("DSV41_LOOKUP_DRAFT_NGRAM", "16") or "0")
 LOOKUP_DRAFT_CANDIDATES = int(os.environ.get("DSV41_LOOKUP_DRAFT_CANDIDATES", "8") or "8")
 if LOOKUP_DRAFT_NGRAM < 0:
     raise ValueError("DSV41_LOOKUP_DRAFT_NGRAM must be 0 (off) or at least 2")
