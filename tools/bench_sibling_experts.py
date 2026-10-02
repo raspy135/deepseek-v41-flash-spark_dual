@@ -202,11 +202,17 @@ def main():
 
     chain3_names = ("root", "a1", "b1", "c1")
     chain5_names = chain3_names + ("d1", "e1")
+    tree_a2_names = chain3_names + ("a2",)
+    tree_b2_names = chain3_names + ("b2",)
     tree_names = chain3_names + ("a2", "b2")
     base = [union_count(row, chain3_names, layer) for row in rows for layer in layers]
     chain5 = [union_count(row, chain5_names, layer) for row in rows for layer in layers]
+    tree_a2 = [union_count(row, tree_a2_names, layer) for row in rows for layer in layers]
+    tree_b2 = [union_count(row, tree_b2_names, layer) for row in rows for layer in layers]
     tree = [union_count(row, tree_names, layer) for row in rows for layer in layers]
     chain_tail = [wide - shallow for wide, shallow in zip(chain5, base)]
+    a2_marginal = [wide - shallow for wide, shallow in zip(tree_a2, base)]
+    b2_marginal = [wide - shallow for wide, shallow in zip(tree_b2, base)]
     tree_siblings = [wide - shallow for wide, shallow in zip(tree, base)]
 
     def pair_stats(first, second):
@@ -223,6 +229,9 @@ def main():
                 "jaccard": round(statistics.fmean(jaccard), 4)}
 
     chain_extra = statistics.fmean(chain_tail)
+    base_total = statistics.fmean(base)
+    a2_total = statistics.fmean(tree_a2)
+    b2_total = statistics.fmean(tree_b2)
     tree_extra = statistics.fmean(tree_siblings)
     chain_total = statistics.fmean(chain5)
     tree_total = statistics.fmean(tree)
@@ -238,11 +247,17 @@ def main():
         "rows": {
             "chain3_rows4": distribution(base),
             "chain5_rows6": distribution(chain5),
+            "tree_a2_rows5": distribution(tree_a2),
+            "tree_b2_rows5": distribution(tree_b2),
             "tree3_rows6": distribution(tree),
             "chain_tail_marginal": distribution(chain_tail),
+            "a2_marginal": distribution(a2_marginal),
+            "b2_marginal": distribution(b2_marginal),
             "tree_siblings_marginal": distribution(tree_siblings),
         },
         "comparison": {
+            "tree_a2_total_vs_chain3_pct": round(100 * (a2_total / base_total - 1), 3),
+            "tree_b2_total_vs_chain3_pct": round(100 * (b2_total / base_total - 1), 3),
             "tree_total_vs_chain5_pct": round(100 * (tree_total / chain_total - 1), 3),
             "tree_extra_vs_chain_tail_pct": round(100 * (tree_extra / chain_extra - 1), 3),
             "sibling_extra_discount_pct": round(100 * (1 - tree_extra / chain_extra), 3),

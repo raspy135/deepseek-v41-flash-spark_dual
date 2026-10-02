@@ -237,3 +237,22 @@ order the same two tokens differently (2 of 160 observed draft positions). `TREE
 column 0 to the greedy-selected token and column 1 to the other top-2 token. Existing acceptance
 logs predate that fix; recollect them before using a one-percent throughput margin to justify the
 tree.
+
+#### Root sibling only: `chain3 + a2`
+
+Keeping only the root sibling is closer to viable. On the same 32 x 40 sample, its five meaningful
+rows use 18.420 distinct experts/layer: `a2` adds 2.143 over depth 3, or +13.2 %, versus +26.1 %
+for both siblings. Relative to one half of the ordinary two-row tail, its expert marginal is 16.4 %
+lower.
+
+The old prose acceptance log attributes 0.149 drafts/step to `a2`, making the provisional
+tokens/step `1.963 + 0.149 = 2.112` (+7.6 %). Applying the full expert discount optimistically to
+one `6.65 ms` row gives `85.6 + 6.65 * 0.836 = 91.16 ms`, or 23.17 tok/s versus depth 3's
+22.93 tok/s: approximately +1.0 %. This is the first free-sibling shape that is plausibly positive,
+but the margin is too small to claim before recollecting acceptance with the tie fix and timing an
+actual tree forward.
+
+There is also a mechanical issue: `root,a1,b1,c1,a2` is five verifier rows, while the current
+ratio-2 compressor requires an even verify width. A six-row kernel could pad with a duplicate or
+masked row whose expert set is already in the union; at concurrency 1 its extra arithmetic may fit
+in the compute slack, but that must be demonstrated rather than assumed.
