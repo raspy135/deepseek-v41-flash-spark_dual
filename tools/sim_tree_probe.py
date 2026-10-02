@@ -93,29 +93,38 @@ def main():
           f"| {tot_resc[0]/tot_resc[1]*100:5.1f}%")
     print("\nchainN = chain of N drafts (N+1 rows); tree3_rb = chain3 + a2 + b2 (6 rows)")
 
-    # Accepted length per branch. For a tree the branches are parallel, so accepted length is the
-    # metric; accepted/proposed serialises them and understates the tree.
-    print("\ntree branch accepted length, drafts/step")
-    print(f"{'class':8} {'steps':>6} | {'a1-b1-c1':>9} {'a1-b2':>7} {'a2':>6} | {'tree3':>6} {'chain3':>7}")
+    # Per-node acceptance. For a tree the branches are parallel, so count each node's own hit; the
+    # accepted length is the sum, and accepted/proposed would serialise them.
+    print("\ntree node acceptance (prose/code)")
+    print(f"{'class':8} {'steps':>6} | {'P(a1)':>6} {'P(a2)':>6} {'P(b1|a1)':>8} {'P(b2|a1)':>8} "
+          f"{'P(c1|a1b1)':>10} | {'accepted':>8} {'chain3':>7}")
     for cls, pred in (("prose", lambda w: w in ("explain", "story")),
                       ("code", lambda w: w not in ("explain", "story"))):
-        n = c3 = t3 = x1 = x2 = x3 = 0.0
+        n = c3 = a1s = a2s = b1s = b2s = c1s = 0.0
         for run in rep["runs"]:
             if not pred(run["workload"]):
                 continue
             for _d, _a, cand, top2 in run.get("tree_log") or []:
-                c, p, _u, _pr = step_metrics(cand, top2, 3, (0, 1))
-                c3 += c
-                t3 += p
                 a1 = cand[0] == top2[0][0]
                 b1 = a1 and len(cand) > 1 and cand[1] == top2[1][0]
                 b2 = a1 and len(cand) > 1 and cand[1] == top2[1][1]
                 c1 = b1 and len(cand) > 2 and cand[2] == top2[2][0]
-                x1 += 3 if c1 else 0
-                x2 += 2 if b2 else 0
-                x3 += 1 if cand[0] == top2[0][1] else 0
+                ch = 0
+                for i in range(3):
+                    if i < len(cand) and cand[i] == top2[i][0]:
+                        ch += 1
+                    else:
+                        break
+                c3 += ch
+                a1s += a1
+                a2s += cand[0] == top2[0][1]
+                b1s += b1
+                b2s += b2
+                c1s += c1
                 n += 1
-        print(f"{cls:8} {int(n):6d} | {x1/n:9.3f} {x2/n:7.3f} {x3/n:6.3f} | {t3/n:6.3f} {c3/n:7.3f}")
+        accepted = (a1s + a2s + b1s + b2s + c1s) / n
+        print(f"{cls:8} {int(n):6d} | {a1s/n:6.3f} {a2s/n:6.3f} {b1s/a1s:8.3f} {b2s/a1s:8.3f} "
+              f"{c1s/b1s:10.3f} | {accepted:8.3f} {c3/n:7.3f}")
 
     # Per-position coverage (conditioned on the chain prefix): how much the runner-up adds.
     cov = {}
