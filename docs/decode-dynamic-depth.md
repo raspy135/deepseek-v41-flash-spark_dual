@@ -118,3 +118,34 @@ a model, not engine measurements:
   unmeasured.
 - One prompt per workload. A prototype still has to beat adaptive depth in alternating
   full-engine runs, net of the per-step broadcast.
+
+## Free-sibling tree: measured, and it does not beat the current policy (2026-10-01)
+
+A chain's runner-ups (`top2[i][1]`) are candidates already conditioned on the chain's prefix, so a
+tree can carry them at no extra drafter cost -- one chain pass yields `a1,b1,c1` and also `a2` and
+`b2`. But each sibling is a **leaf**: its own continuation is a different forward, so accepting one
+adds a single token and stops.
+
+`DSV41_TREE_PROBE=1` logged the verifier's own argmax and the drafter's top-2 at every position of a
+depth-5 chain across the five workloads (816 steps); `tools/sim_tree_probe.py` replays the shapes
+against the measured row-cost curve (`59.0 + 6.65 x rows` ms, fit to the BLOCK 3/5/7 sweep):
+
+| workload | chain3 | chain5 | tree3 (chain3 + a runner-up sibling at each level) |
+| --- | ---: | ---: | ---: |
+| html | 41.40 | **49.87** | 37.30 |
+| python | 43.99 | **54.54** | 38.72 |
+| explain | **23.55** | 21.17 | 23.14 |
+| story | **22.24** | 19.57 | 21.71 |
+| mixed | 32.94 | **33.40** | 30.53 |
+| all | 29.59 | **30.53** | 27.74 |
+
+tok/s. The tree carries +9.5 % / +10.9 % tokens per step over chain5 on prose, and still loses:
+the two extra rows cost more than the rescued tokens, so it is behind chain3 -- the arm the policy
+already picks for prose -- and well behind chain5 on code. Every free-sibling shape tested is worse
+than the existing `DSV41_BLOCK_DYNAMIC=3,5`.
+
+To beat it, a tree needs a **deeper branch**, which means a second draft chain (or a tree-shaped
+draft pass, EAGLE-style) plus tree attention on the verify side: a tree buffer instead of the
+position-indexed ring (siblings share a position), per-node RoPE positions, and the recurrent
+compressor forked per branch. The measured upside for the free part is ~0.10 tokens/step pooled
+(0.15 prose, 0.04 code), so that build starts from a negative and was not attempted.

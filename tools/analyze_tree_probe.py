@@ -58,8 +58,8 @@ def main():
             cells.append(f"p{i}: {r} {100*h/r:.0f}% res{100*s/m if m else 0:.0f}% (miss {m})")
         print(f"{run['workload']:10} {len(log):6d} {acc:12.2f} | " + "  ".join(cells))
     print("\nall runs, pooled per position:")
-    for i, (r, h, m, s) in enumerate(sorted(agg.items())):
-        r, h, m, s = agg[i]
+    for i, vals in sorted(agg.items()):
+        r, h, m, s = vals
         if not r:
             continue
         print(f"  position {i}: reached {r:5d}  hit {100*h/r:5.1f}%  first-miss {m:5d}  "
