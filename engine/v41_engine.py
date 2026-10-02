@@ -76,6 +76,17 @@ PREFILL_SWAP_MIN_MISS = ADAPT.swap_prefill_min_miss
 # Sampling semantics are untouched: the temperature > 0 path is the ORIGINAL code, RNG draw for RNG
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
+# Request-local prompt-lookup drafting.  A value N >= 2 uses an exact N-token suffix match to
+# propose a previously seen continuation and skips DSpark for that greedy step.  Zero disables it.
+# Default off until the full-engine A/B establishes a win on more than a copy-heavy microbenchmark.
+LOOKUP_DRAFT_NGRAM = int(os.environ.get("DSV41_LOOKUP_DRAFT_NGRAM", "0") or "0")
+LOOKUP_DRAFT_CANDIDATES = int(os.environ.get("DSV41_LOOKUP_DRAFT_CANDIDATES", "8") or "8")
+if LOOKUP_DRAFT_NGRAM < 0:
+    raise ValueError("DSV41_LOOKUP_DRAFT_NGRAM must be 0 (off) or at least 2")
+if LOOKUP_DRAFT_NGRAM == 1:
+    raise ValueError("DSV41_LOOKUP_DRAFT_NGRAM=1 is too ambiguous; use at least 2")
+if LOOKUP_DRAFT_CANDIDATES < 1:
+    raise ValueError("DSV41_LOOKUP_DRAFT_CANDIDATES must be positive")
 
 
 class StepPhases:
@@ -920,6 +931,11 @@ class V41Engine:
                 # decided on rank 0 and broadcast with the control flag, so the other
                 # DSV41_BLOCK_DYNAMIC_* policy knobs only need to be right on rank 0.
                 "block_dynamic": os.environ.get("DSV41_BLOCK_DYNAMIC", ""),
+                # Request-local exact-continuation drafting changes whether the DSpark graph and
+                # its TP collectives run on a step.  A split pair would deadlock immediately, so
+                # both the switch and bounded occurrence count belong in the boot guard.
+                "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
+                "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
                 # Decode fp8 scheduling and projection merging are meant to be bit-identical to
                 # the defaults, but that is a measured property of this GPU and compiler, not a
                 # guarantee; a pair split across them must refuse to start.
@@ -1079,6 +1095,11 @@ class V41Engine:
             self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS)
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
+        if LOOKUP_DRAFT_NGRAM:
+            if int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) != 1:
+                raise ValueError("lookup drafting currently supports DSV41_MAX_CONCURRENCY=1 only")
+            log(f"request-local lookup drafting enabled (exact {LOOKUP_DRAFT_NGRAM}-token suffix, "
+                f"{LOOKUP_DRAFT_CANDIDATES} recent occurrences/key; greedy only)")
         torch.cuda.synchronize()
         if self.ep.active:
             # Force the NCCL communicator into existence now instead of inside the first
@@ -1393,6 +1414,8 @@ class V41Engine:
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
                 "spec_conf": _st.get("conf"),
                 "tree_probe": _st.get("tree"),
+                "lookup_draft": (_st["lookup_draft"].report()
+                                 if _st.get("lookup_draft") is not None else None),
                 "spec_depth": (self.depth_policy.report() if getattr(self, "depth_policy", None) is not None
                                else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
@@ -2100,6 +2123,15 @@ class V41Engine:
         from engine.fastdecode import SPEC_CONF, TREE_PROBE
         conf_hist = [] if (SPEC_CONF and self.spec and self.fast is not None) else None
         tree_hist = [] if (TREE_PROBE and self.spec and self.fast is not None) else None
+        lookup_draft = None
+        if (LOOKUP_DRAFT_NGRAM and self.spec and self.fast is not None and temperature <= 0
+                and conf_hist is None and tree_hist is None):
+            from engine.lookup_draft import ExactDraftCache
+            history = list(host_ids) if host_ids is not None else ids.tolist()
+            lookup_draft = ExactDraftCache(history, LOOKUP_DRAFT_NGRAM, LOOKUP_DRAFT_CANDIDATES)
+            # `tok` is already settled but has not passed through the verifier yet.  It belongs in
+            # the lookup history now: the first speculative step predicts the token after it.
+            lookup_draft.extend([tok])
         ph = StepPhases() if STEP_TIMING else None
         if self.fast is not None:
             # the engram row wait and the graph queueing both live inside the "step" phase; record
@@ -2108,6 +2140,7 @@ class V41Engine:
             # true about the graphed path, which is where all of decode's time actually goes.
             out_st["fd0"] = dict(self.fast.stats)
         out_st.update(n_out=1, steps=0, accepted=accepted_hist, conf=conf_hist, tree=tree_hist,
+                      lookup_draft=lookup_draft,
                       t_decode0=time.perf_counter(), phases=ph)
         steps = 0
         # The gate cannot be constraining anything yet (it engages on a marker that takes several
@@ -2161,15 +2194,25 @@ class V41Engine:
                 # the lean path applies to greedy decoding only; temperature > 0 keeps the original
                 # sequential rejection-sampling loop so its RNG stream is bit-for-bit unchanged
                 lean = LEAN_STEP and self.fast is not None and temperature <= 0
+                lookup_tokens = lookup_draft.propose(depth) if lookup_draft is not None else None
+                lookup_used = lookup_tokens is not None
                 if self.fast is not None:
-                    drafts, q = self.fast.draft(tok, pos - 1, temperature)
+                    if lookup_used:
+                        # Tiny H2D copy instead of the three-block DSpark graph.  The target still
+                        # verifies every id, so a stale continuation costs acceptance, never text.
+                        drafts = torch.tensor(lookup_tokens, dtype=torch.long, device=self.device)
+                        q = None                    # greedy verification never reads draft probs
+                    else:
+                        drafts, q = self.fast.draft(tok, pos - 1, temperature)
                     if depth < drafts.numel():
                         # dynamic depth: verify the first `depth` of the deeper draft
-                        drafts, q = drafts[:depth], q[:depth]
+                        drafts, q = drafts[:depth], (None if q is None else q[:depth])
                     if not lean:
                         # the drafter's static buffers survive until the next draft() call, which is
                         # after this step's verification, so the lean path does not need the copies
-                        drafts = drafts.clone(); q = q.clone()
+                        drafts = drafts.clone()
+                        if q is not None:
+                            q = q.clone()
                     if ph is not None:
                         ph.mark("draft")
                     if lean:
@@ -2253,6 +2296,8 @@ class V41Engine:
                             break
                     if ph is not None:
                         ph.mark("verify")
+                    if lookup_used:
+                        lookup_draft.record_accept(a)
                     m.c.rollback(pos + a + 1)
                     if ph is not None:
                         ph.mark("rollback")
@@ -2277,6 +2322,8 @@ class V41Engine:
                         if pen is not None:
                             pen.observe(emitted)
                         out += emitted
+                        if lookup_draft is not None:
+                            lookup_draft.extend(emitted)
                         n_out += len(emitted)
                         out_st["n_out"] = n_out
                         if grammar is not None:
@@ -2336,6 +2383,8 @@ class V41Engine:
                     _ev_sample.record()
                 if ph is not None:
                     ph.mark("verify")
+                if lookup_used:
+                    lookup_draft.record_accept(a)
                 # caches valid for positions < pos + a + 1 (tok + accepted drafts)
                 m.c.rollback(pos + a + 1)
                 if self.fast is None:
@@ -2355,6 +2404,8 @@ class V41Engine:
                     if pen is not None:
                         pen.observe(emitted)
                     out += emitted
+                    if lookup_draft is not None:
+                        lookup_draft.extend(emitted)
                     n_out += len(emitted)
                     out_st["n_out"] = n_out
                     if grammar is not None:
@@ -2477,6 +2528,8 @@ class V41Engine:
             "act_quant": self.act_quant,
             "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0") == "1",
             "no_repeat_ngram": int(os.environ.get("DSV41_NO_REPEAT_NGRAM", "0")),
+            "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
+            "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
             "swa_replay": self.swa_replay,
             "prefill_skip_null": (self.ep.active and self.kernel == "triton-fp4" and
                                   os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1"),

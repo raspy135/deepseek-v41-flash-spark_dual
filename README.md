@@ -131,6 +131,7 @@ The main capacity and speed controls:
 | `DSV41_TP_EMBED=1` | Split input embedding columns across two ranks; saves 0.62 GiB per node. Adds one gather per lookup, without changing stored precision. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
 | `DSV41_BLOCK_DYNAMIC=3,5` | Choose the draft depth per request: 5 while acceptance is high, 3 otherwise. For a fixed depth, remove it and set `DSV41_BLOCK=3` (never both). Needs `DSV41_MAX_CONCURRENCY=1`. See [measurements](docs/decode-dynamic-depth.md). |
+| `DSV41_LOOKUP_DRAFT_NGRAM=16` | For greedy decoding, use an exact request-local suffix match to propose a known continuation and skip DSpark on a hit. Zero/unset disables it. The target still verifies every token. |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |

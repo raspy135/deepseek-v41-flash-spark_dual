@@ -256,3 +256,35 @@ There is also a mechanical issue: `root,a1,b1,c1,a2` is five verifier rows, whil
 ratio-2 compressor requires an even verify width. A six-row kernel could pad with a duplicate or
 masked row whose expert set is already in the union; at concurrency 1 its extra arithmetic may fit
 in the compute slack, but that must be demonstrated rather than assumed.
+
+### Request-local exact-continuation drafts
+
+`DSV41_LOOKUP_DRAFT_NGRAM=N` enables prompt-lookup drafting for greedy decoding. The engine indexes
+exact N-token suffixes from the current request only. If the current suffix occurred earlier and a
+full continuation for the selected verify depth is already settled, that continuation replaces the
+DSpark proposal for the step. The target verifies the same ordinary causal block, so output remains
+lossless and no tree attention is needed; a hit also skips the complete DSpark graph.
+
+The cache retains a bounded number of recent occurrences per suffix and chooses the one with the
+longest matching preceding context. It is request-local by design: a cross-request cache would retain
+user token sequences and make rank agreement harder. Sampling continues to use DSpark because its
+rejection sampler needs the drafter probabilities. `SPEC_CONF` and `TREE_PROBE` collection also keep
+DSpark active so their logs remain meaningful.
+
+Three clean-process two-Spark TP2 A/Bs on 2026-10-02, dynamic depth 3/5, 96 output tokens,
+after warming both paths:
+
+| run | lookup off tok/s | exact-16 tok/s | off wall | exact-16 wall | accepted / proposed |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 50.52 | 57.88 | 2.522 s | 2.299 s | 75 / 75 |
+| 2 | 54.97 | 62.48 | 2.358 s | 2.136 s | 75 / 75 |
+| 3 | 55.70 | 62.21 | 2.319 s | 2.139 s | 75 / 75 |
+
+Both ranks produced the same output hash with lookup off and on. This is deliberately the best case:
+the prompt repeated the same natural-language sentence 24 times, so all 21 lookups hit and every
+proposal was accepted. The median paired improvement from skipping all 21 DSpark graphs was 13.7%
+in decode throughput and 9.7% in request-level throughput including prefill. A second correctness
+case planted a continuation whose first token the target rejected; it then mixed 5 lookup hits with
+11 DSpark misses and still matched lookup-off output on both ranks. Real gains scale with exact-match
+and acceptance rates, so the feature remains off by default until measured on representative
+traffic. `N=16` is the conservative starting point for copy-heavy prompts.

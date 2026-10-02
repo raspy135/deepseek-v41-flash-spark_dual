@@ -188,6 +188,12 @@ class EngineIntegrationTests(unittest.TestCase):
 def sampled_tail(self, logits, q, drafts, temperature, top_p, stop_ids, max_tokens, m):
     pos, n_out, tok, steps = 10, 0, 0, 0
     ph = pen = grammar = None
+    lookup_draft = None
+    lookup_used = False
+    conf_hist = None
+    pol = None
+    t_iter = 0
+    n_graphs = 0
     accepted_hist, out, out_st = [], [], {}
     for _ in range(1):
         pass
