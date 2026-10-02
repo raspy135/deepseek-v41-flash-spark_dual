@@ -150,6 +150,31 @@ are read.
 A 7-row tree (with the third sibling) and an 8-row tree5 are worse still (26.00 and 28.44 all-mean).
 Every free-sibling shape tested is behind the existing `DSV41_BLOCK_DYNAMIC=3,5`.
 
+Acceptance, same log (pooled, 816 steps):
+
+| metric | chain3 | chain5 | tree3_rb |
+| --- | ---: | ---: | ---: |
+| tokens/step | 2.53 | **3.02** | 2.70 |
+| accept rate (accepted/proposed) | **51.1%** | 40.4% | 34.1% |
+| rescue (top-1 miss, runner-up holds) | -- | -- | 17.2% |
+
+The tree does accept more than a chain of the same depth (+0.05 to +0.23 tokens/step over chain3,
+and the runner-up holds 36 % of the root's misses), but its rate is *lower* than any chain and at the
+same 6 rows the depth-5 chain accepts 0.32 tokens/step more. Per position (chain prefix fixed):
+
+| pos | top-1 | top-2 | union | P(#2 | miss) |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 70.7% | 10.5% | 81.2% | 36.0% |
+| 1 | 60.3% | 10.8% | 71.1% | 27.2% |
+| 2 | 52.5% | 10.4% | 62.9% | 21.9% |
+
+Depth beats breadth here because chain5 spends its rows where top-1 still holds 42--52 % of the
+time, while the runner-up holds ~10 %. One caveat this replay cannot settle: the row cost
+(6.65 ms/row) is measured on *chains*. A tree's siblings share a parent, so their MoE expert sets
+should overlap more than successive chain tokens, which would make the tree's rows cheaper than the
+model assumes. Closing the 11 % gap needs that overlap to be large; only a real tree forward can
+measure it, and it was not built for the ~0.10 tokens/step the free part offers.
+
 To beat it, a tree needs a **deeper branch**, which means a second draft chain (or a tree-shaped
 draft pass, EAGLE-style) plus tree attention on the verify side: a tree buffer instead of the
 position-indexed ring (siblings share a position), per-node RoPE positions, and the recurrent

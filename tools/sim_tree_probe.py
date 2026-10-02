@@ -1,19 +1,19 @@
-"""Replay the DSV41_TREE_PROBE log: would a free-sibling tree have been faster?
+"""Replay the DSV41_TREE_PROBE log: acceptance rate and throughput, chain vs free-sibling tree.
 
 The probe recorded, at every position of a depth-5 chain, the verifier's own argmax (`cand[i]`, the
-token the target would emit -- that is what "correct" means) and the drafter's top-2 (`top2[i]`). A
-tree's siblings are exactly those runner-ups, and they cost no extra drafter work: `top2[i][1]` is
-already conditioned on the chain's prefix up to i.
+token the target would emit) and the drafter's top-2 (`top2[i]`). The siblings in a tree are exactly
+those runner-ups, and they cost no extra drafter work: `top2[i][1]` is already conditioned on the
+chain's prefix up to i.
 
-So every shape can be replayed from one log:
+Readouts from one log:
 
-  chainD   t0 -> a1 -> b1 -> ... -> z1        D drafts, rows = D + 1
-  treeD    chainD + a runner-up sibling at every level; a sibling is a LEAF (no continuation),
-           rows = D + 1 + D
-
-Rows are what cost: the step is ~59.0 + 6.65 x rows ms, fit to the BLOCK=3/5/7 width sweep
-(rows 4/6/8 -> 85.6/98.5/112.2 ms on the pair). So the honest readout is tok/s, not tokens/step --
-a shape that adds tokens but adds rows can still lose.
+  tokens/step   accepted drafts + the bonus token
+  tok/s         tokens/step over the measured row cost (~59.0 + 6.65 x rows ms, fit to the BLOCK
+                3/5/7 sweep: rows 4/6/8 -> 85.6/98.5/112.2 ms). A row is ~2.7 distinct experts.
+  accept rate   accepted drafts / proposed drafts. A tree proposes more, so it must accept
+                proportionally more to tie on tokens.
+  rescue        steps where the top-1 missed and the runner-up held -- the only steps a tree can
+                extend that a chain cannot.
 
     python tools/sim_tree_probe.py results/<dir>/spec-conf-rank0.json
 """
@@ -23,27 +23,29 @@ import argparse
 import json
 
 
-def chain_tokens(cand, top2, depth):
-    acc = 0
+def step_metrics(cand, top2, depth, sib):
+    """(chain_accepted, tree_accepted, sibling_used, tree_proposed) for one step."""
+    chain = 0
     for i in range(depth):
         if i >= len(cand) or cand[i] != top2[i][0]:
             break
-        acc += 1
-    return acc + 1
-
-
-def tree_tokens(cand, top2, depth, sib):
-    path = 0
+        chain += 1
+    path, used = 0, 0
     for i in range(depth):
         if i >= len(cand):
             break
         if cand[i] == top2[i][0]:
             path += 1
         elif i in sib and cand[i] == top2[i][1]:
-            return path + 2          # sibling accepted (path + 1) and its bonus token
+            path, used = path + 1, 1
+            break
         else:
             break
-    return path + 1
+    return chain, path, used, depth + len(sib)
+
+
+ARMS = [("chain3", 3, (), 4), ("chain5", 5, (), 6), ("tree3_rb", 3, (0, 1), 6)]
+MS = lambda rows: 59.0 + 6.65 * rows
 
 
 def main():
@@ -52,32 +54,61 @@ def main():
     args = ap.parse_args()
     rep = json.load(open(args.report))
     assert rep.get("tree_probe"), "collect with DSV41_TREE_PROBE=1"
-    ms = lambda rows: 59.0 + 6.65 * rows
-    # (name, chain?, depth, sibling levels, rows). rows = depth + 1 + len(sibling levels).
-    shapes = [("chain1", "c", 1, (), 2), ("chain3", "c", 3, (), 4), ("chain5", "c", 5, (), 6),
-              ("tree3_rb", "t", 3, (0, 1), 6),      # a2 and b2 only -- the proposal
-              ("tree3_all", "t", 3, (0, 1, 2), 7),  # + a c2 sibling
-              ("tree5_rb", "t", 5, (0, 1), 8)]
-    print(f"{'workload':10} {'steps':>6} | " + " ".join(f"{n:>7}" for n, *_ in shapes) + "   (tok/s)")
-    rate = {n: [0.0, 0] for n, *_ in shapes}
+    hdr = (f"{'workload':10} {'steps':>6} | {'tokens/step':^27} | {'tok/s':^27} | "
+           f"{'accept rate (acc/prop)':^27} | rescue")
+    print(hdr)
+    tot = {nm: {"t": 0.0, "a": 0.0, "n": 0} for nm, *_ in ARMS}
+    tot_resc = [0, 0]
     for run in rep["runs"]:
         log = run.get("tree_log") or []
         if not log:
             continue
-        cells = []
-        for name, kind, depth, sib, rows in shapes:
-            if kind == "c":
-                fn = lambda c, t, d=depth: chain_tokens(c, t, d)
-            else:
-                fn = lambda c, t, d=depth, s=sib: tree_tokens(c, t, d, s)
-            tok = sum(fn(c, t) for _d, _a, c, t in log) / len(log)
-            rate[name][0] += tok * len(log)
-            rate[name][1] += len(log)
-            cells.append(f"{tok / (ms(rows) / 1000):7.2f}")
-        print(f"{run['workload']:10} {len(log):6d} | " + " ".join(cells))
-    print(f"{'ALL':10} {'':>6} | " +
-          " ".join(f"{rate[n][0] / rate[n][1] / (ms(r) / 1000):7.2f}" for n, _, _, _, r in shapes))
-    print("\nchainN = chain of N drafts; treeN = chainN + a runner-up sibling at every level")
+        n = len(log)
+        tok = {nm: 0.0 for nm, *_ in ARMS}
+        acc = {nm: 0.0 for nm, *_ in ARMS}
+        resc = 0
+        for _d, _a, cand, top2 in log:
+            for nm, depth, sib, rows in ARMS:
+                c, p, u, prop = step_metrics(cand, top2, depth, sib)
+                accepted = p if sib else c
+                tok[nm] += accepted + 1
+                acc[nm] += accepted / (prop if sib else depth)
+                if nm == "tree3_rb":
+                    resc += u
+        print(f"{run['workload']:10} {n:6d} | " +
+              " ".join(f"{tok[nm]/n:8.2f} " for nm, *_ in ARMS) + "| " +
+              " ".join(f"{tok[nm]/(MS(r)/1000)/n:8.2f} " for nm, _d, _s, r in ARMS) + "| " +
+              " ".join(f"{acc[nm]/n*100:8.1f}% " for nm, *_ in ARMS) + f"| {resc/n*100:5.1f}%")
+        for nm, _d, _s, rows in ARMS:
+            tot[nm]["t"] += tok[nm]
+            tot[nm]["a"] += acc[nm]
+            tot[nm]["n"] += n
+        tot_resc[0] += resc
+        tot_resc[1] += n
+    n = tot["chain3"]["n"]
+    print(f"{'ALL':10} {n:6d} | " +
+          " ".join(f"{tot[nm]['t']/n:8.2f} " for nm, *_ in ARMS) + "| " +
+          " ".join(f"{tot[nm]['t']/n/(MS(r)/1000):8.2f} " for nm, _d, _s, r in ARMS) + "| " +
+          " ".join(f"{tot[nm]['a']/n*100:8.1f}% " for nm, *_ in ARMS) +
+          f"| {tot_resc[0]/tot_resc[1]*100:5.1f}%")
+    print("\nchainN = chain of N drafts (N+1 rows); tree3_rb = chain3 + a2 + b2 (6 rows)")
+
+    # Per-position coverage (conditioned on the chain prefix): how much the runner-up adds.
+    cov = {}
+    for run in rep["runs"]:
+        for _d, _a, cand, top2 in run.get("tree_log") or []:
+            for i in range(min(len(cand), len(top2))):
+                s = cov.setdefault(i, [0, 0, 0, 0])
+                s[0] += 1
+                s[1] += cand[i] == top2[i][0]
+                s[2] += cand[i] == top2[i][1]
+                s[3] += cand[i] != top2[i][0] and cand[i] == top2[i][1]
+    print("\nper-position (chain prefix held fixed)")
+    print(f"{'pos':>3} {'n':>6}  {'top1':>7}  {'top2':>7}  {'top1|top2':>9}  {'rescue|miss':>11}  {'miss':>6}")
+    for i in sorted(cov):
+        n, h1, h2, r = cov[i]
+        print(f"{i:3d} {n:6d}  {h1/n*100:6.1f}%  {h2/n*100:6.1f}%  {(h1+r)/n*100:8.1f}%  "
+              f"{r/max(n-h1,1)*100:10.1f}%  {(1-h1/n)*100:5.1f}%")
 
 
 if __name__ == "__main__":
