@@ -150,17 +150,30 @@ are read.
 A 7-row tree (with the third sibling) and an 8-row tree5 are worse still (26.00 and 28.44 all-mean).
 Every free-sibling shape tested is behind the existing `DSV41_BLOCK_DYNAMIC=3,5`.
 
-Acceptance, same log (pooled, 816 steps):
+Acceptance, same log. For a tree the meaningful number is accepted length per verification, not
+accepted/proposed -- a tree's branches are parallel hypotheses, so dividing by the number of nodes
+serialises them and understates the tree.
 
 | metric | chain3 | chain5 | tree3_rb |
 | --- | ---: | ---: | ---: |
 | tokens/step | 2.53 | **3.02** | 2.70 |
-| accept rate (accepted/proposed) | **51.1%** | 40.4% | 34.1% |
+| accepted drafts/step | 1.53 | 2.02 | 1.70 |
 | rescue (top-1 miss, runner-up holds) | -- | -- | 17.2% |
 
-The tree does accept more than a chain of the same depth (+0.05 to +0.23 tokens/step over chain3,
-and the runner-up holds 36 % of the root's misses), but its rate is *lower* than any chain and at the
-same 6 rows the depth-5 chain accepts 0.32 tokens/step more. Per position (chain prefix fixed):
+On prose (explain+story, 464 steps), the shape the tree is for:
+
+| | accepted drafts/step | tokens/step |
+| --- | ---: | ---: |
+| chain3 (`a1,b1,c1`) | 0.963 | 1.963 |
+| tree3 (three branches from t0: `a1-b1-c1`, `a1-b2`, `a2`) | 1.190 | 2.190 (+11.5%) |
+
+Branch accepted lengths (drafts/step): `a1-b1-c1` 0.330 (all three), `a1-b2` 0.155, `a2` 0.149. On
+code the same tree adds only +3.0%, because the chain is already deep and the runner-up is rare
+there (`a2` 0.048, `a1-b2` 0.102).
+
+So the tree does accept more, on prose, by 11.5%. The whole question is then the two extra rows:
+converting that to tok/s needs the sibling rows to cost <= ~5 ms each, a ~25% discount against a
+fresh row, which is the expert-overlap a replay cannot measure. Per position (chain prefix fixed):
 
 | pos | top-1 | top-2 | union | P(#2 | miss) |
 | --- | ---: | ---: | ---: | ---: |
