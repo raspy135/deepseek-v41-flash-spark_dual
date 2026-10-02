@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
+from engine import ablit as R_ablit  # noqa: E402
 from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
@@ -893,6 +894,10 @@ class V41Engine:
                 "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
                 "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
                 "roce_hcas": os.environ.get("DSV41_ROCE_HCAS", "2"),
+                # The abliteration overlay changes layers 10-35 attn.wo_b, so a pair must load the
+                # same file -- the digest, not just the switch, is what both ranks compare.
+                "ablate_wob": R_ablit.enabled(),
+                "ablate_wob_digest": R_ablit.digest(),
                 "head_fmt": R.head_fmt(),
                 "draft_head_fmt": R.draft_head_fmt(),
                 "hc_kernel": R.HC_KERNEL,
@@ -2435,6 +2440,7 @@ class V41Engine:
             "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
             "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
+            "ablate_wob": R_ablit.enabled(),
             "draft_head_fmt": R.draft_head_fmt(),
             "hc_kernel": R.HC_KERNEL,
             "hc_prec": R.HC_PREC,

@@ -243,6 +243,11 @@ class Weights:
                 handles[f] = safe_open(path, "pt", device="cpu")
             return handles[f].get_tensor(name)
 
+        # DSV41_ABLIT_WOB: an abliteration overlay for layers 10-35 attn.wo_b (engine/ablit.py),
+        # substituted here so every consumer -- and the DENSE_FP4 re-quantization -- sees it.
+        from engine import ablit
+        get = ablit.loader(get)
+
         t0 = time.time()
         if os.environ.get('DSV41_TP_EMBED', '0') == '1':
             from engine.tensor_parallel import FeatureParallelEmbedding, shard
