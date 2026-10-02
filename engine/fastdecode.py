@@ -153,6 +153,11 @@ DYNAMIC_DEPTHS = _dynamic_depths()
 # records it per step. Observation only: nothing reads it to choose a width yet. Off by default so
 # the served draft graph is unchanged; tools/bench_spec_conf_tp.py collects it.
 SPEC_CONF = os.environ.get("DSV41_SPEC_CONF", "0") == "1"
+# DSV41_TREE_PROBE=1: record, per draft position, the DSpark drafter's top-2 (d_top2) so the decode
+# loop can log it beside the verifier's argmax. Observation only -- it answers one question before a
+# tree is built: when the drafter's top-1 misses, how often is the target's token its #2? That rate,
+# not the tree mechanism, decides whether a second candidate is worth a second draft chain.
+TREE_PROBE = os.environ.get("DSV41_TREE_PROBE", "0") == "1"
 T_DRAFT = DYNAMIC_DEPTHS[-1] if DYNAMIC_DEPTHS else _draft_block()
 T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts; the widest verify block
 # Every verify width this process captures graphs and static buffers for.
@@ -223,6 +228,7 @@ class FastDecoder:
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
         self.d_probs = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)
         self.d_conf = torch.zeros(T_DRAFT, dtype=torch.float32, device=dev)   # raw logits, SPEC_CONF only
+        self.d_top2 = torch.zeros(T_DRAFT, 2, dtype=torch.long, device=dev)   # drafter top-2, TREE_PROBE only
         # Mode-independent draft constants.  They used to be rebuilt by captured fill/arange
         # kernels every replay; only element zero of the ids changes with the accepted token.
         self._d_ids = torch.full((T_DRAFT,), a.dspark_noise_token_id, dtype=torch.long, device=dev)
@@ -923,6 +929,8 @@ class FastDecoder:
             embeds.append(e)
             bias = _lin(e, self.markov_head_bf16).float()[0]
             lg = logits[i] + bias
+            if TREE_PROBE:
+                self.d_top2[i].copy_(lg.topk(2).indices)
             if greedy:
                 # Greedy verification never reads q=d_probs.  Avoid five vocabulary-wide
                 # softmax/log/Gumbel passes that the old dynamic torch.where computed anyway.

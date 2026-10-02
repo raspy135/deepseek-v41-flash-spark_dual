@@ -41,8 +41,8 @@ def main():
                    spec=True, prune_keep=.61, transient_slots=16, keep_free_gb=6)
     tok, enc = Tok(root), load_encoding_module(root)
     eos = tok.token_to_id(enc.eos_token)
-    report = dict(config=e.config(), spec_conf=FD.SPEC_CONF, draft_tokens=FD.T_DRAFT,
-                  max_tokens=args.max_tokens, runs=[])
+    report = dict(config=e.config(), spec_conf=FD.SPEC_CONF, tree_probe=FD.TREE_PROBE,
+                  draft_tokens=FD.T_DRAFT, max_tokens=args.max_tokens, runs=[])
 
     def emit(kind, item):
         print('SPEC_CONF_' + kind + ' ' + json.dumps(dict(rank=e.ep.rank, **item)), flush=True)
@@ -63,7 +63,8 @@ def main():
             emit('WARMUP' if warm else 'RUN', item)
             if not warm:
                 # steps: [verified depth, leading accepts, [confidence logit per draft]]
-                report['runs'].append(dict(item, steps_log=st.get('spec_conf')))
+                report['runs'].append(dict(item, steps_log=st.get('spec_conf'),
+                                          tree_log=st.get('tree_probe')))
     # The gate launcher creates its log directory on the head only; the worker's results mount
     # does not have it, and a rank-1 write failure here would fail the whole gate at the end.
     owner = os.stat('/app/results')

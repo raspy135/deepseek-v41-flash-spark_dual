@@ -1392,6 +1392,7 @@ class V41Engine:
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
                 "spec_conf": _st.get("conf"),
+                "tree_probe": _st.get("tree"),
                 "spec_depth": (self.depth_policy.report() if getattr(self, "depth_policy", None) is not None
                                else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
@@ -2096,8 +2097,9 @@ class V41Engine:
         accepted_hist = []
         # DSV41_SPEC_CONF=1: per step (verified depth, leading accepts, confidence logits [T_DRAFT]).
         # Rank-local observation; it never feeds back into the step, so the ranks cannot diverge on it.
-        from engine.fastdecode import SPEC_CONF
+        from engine.fastdecode import SPEC_CONF, TREE_PROBE
         conf_hist = [] if (SPEC_CONF and self.spec and self.fast is not None) else None
+        tree_hist = [] if (TREE_PROBE and self.spec and self.fast is not None) else None
         ph = StepPhases() if STEP_TIMING else None
         if self.fast is not None:
             # the engram row wait and the graph queueing both live inside the "step" phase; record
@@ -2105,8 +2107,8 @@ class V41Engine:
             # it is a dict of four floats, and decode_accounting below needs it to say anything
             # true about the graphed path, which is where all of decode's time actually goes.
             out_st["fd0"] = dict(self.fast.stats)
-        out_st.update(n_out=1, steps=0, accepted=accepted_hist, conf=conf_hist, t_decode0=time.perf_counter(),
-                      phases=ph)
+        out_st.update(n_out=1, steps=0, accepted=accepted_hist, conf=conf_hist, tree=tree_hist,
+                      t_decode0=time.perf_counter(), phases=ph)
         steps = 0
         # The gate cannot be constraining anything yet (it engages on a marker that takes several
         # tokens to write), but it has to see every settled token to stay in step with the stream.
@@ -2257,6 +2259,9 @@ class V41Engine:
                     accepted_hist.append(a)
                     if conf_hist is not None:
                         conf_hist.append((depth, a, self.fast.d_conf.tolist()))
+                    if tree_hist is not None:
+                        # (depth, leading accepts, verifier argmax per row, drafter top-2 per row)
+                        tree_hist.append((depth, a, list(cand[:depth]), self.fast.d_top2[:depth].tolist()))
                     emitted = list(new)
                     if bonus is not None:
                         emitted.append(bonus)
