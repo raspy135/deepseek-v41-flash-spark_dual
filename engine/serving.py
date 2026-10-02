@@ -20,7 +20,14 @@ class ScheduledPeer:
     def __getattr__(self, name):
         return getattr(self.peer, name)
 
-    def control(self, keep_going):
+    def control(self, keep_going, value: int = 0, flag: int = 0) -> bool:
+        """EPDistributed.control(keep_going, depth, adapt-flag) is the single-request step gate;
+        the scheduler owns termination for both lanes and the batch path runs a fixed verify width,
+        so a lane obeys its own scheduler and records the extras without acting on them (under
+        DSV41_MAX_CONCURRENCY=2 the depth policy is None and the decode-adaptation flag is off, so
+        neither is ever read back). Accepting the two arguments is what keeps this in step with
+        engine/dist.py:control."""
+        self.control_value, self.control_flag = int(value), int(flag)
         return keep_going
 
     def release_peer(self):

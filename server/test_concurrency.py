@@ -103,6 +103,17 @@ class TestScheduler(unittest.TestCase):
         self.assertIn({'op': 'close', 'lane': 0}, runtime.actions)
         self.assertIsNone(state.ep_fault)
 
+    def test_scheduled_peer_control_accepts_the_step_gate_args(self):
+        """engine/dist.py:control grew (value, flag) for the depth and adaptation broadcast; the
+        lane's stub must keep up or the first concurrent request dies with "takes 2 positional
+        arguments but 4 were given" and marks the pair out of step."""
+        from engine.serving import ScheduledPeer
+        peer = ScheduledPeer(SimpleNamespace(rank=0, active=True))
+        self.assertTrue(peer.control(True, 5, 1))
+        self.assertEqual((peer.control_value, peer.control_flag), (5, 1))
+        self.assertFalse(peer.control(False))
+        self.assertEqual(peer.rank, 0)          # __getattr__ still reaches the wrapped peer
+
     def test_stream_eof_is_stable(self):
         job = RequestStream({})
         job.finish({'done': True})
