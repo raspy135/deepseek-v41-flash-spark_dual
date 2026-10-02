@@ -193,3 +193,28 @@ draft pass, EAGLE-style) plus tree attention on the verify side: a tree buffer i
 position-indexed ring (siblings share a position), per-node RoPE positions, and the recurrent
 compressor forked per branch. The measured upside for the free part is ~0.10 tokens/step pooled
 (0.15 prose, 0.04 code), so that build starts from a negative and was not attempted.
+
+### The sibling row cost, measured (2026-10-02)
+
+The replay above could only assume a sibling costs `6.65 ms` like any row. That assumption is the
+whole verdict, so it was measured: `tools/bench_sibling_experts.py` records `route_idx` from a plain
+causal forward. A candidate's routing depends only on its ancestors, so a forward reproduces the row
+a tree would compute exactly, and batching the rows in one load would not change any row's expert
+set -- only its timing. So the overlap measured here is what the one-load implementation would see.
+
+30 positions x 40 layers, k=6, production prune (keep 0.61):
+
+| pair | union | marginal experts/layer | jaccard | vs a chain row |
+| --- | ---: | ---: | ---: | ---: |
+| root sibling `a1 -> a2` | 9.69 | 3.69 | 0.262 | **1.02** |
+| deep sibling `b1 -> b2` | 9.12 | 3.12 | 0.365 | **0.86** |
+| chain neighbour `x_{p+1} -> x_{p+2}` | 9.61 | 3.61 | 0.272 | 1.00 |
+
+The root sibling adds exactly as many new experts as a chain row; the deep sibling saves 14 %. A
+combined ~6 % is far short of the ~26 % the tree needed to convert its +11.5 % prose tokens into
+tok/s. Two tokens that share a parent are not meaningfully cheaper to route than two consecutive
+tokens, because the token identity dominates the router, not the context.
+
+This closes the free-sibling tree as a measured negative rather than an assumed one. It does not
+close a *tree-shaped draft pass* (a second draft chain under the branch), which would buy depth
+rather than breadth -- but that is the EAGLE-style build, and nothing measured here argues for it.
