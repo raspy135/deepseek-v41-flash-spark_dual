@@ -148,20 +148,24 @@ def _dynamic_depths():
 
 
 DYNAMIC_DEPTHS = _dynamic_depths()
+from engine.spec_depth import confidence_depths
+CONFIDENCE_DEPTHS = confidence_depths(DYNAMIC_DEPTHS)
 # DSV41_SPEC_CONF=1: the draft graph also evaluates DSpark's confidence head (per-position
 # conditional acceptance logits, tech report 2.4.3) into FastDecoder.d_conf, and the decode loop
-# records it per step. Observation only: nothing reads it to choose a width yet. Off by default so
-# the served draft graph is unchanged; tools/bench_spec_conf_tp.py collects it.
+# records it per step. The confidence depth policy also requires this head, but does not
+# retain per-step logits unless observation was explicitly requested.
 SPEC_CONF = os.environ.get("DSV41_SPEC_CONF", "0") == "1"
+COMPUTE_CONF = SPEC_CONF or CONFIDENCE_DEPTHS is not None
 # DSV41_TREE_PROBE=1: record, per draft position, the DSpark drafter's top-2 (d_top2) so the decode
 # loop can log it beside the verifier's argmax. Observation only -- it answers one question before a
 # tree is built: when the drafter's top-1 misses, how often is the target's token its #2? That rate,
 # not the tree mechanism, decides whether a second candidate is worth a second draft chain.
 TREE_PROBE = os.environ.get("DSV41_TREE_PROBE", "0") == "1"
-T_DRAFT = DYNAMIC_DEPTHS[-1] if DYNAMIC_DEPTHS else _draft_block()
+_DEPTHS = CONFIDENCE_DEPTHS or DYNAMIC_DEPTHS
+T_DRAFT = _DEPTHS[-1] if _DEPTHS else _draft_block()
 T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts; the widest verify block
 # Every verify width this process captures graphs and static buffers for.
-VERIFY_WIDTHS = tuple(d + 1 for d in DYNAMIC_DEPTHS) if DYNAMIC_DEPTHS else (T_VERIFY,)
+VERIFY_WIDTHS = tuple(d + 1 for d in _DEPTHS) if _DEPTHS else (T_VERIFY,)
 # FastDecoder attributes that are sized by the verify width; _bind(T) points them at T's set.
 _WIDTH_ATTRS = ("ids", "pos", "eg_rows", "slots", "h", "pre_mix", "attn_pre", "ffn_post", "ffn_comb",
                 "ffn_pre", "y", "route_idx", "route_w", "topk", "candidates", "main_hidden", "logits",
@@ -942,7 +946,7 @@ class FastDecoder:
                 self.d_probs[i].copy_(p)
             self.d_out[i] = nxt
             prev = nxt
-        if SPEC_CONF:
+        if COMPUTE_CONF:
             # embeds[i] is the Markov embedding of the token before draft i, as in the reference
             feat = torch.cat([x_pre.float(), torch.cat(embeds).float()], dim=-1)
             self.d_conf.copy_((feat @ w.conf_proj.T).squeeze(-1))

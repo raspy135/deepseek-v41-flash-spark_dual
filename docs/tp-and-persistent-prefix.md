@@ -32,6 +32,28 @@ staging is charged to prefill; disk restore latency is also included in prefill.
 No model weights or original plaintext prompt are stored, but token IDs and KV are
 sensitive and may reveal the prompt. Caches/captures are excluded from Git and images.
 
+Disk saves are attempted on the first eligible boundary, then at most once per
+`DSV41_PREFIX_DISK_MIN_INTERVAL_S` seconds (default 300; 0 restores every-boundary saving).
+The interval is global to the engine, including switches between conversations and response
+prefix saves. RAM snapshots still update at every eligible boundary. Rank 0 broadcasts the
+save/skip decision before staging; clock skew or different local write times cannot make the
+ranks skip different collectives. Failed attempts also consume the interval. There is no
+background timer or shutdown flush: persistence catches up at the next eligible boundary
+after the interval, so a restart may require recomputing the unsaved suffix.
+
+Motivation: the 2026-10-02 live tool workload at roughly 150K context logged 5.35–5.97 seconds
+of synchronous staging per save, with roughly 668–675 MB bundles. Total prefill on nearby
+turns was 9–10 seconds despite over 99% RAM prefix hits. The file write itself is asynchronous;
+its logged duration must not be added to staging as if both blocked prefill. The interval
+removes staging on skipped boundaries; an end-to-end speedup has not yet been measured.
+
+Validation on the morning `8eee6f8` baseline plus this change: all 25 CPU prefix
+disk/cache/response/media tests passed, including interval boundaries, zero-interval behavior,
+failed staging, skipped copies, and a peer following rank 0 despite a different local clock.
+Both serving ranks agreed on the 90-field boot guard and `/health` reported 300 seconds.
+Two short HTTP requests returned the requested `OK` and `YES`; one disk save was logged on
+each rank. This is an integration smoke check, not a long-context throughput comparison.
+
 Compatibility hashes include engine/kernel source, model config/index/tokenizer,
 checkpoint file sizes and mtimes, parallel layout, precision settings and pruning
 fraction. They are conservative; code/config changes can invalidate previous entries.

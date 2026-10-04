@@ -6,6 +6,7 @@ background job. Disk failures are cache misses, never unilateral collective skip
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -15,6 +16,10 @@ import torch
 
 from engine.prefix_disk import PrefixDisk, cpu_tree, device_tree
 from engine.prefix_media import media_prefix
+
+PREFIX_DISK_MIN_INTERVAL_S = float(os.environ.get('DSV41_PREFIX_DISK_MIN_INTERVAL_S', '300'))
+if not math.isfinite(PREFIX_DISK_MIN_INTERVAL_S) or PREFIX_DISK_MIN_INTERVAL_S < 0:
+    raise ValueError('DSV41_PREFIX_DISK_MIN_INTERVAL_S must be finite and nonnegative')
 
 
 def namespace(engine):
@@ -74,6 +79,8 @@ class PersistentPrefixes:
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='prefix-disk')
         self.pending = None
         self.stats = {}
+        self.min_interval_s = PREFIX_DISK_MIN_INTERVAL_S
+        self._last_save_attempt = None
 
     def join(self):
         if self.pending is not None:
@@ -86,9 +93,20 @@ class PersistentPrefixes:
 
     def save(self, prompt):
         e = self.engine
-        # Called unconditionally at the prompt boundary on both ranks. Each rank
-        # owns its local file; the UUID identifies the *same* computation on both nodes.
-        bid = e.ep.broadcast_obj(uuid.uuid4().hex if e.ep.rank == 0 else None)
+        # RAM snapshots are already current. At long contexts CPU staging alone cost
+        # 5–6 seconds per tool turn; rate-limit BEFORE copying any tensors. Rank 0's
+        # clock decides for both ranks, through the same unconditional collective.
+        # None means skip; a UUID identifies the same computation on both nodes.
+        now = time.monotonic()
+        bid = None
+        if e.ep.rank == 0 and (self._last_save_attempt is None
+                              or now - self._last_save_attempt >= self.min_interval_s):
+            bid = uuid.uuid4().hex
+        bid = e.ep.broadcast_obj(bid)
+        if bid is None:
+            return
+        # Bound failed attempts too, rather than retrying expensive staging every turn.
+        self._last_save_attempt = now
         self.join()
         start = time.perf_counter()
         try:

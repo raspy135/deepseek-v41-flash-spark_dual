@@ -1,4 +1,7 @@
-"""Per-request speculative depth policy for DSV41_BLOCK_DYNAMIC (two depths, e.g. 3 and 5).
+"""Speculative depth policies: recent acceptance and opt-in per-draft confidence.
+
+ConfidenceDepthPolicy implements DSV41_BLOCK_CONFIDENCE for greedy requests.
+The original DSV41_BLOCK_DYNAMIC controller below supports greedy and sampling:
 
 Why: the best draft depth depends on how predictable the text is. Measured on TP2
 (2026-09-23, docs/decode-dynamic-depth.md): depth 5 makes every verify step ~16% slower
@@ -29,8 +32,102 @@ always verify the same width (EPDistributed.control). Rank 1 never consults its 
 from __future__ import annotations
 
 import os
+import math
 import statistics
 from collections import deque
+
+
+def confidence_depths(dynamic_depths=None):
+    """Resolve the opt-in policy without importing CUDA; sampled requests retain 3/5."""
+    value = os.environ.get("DSV41_BLOCK_CONFIDENCE", "0")
+    if value not in ("0", "1"):
+        raise ValueError("DSV41_BLOCK_CONFIDENCE must be 0 or 1")
+    if value == "0":
+        return None
+    if dynamic_depths not in (None, (3, 5)):
+        raise ValueError("DSV41_BLOCK_CONFIDENCE requires DSV41_BLOCK_DYNAMIC=3,5 or unset")
+    fixed = os.environ.get("DSV41_BLOCK", "").strip()
+    if fixed not in ("", "off", "default", "5"):
+        raise ValueError("DSV41_BLOCK_CONFIDENCE requires DSV41_BLOCK=5 or unset")
+    return (1, 3, 5)
+
+
+class ConfidenceDepthPolicy:
+    """Greedy-only per-draft expected tokens / measured step cost.
+
+    DSpark's logits estimate conditional acceptance, so survival to position k is
+    the product of the first k probabilities. Include the guaranteed verifier token.
+    Never consult the current step's actual acceptance to choose its width.
+
+    The 88/106/124 ms priors are historical TP2 measurements. Unseen widths inherit
+    the median measured/prior scale; observed widths use robust local timings.
+    Captures are excluded by the caller. This does not save any drafter passes:
+    DSpark computes all five backbone positions together.
+    """
+    depths = (1, 3, 5)
+    priors = {1: .088, 3: .106, 5: .124}
+
+    def __init__(self):
+        self._samples = {d: deque(maxlen=32) for d in self.depths}
+        self.step_s = {d: None for d in self.depths}
+        self.pinned = None  # qualification only
+        self.reset_request()
+
+    def reset_request(self):
+        self.depth = 3
+        self.steps = dict.fromkeys(self.depths, 0)
+        self.switches = self.invalid_confidence = 0
+
+    def _times(self):
+        ratios = [t / self.priors[d] for d, t in self.step_s.items() if t is not None]
+        scale = statistics.median(ratios) if ratios else 1.0
+        return {d: self.step_s[d] or self.priors[d] * scale for d in self.depths}
+
+    def decide(self):
+        # Provisional width in the loop-control message. Final choice follows draft().
+        return self.depth
+
+    def choose(self, logits):
+        if self.pinned is not None:
+            if self.pinned not in self.depths:
+                raise ValueError("confidence depth must be 1, 3 or 5")
+            target = self.pinned
+        elif len(logits) != 5 or any(not math.isfinite(x) for x in logits):
+            self.invalid_confidence += 1
+            target = 3
+        else:
+            times = self._times()
+            survival, expected = 1.0, 1.0
+            rates = {}
+            for k, x in enumerate(logits, 1):
+                # Stable sigmoid, including arbitrarily large finite logits.
+                z = math.exp(-abs(x))
+                survival *= 1 / (1 + z) if x >= 0 else z / (1 + z)
+                expected += survival
+                if k in times:
+                    rates[k] = expected / times[k]
+            target = max(self.depths, key=lambda d: rates[d])  # ties prefer shallower
+        self.switches += target != self.depth
+        self.depth = target
+        return target
+
+    def observe(self, depth, accepted, emitted, step_s):
+        self.steps[depth] += 1
+        if step_s is not None and math.isfinite(step_s) and step_s > 0:
+            samples = self._samples[depth]
+            samples.append(step_s)
+            self.step_s[depth] = statistics.median(samples) if len(samples) >= 3 else min(samples)
+
+    def pop_switch(self):
+        return None  # per-step switches belong in aggregate stats, not the server log
+
+    def report(self):
+        return {"policy": "confidence", "depths": list(self.depths),
+                "steps": {str(d): n for d, n in self.steps.items()},
+                "switches": self.switches, "invalid_confidence": self.invalid_confidence,
+                "step_ms": {str(d): None if t is None else round(t * 1000, 1)
+                            for d, t in self.step_s.items()},
+                "estimated_step_ms": {str(d): round(t * 1000, 1) for d, t in self._times().items()}}
 
 
 class DepthPolicy:

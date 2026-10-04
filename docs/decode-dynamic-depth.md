@@ -79,9 +79,11 @@ prose), long contexts, and requests that switch between code and prose several t
 
 DSpark has a confidence head that predicts the conditional acceptance of each draft position
 (V4.1 tech report 2.4.3; DeepSeek's scheduler turns it into a per-step verify length).
-TensorFold's CUDA engine does the same for Qwen3.8 Flash Next's MTP head (`--mtp-confidence`,
-default 0.30). This engine chooses depth per request only, so the question was whether the head
-is good enough to choose it per step.
+TensorFold's Qwen3.8 Flash Next CUDA engine also uses confidence to shorten drafts
+(`--mtp-confidence`), but its score is the sampled draft token's temperature-1
+probability, not DSpark's learned acceptance score. This engine chooses depth
+from a recent window of acceptance, so the question was whether the head is
+good enough to choose it per step.
 
 `DSV41_SPEC_CONF=1` (off by default) makes the draft graph compute the head's logits and
 records `(depth, leading accepts, logits[5])` per step in `last_stats["spec_conf"]`. It is
@@ -104,17 +106,156 @@ a model, not engine measurements:
 | story, temperature 0.7 (253) | +0.3% | +8.5% | +18% |
 | prose with code (181) | +5.1% | +6.0% | +19% |
 
-- With the existing 3/5 graphs, the gain is too small to pay for the extra collective a
-  per-step width needs. Today rank 0 broadcasts depth before drafting; a confidence-based depth
-  is only known after it.
+- With the existing 3/5 graphs, the modeled gain looked too small to justify the extra
+  collective a per-step width needs; its cost had not yet been measured. Rank 0 broadcasts
+  adaptive depth before drafting; a confidence-based depth is only known after it.
 - Most of the value needs depth 1, which means width-2 graphs as well. The confidence rule gets
   about a third of the perfect-predictor ceiling on prose. Tuning a logit offset on the same
   data barely helps, so the head's ranking accuracy is the limit, not its calibration.
-- Reading the logits costs no extra wait: the host already waits for the draft graph at the
-  n-gram hash D2H.
+- Reading the logits can share the wait for the draft graph already required by the n-gram
+  hash D2H. A separate readback and control message still add host overhead.
 - Greedy and seeded sampled output were token-identical with the flag on and off, and on both
   ranks. The on/off decode rates differed by 5-16% in the flag-on run's favour on all six
   prompts. That is run-to-run variation, not an effect of the flag, so its overhead remains
   unmeasured.
 - One prompt per workload. A prototype still has to beat adaptive depth in alternating
   full-engine runs, net of the per-step broadcast.
+
+## TensorFold-style cutoff replay, 2026-10-03
+
+The Qwen TensorFold/vLLM comparison prompted a fresh check of a simple cutoff.
+The mechanism does not transfer literally: Qwen executes sequential MTP passes,
+so an early cutoff avoids subsequent draft passes. DSpark computes its five
+draft positions together (with a small sequential Markov-head loop); their
+backbone cost is already paid when confidence is available. Here the saving
+would come from fewer verifier rows, including fewer routed expert reads.
+
+`tools/analyze_spec_conf.py --cutoff .7` now compares a prefix cutoff with the
+existing cost-aware confidence rule. It stops before the first conditional
+confidence below the threshold, rounds down to an available depth, and floors
+at the smallest available depth. Confidence later in the block cannot restart
+the prefix. The following replays use the existing September 29 traces and
+historical 88/106/124 ms step costs for depths 1/3/5:
+
+| Workload | Simple 70% cutoff | Cost-aware confidence |
+| --- | ---: | ---: |
+| HTML | -2.2% | +3.6% |
+| Python | -0.6% | +0.7% |
+| Explanation | -7.8% | +3.2% |
+| Story | -0.7% | +5.5% |
+| Story, temperature 0.7 | -0.4% | +8.5% |
+| Prose mixed with code | +0.1% | +6.0% |
+
+These are modeled changes against the best fixed depth on each trace, **not
+measured gains against the running adaptive policy**. They exclude added
+control/synchronization cost, confidence-head overhead, and graph capture.
+Changing depth also changes which future positions become step boundaries, so
+replaying the original steps is only a screening model, not a full rollout.
+
+With only existing depths 3/5, the 70% cutoff is neutral on pure prose, -0.3%
+on HTML, +0.6% on Python and +4.1% on mixed text. Lowering the cutoff to 30%
+with depths 1/3/5 improves some cases (story +3.9%, sampled story +6.9%), but
+still loses slightly on explanation and Python. A single threshold is not
+automatically a better policy; the cost-aware rule estimates expected tokens
+from cumulative acceptance confidence and divides by each width's step cost.
+
+Retained results: `results/spec-confidence-cutoff-20261003/`, with 3/5 and
+1/3/5 replays at 70%, plus 1/3/5 at 30%. No serving policy or defaults were
+changed, and the Qwen TensorFold service remained running. The candidate for
+an engine experiment is cost-aware confidence per step, with rank-0 decisions
+broadcast to both ranks and width-2 graph qualification before enabling depth 1.
+
+## Opt-in confidence policy, 2026-10-03
+
+`DSV41_BLOCK_CONFIDENCE=1` enables a greedy-only experiment using depths 1/3/5.
+Leave `DSV41_BLOCK_DYNAMIC=3,5` in place, and leave `DSV41_BLOCK` unset or set it
+to 5. Speculation, the graphed fast path and concurrency 1 are required. The
+flag defaults to 0; the serving `.env` is unchanged.
+
+For each draft, rank 0 calculates
+`expected_tokens(d) = 1 + sum(k=1..d, product(j=1..k, sigmoid(conf[j])))`
+and chooses the depth maximizing `expected_tokens(d) / step_seconds(d)`.
+Measured times are medians of the last 32 observations (minimum until three
+samples), excluding graph-capture steps. The initial 88/106/124 ms priors come
+from the earlier TP2 measurements. Unseen widths scale their priors by the
+median observed/prior ratio rather than assuming that this machine still has
+the historical absolute latency. Timing history survives requests; counters reset.
+No forced exploration or per-step switch logging is added. Invalid confidence
+falls back to depth 3.
+
+Both ranks compute the head, but only rank 0 reads and uses it. Both then enter
+a second three-integer control broadcast, after drafting and before building
+the verify block. Reusing the stop protocol lets `release_peer()` abort a worker
+waiting there. The feature and observation flags are in the boot config guard.
+Width-2/4/6 graphs are captured only at first actual use: capturing ahead can
+overwrite the KV ring. `last_stats.spec_depth` reports the selected policy,
+counts per depth and observed/estimated costs. `DSV41_SPEC_CONF=1` separately
+retains per-step logits; it is not required for the policy itself.
+
+Sampled requests retain the existing adaptive 3/5 controller. Looking ahead
+across all five confidence scores can select prefix length based on sampled
+prefix tokens; preserving the sampler's distribution requires more than
+reusing its acceptance formula. That extension is deliberately unqualified.
+
+`tools/bench_confidence_depth_tp.py` checks greedy equality and rank agreement
+while alternating 1/3/5, compares pinned widths and both controllers, and checks
+seeded sampled fallback with a pinned legacy schedule. It then runs 512-token
+HTML/Python/explanation requests in adaptive/confidence/confidence/adaptive order.
+Both benchmark arms share the compiled confidence head; the confidence arm alone
+pays its pre-verify readback and second broadcast. Thus this measures policy and
+synchronization effects, but not the head's incremental compute overhead.
+
+### Two-Spark result
+
+The disposable TP2 run passed on both ranks. In the following table, each cell
+is the median of two measured requests, with greedy temperature 0 and a maximum
+of 512 new tokens. HTML stopped naturally at 453 tokens, Python at 511, and
+explanation reached 512. Context capacity was 524288; these were short prompts,
+not long-context or thinking-mode measurements.
+
+| Workload | Existing adaptive 3/5 | Confidence 1/3/5 | Change |
+| --- | ---: | ---: | ---: |
+| HTML | 41.28 tok/s | 42.52 tok/s | +3.0% |
+| Python | 52.25 tok/s | 53.66 tok/s | +2.7% |
+| Explanation | 24.61 tok/s | 25.38 tok/s | +3.2% |
+
+All four measured outputs per workload were token-identical, and both ranks
+agreed across all 26 qualification and measured requests. Alternating widths
+and fixed depths 1/3/5 also matched on the 256-token HTML qualification. The
+128-token sampled fallback matched with the legacy policy pinned to 3. The
+Python output parses and its five generated unit tests pass; this is still not
+a general model-quality evaluation. The policy/control CPU suite passed 22 tests.
+
+Confidence used depths 1/3/5 on 12/29/70 HTML steps, 0/5/87 Python steps, and
+approximately 125/122/2 explanation steps. It therefore saves verification rows
+on prose, while immediately choosing depth 5 on predictable code instead of
+waiting for the legacy 60-token acceptance window. Peak PyTorch allocation on
+rank 0 was 101.78 GB, with all six parity/width graph variants present.
+
+This is a small preliminary gain, not grounds to replace the default controller.
+Only one prompt per workload was tested, with two repetitions. Both arms share
+the confidence-head computation, whose incremental overhead remains unisolated.
+Sampling, long-context thinking and throughput under multiple clients are not
+qualified for confidence scheduling. No thresholds were tuned to these outputs.
+
+Retained evidence: `results/confidence-depth-20261003/summary.json`, both
+`confidence-rank*.json` reports, both rank logs, decoded outputs, and
+`generated-python-check.txt`. The summary records hashes of the exact engine
+snapshot used for the gate. Serving `.env` remains unchanged and the wrapper
+restores the Qwen TensorFold service after the test.
+
+### Enabled as the recipe default
+
+After reviewing these results, the user selected confidence scheduling as the
+DS recipe default on 2026-10-03. Both environment templates and the local
+serving configuration now set `DSV41_BLOCK_CONFIDENCE=1`, alongside adaptive
+3/5 for sampled requests. The earlier opt-in/default-off wording describes the
+experiment before this decision. The low-level engine switch still defaults to
+0 when absent, so standalone fixed-width gates remain explicit and compatible.
+Set `DSV41_BLOCK_CONFIDENCE=0` to return to adaptive 3/5 for all requests.
+
+The installed DS runtime is `deepseek-v41-flash-spark:confidence-depth` on both
+Sparks, built from the tested CUDA runtime plus the current engine/tools/server
+source. The head launcher's `.env` selects this image and forwards identical
+settings to both ranks. The user subsequently requested switching the active
+service from Qwen TensorFold to DS4.1 with this default enabled.

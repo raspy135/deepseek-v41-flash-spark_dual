@@ -18,10 +18,8 @@ vision, and DSpark speculative decoding. It processes one request at a time.
 - **Native MXFP4 checkpoint.** Uses the original routed-expert weights without requantizing them to another format.
 - **Vision enabled.** Supports text and image inputs, not just text-only inference.
 - **Adaptive expert loading.** Resident experts change with your workload, using observed routing demand to decide which weights to keep in memory.
-- **One model, two DGX Sparks.** Tensor parallelism splits the same selected experts across both nodes, alongside attention and other model weights.
-- **Dual-rail prefill.** Optionally use both RoCE paths for prompt processing while keeping latency-sensitive decode on one rail. Requires the matching network settings below.
 - **Persistent prefix cache.** Saves prompt prefixes to local disk for reuse across requests and server restarts.
-- **Adaptive speculative depth.** Drafts 5 tokens ahead while the drafter keeps being right (code, markup) and falls back to 3 on prose, per request. Output is unchanged; only speed moves.
+- **Confidence-based speculative depth.** speclative depth changes depends on the confidence, it boosts prose token/sec.
 
 ## Setup
 
@@ -130,7 +128,8 @@ The main capacity and speed controls:
 | `DSV41_TP_DRAFT_EXPERTS=1` | Split draft expert weights across TP2; saves 3.36 GiB per node. Requires native FP4 and the `output` expert layout. Adds draft collectives. |
 | `DSV41_TP_EMBED=1` | Split input embedding columns across two ranks; saves 0.62 GiB per node. Adds one gather per lookup, without changing stored precision. |
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
-| `DSV41_BLOCK_DYNAMIC=3,5` | Choose the draft depth per request: 5 while acceptance is high, 3 otherwise. For a fixed depth, remove it and set `DSV41_BLOCK=3` (never both). Needs `DSV41_MAX_CONCURRENCY=1`. See [measurements](docs/decode-dynamic-depth.md). |
+| `DSV41_BLOCK_CONFIDENCE=1` | Recipe default: choose greedy verify depth 1/3/5 using confidence and measured cost. Sampled requests use adaptive 3/5. Set 0 to restore adaptive depth for all requests. Requires speculation, CUDA graphs, concurrency 1, and `DSV41_BLOCK=5` or unset. See [measurements and limitations](docs/decode-dynamic-depth.md#two-spark-result). |
+| `DSV41_BLOCK_DYNAMIC=3,5` | Adaptive 3/5 for sampling, or all requests when confidence is disabled. For fixed depth, disable confidence, remove this setting, and set `DSV41_BLOCK=3`. Needs `DSV41_MAX_CONCURRENCY=1`. |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |
@@ -140,6 +139,9 @@ The main capacity and speed controls:
 | Decode projections | On by default: `DSV41_DECODE_MERGED_PROJ`, `DSV41_FP8_DECODE_BLOCK_N=auto`, `DSV41_PRUNE_MISS_FUSED`. Bit-exact; about 4% less time per verify step. Roll back with `0` (`128` for the tile) on both nodes. See [measurements](docs/decode-projection-fusion.md). |
 | `DSV41_FP4_CUDA_RELAXED=1` | Default faster CUDA reduction order. Preserves BF16 output boundaries but changes numerics. Set `0` for the original CUDA summation order; restart both ranks together. |
 | `DSV41_ENGRAM_ROW_SPLIT=1` | Split large Engram row reads across the two nodes. |
+| `DSV41_ENGRAM_CACHE_MB=2048` | Optional packed host row cache, total MiB per node. Defaults off; initial measurements showed no consistent decode gain. [Details and measurements](docs/engram-row-cache.md). |
+| `DSV41_ENGRAM_CACHE_MB_PEER=4096` | Optional capacity override for rank 1; otherwise it inherits the primary's budget. Caches are local to each node. |
+| `DSV41_ADAPT_URGENT=1` | Rolling expert-miss trigger: >10% over the last ~30 decoded tokens, up to 64 swaps, 150-token cooldown. Requires decode adaptation. [Details](docs/urgent-expert-loading.md). |
 | `DSV41_VISION=1` | Load image support. Set to `0` for text-only serving. |
 
 At keep `0.63`, the engine selects 9,680 of 15,360 routed experts: 242 per layer.

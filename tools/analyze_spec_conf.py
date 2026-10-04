@@ -8,6 +8,10 @@ known, and any smaller width w would have emitted min(a, w) + 1 tokens. Policies
                depth (DSV41_BLOCK_DYNAMIC), which also pays for its first ~60 tokens
   confidence   DSpark's rule (tech report 2.4.3): survival s_k = prod_{j<=k} sigmoid(c_j),
                E[tokens | w] = 1 + sum_{k<=w} s_k, pick the w maximizing E / step_ms(w)
+  cutoff       keep the prefix before the first conditional confidence below --cutoff,
+               rounded down to a supported width (with the smallest width as a floor).
+               Inspired by TensorFold; DSpark's acceptance head is NOT token probability,
+               and all drafts have already been computed in DSpark's parallel block.
   conf+bias    the same with a logit offset tuned on THIS data -- in-sample, so optimistic
   oracle       knows `a`; the cheapest width that still collects it
 
@@ -57,21 +61,44 @@ def conf_rule(widths, ms, bias=0.0):
     return choose
 
 
+def cutoff_rule(widths, threshold):
+    """Replay a prefix cutoff; never resume after a low-confidence position.
+
+    A 3/5-only verifier cannot stop at draft 1, so it floors at 3 even when the
+    first prediction is low. This is a verifier-width simulation, not a saving
+    in draft computation: DSpark has already produced the complete block.
+    """
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError('cutoff must be a finite probability in [0, 1]')
+    widths = sorted(widths)
+
+    def choose(a, conf):
+        prefix = 0
+        for c in conf[:widths[-1]]:
+            if sig(c) < threshold:
+                break
+            prefix += 1
+        return max((w for w in widths if w <= max(1, prefix)), default=widths[0])
+    return choose
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('report')
     ap.add_argument('--widths', default='3,5', help='verify depths a policy may choose (1 needs new graphs)')
     ap.add_argument('--ms', default='1:88,3:106,5:124', help='step ms per depth (docs/decode-dynamic-depth.md)')
+    ap.add_argument('--cutoff', type=float, default=0.7, help='conditional acceptance cutoff (not Qwen token probability)')
     args = ap.parse_args()
     widths = sorted(int(x) for x in args.widths.split(','))
     ms = {int(k): float(v) for k, v in (kv.split(':') for kv in args.ms.split(','))}
     assert all(w in ms for w in widths), 'every width needs a step cost'
+    cutoff = cutoff_rule(widths, args.cutoff)
     rep = json.load(open(args.report))
     assert rep.get('spec_conf'), 'this report was collected without DSV41_SPEC_CONF=1'
     top = max(widths)
-    print(f'widths {widths}, step ms {ms}\n')
+    print(f'widths {widths}, step ms {ms}, cutoff {args.cutoff}; offline replay, no extra control/sync cost\n')
     hdr = f"{'workload':10} {'steps':>5} " + ' '.join(f'{"fixed " + str(w):>8}' for w in widths)
-    print(hdr + f" {'best fix':>8} {'conf':>7} {'conf+b':>7} {'oracle':>7}  conf vs best fixed   AUC per draft")
+    print(hdr + f" {'best fix':>8} {'conf':>7} {'cutoff':>7} {'conf+b':>7} {'oracle':>7}  conf / cutoff vs best fixed   AUC per draft")
     for run in rep['runs']:
         log = [(d, a, c) for d, a, c in (run['steps_log'] or [])]
         steps = [(a, c) for d, a, c in log if d >= top]
@@ -79,6 +106,7 @@ def main():
         fixed = {w: rate(steps, lambda a, c, w=w: w, ms) for w in widths}
         best = max(fixed.values())
         conf = rate(steps, conf_rule(widths, ms), ms)
+        cut = rate(steps, cutoff, ms)
         conf_b = max(rate(steps, conf_rule(widths, ms, b / 4), ms) for b in range(-16, 17))
         oracle = rate(steps, lambda a, c: next((w for w in widths if w >= a), top), ms)
         # conditional acceptance of draft k given drafts 1..k-1 accepted: the quantity the head predicts
@@ -88,7 +116,8 @@ def main():
             aucs.append(auc([s for s, _ in sub], [l for _, l in sub]))
         auc_s = ' '.join('  -  ' if x is None else f'{x:.2f}' for x in aucs)
         print(f"{run['workload']:10} {len(steps):5d} " + ' '.join(f'{fixed[w]:8.1f}' for w in widths)
-              + f' {best:8.1f} {conf:7.1f} {conf_b:7.1f} {oracle:7.1f}  {100 * (conf / best - 1):+17.1f}%   {auc_s}'
+              + f' {best:8.1f} {conf:7.1f} {cut:7.1f} {conf_b:7.1f} {oracle:7.1f}'
+              + f'  {100 * (conf / best - 1):+10.1f}% / {100 * (cut / best - 1):+6.1f}%   {auc_s}'
               + (f'  ({censored} censored steps skipped)' if censored else ''))
 
 

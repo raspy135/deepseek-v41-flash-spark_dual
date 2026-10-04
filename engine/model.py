@@ -990,6 +990,12 @@ class Model:
         tot = self._miss_tot.sum(dim=0)
         return float(tot[0]), float(tot[1])
 
+    def decode_miss_snapshot(self):
+        """Existing decode-only counters: one tiny readback, no new per-layer work."""
+        if self._miss_phase is None:
+            return None
+        return tuple(self._miss_phase[1].tolist())
+
     def reset_prune_miss(self):
         self._want_counts = self._want_mass = self._miss_tot = None
 
@@ -1140,6 +1146,17 @@ class Model:
         h = (_hc_post_fused(y, residual, attn_post, attn_comb) if HC_OPS
              else R.hc_post(y, residual, attn_post, attn_comb))
         _mark("hc_post_attn")
+        graphs = getattr(self, 'prefill_graphs', None)
+        if graphs is not None and graphs.eligible(h, L, prefill, n_experts):
+            # Intermediate outputs feed the next attention block immediately. Final
+            # encoder/decoder outputs must outlive staging for replay/prefix caches.
+            retain = L in (a.candidate_source_layer, a.n_layers - 1)
+            return graphs.run(h, attn_pre, w, L, store, arena, n_experts, retain=retain)
+        return self._ffn(h, attn_pre, w, L, prefill, store, arena, n_experts)
+
+    def _ffn(self, h, attn_pre, w, L, prefill, store, arena, n_experts):
+        """Position-independent FFN, shared verbatim by eager and graphed prefill."""
+        a = self.args
         residual = h
         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
         y = (_hc_pre_rn_fused(h, attn_pre, w.ffn_norm, a.norm_eps) if HC_OPS

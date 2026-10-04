@@ -26,6 +26,7 @@ from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetc
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 from engine.prefix_media import image_fingerprints, media_prefix
+from engine.prefix_persistence import PREFIX_DISK_MIN_INTERVAL_S
 import v41_ref as R  # noqa: E402
 
 
@@ -717,7 +718,15 @@ class V41Engine:
                     f"{self.vision.cfg['vision_dim']} dim); image inputs enabled")
             except Exception as e:  # noqa: BLE001
                 log(f"vision tower not loaded ({e}); image inputs will be rejected")
-        self.tables = {L: EngramTable(model_dir, index, L, device) for L in self.args.engram_layer_ids}
+        from engine.engram_cache import cache_budget_mb
+        cache_mb = cache_budget_mb(self.ep.rank)
+        if cache_mb and os.environ.get('DSV41_ENGRAM_MMAP', '1') != '1':
+            raise ValueError('Engram row cache requires mmap row reads')
+        cache_bytes = cache_mb * 1024**2 // max(1, len(self.args.engram_layer_ids))
+        self.tables = {L: EngramTable(model_dir, index, L, device, cache_bytes=cache_bytes)
+                       for L in self.args.engram_layer_ids}
+        if cache_mb:
+            log(f'Engram packed row cache: {cache_mb} MiB total per rank')
         for _t in self.tables.values():
             _t.ep = self.ep          # enables the DSV41_ENGRAM_ROW_SPLIT read split (prefill only)
         if self.ep.active and self.tables and next(iter(self.tables.values())).row_split:
@@ -920,6 +929,10 @@ class V41Engine:
                 # decided on rank 0 and broadcast with the control flag, so the other
                 # DSV41_BLOCK_DYNAMIC_* policy knobs only need to be right on rank 0.
                 "block_dynamic": os.environ.get("DSV41_BLOCK_DYNAMIC", ""),
+                # v1 adds a second control broadcast after drafting on GREEDY requests.
+                # A split pair must fail at boot, before either rank can enter that call.
+                "block_confidence_v1": os.environ.get("DSV41_BLOCK_CONFIDENCE", "0"),
+                "spec_conf": os.environ.get("DSV41_SPEC_CONF", "0"),
                 # Decode fp8 scheduling and projection merging are meant to be bit-identical to
                 # the defaults, but that is a measured property of this GPU and compiler, not a
                 # guarantee; a pair split across them must refuse to start.
@@ -943,6 +956,8 @@ class V41Engine:
                 # hangs the pair until the process-group timeout.
                 "engram_row_split": os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0"),
                 "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0"),
+                "engram_cache_v1_mb": os.environ.get("DSV41_ENGRAM_CACHE_MB", "0"),
+                "engram_cache_v1_peer_mb": os.environ.get("DSV41_ENGRAM_CACHE_MB_PEER", "inherit"),
                 "engram_native_threads": os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64"),
                 "engram_split_min": os.environ.get("DSV41_ENGRAM_SPLIT_MIN", "4096"),
                 # A rank that adapts at the prefill boundary while its peer does not ends up
@@ -954,6 +969,8 @@ class V41Engine:
                 # on what they MEAN, e.g. whether the prefill-boundary collective happens.
                 **ADAPT.boot_fields(),
                 "prefill_chunk": MAX_CHUNK,
+                "prefill_graphs_v2": os.environ.get("DSV41_PREFILL_GRAPHS", "0"),
+                "prefill_graph_fixed_routing": os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1"),
                 "prefill_timing": PREFILL_TIMING,
                 "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
                 "prefill_swap_routes_version": 1,
@@ -975,7 +992,8 @@ class V41Engine:
                 "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1'),
                 "prefix_cache": os.environ.get('DSV41_PREFIX_CACHE', '1'),
                 "prefix_disk": PREFIX_DISK,
-                "prefix_disk_version": 2,  # image-aware identity + request-level rank agreement
+                "prefix_disk_version": 3,  # rank-0-authoritative save interval
+                "prefix_disk_min_interval_s": PREFIX_DISK_MIN_INTERVAL_S,
                 "prefix_disk_strict": os.environ.get("DSV41_PREFIX_DISK_STRICT", "0"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
@@ -1060,7 +1078,7 @@ class V41Engine:
                 f"{replica_bytes / 1e9:.3f} extra GB/rank; prefix reuse disabled")
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
-        from engine.fastdecode import T_VERIFY as _TV, VERIFY_WIDTHS, DYNAMIC_DEPTHS
+        from engine.fastdecode import T_VERIFY as _TV, VERIFY_WIDTHS, DYNAMIC_DEPTHS, CONFIDENCE_DEPTHS
         self._tv = _TV
         # one (block, readback, pinned host) triple per verify width; the defaults are the widest
         self._vbufs = {T: (torch.empty(T, dtype=torch.long, device=device),
@@ -1068,17 +1086,34 @@ class V41Engine:
                            torch.empty(T + 1, dtype=torch.long).pin_memory()) for T in VERIFY_WIDTHS}
         self._blk, self._vout, self._vhost = self._vbufs[_TV]
         self.depth_policy = None
-        if DYNAMIC_DEPTHS:
+        self.confidence_depth_policy = None
+        if DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS:
             # Scope: the single-request greedy/sampled graphed path. Two-request serving
             # (engine/batch2.py) and the eager path stack or verify T_VERIFY rows unconditionally.
             if not (self.spec and self.fast is not None and self.fast.use_graphs):
-                raise ValueError("DSV41_BLOCK_DYNAMIC needs speculative decoding on the graphed fast path")
+                raise ValueError("variable speculative depth needs speculative decoding on the graphed fast path")
             if int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) != 1:
-                raise ValueError("DSV41_BLOCK_DYNAMIC supports DSV41_MAX_CONCURRENCY=1 only")
-            from engine.spec_depth import DepthPolicy
-            self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS)
-            log(f"dynamic speculative depth {DYNAMIC_DEPTHS} (start {self.depth_policy.start}, "
+                raise ValueError("variable speculative depth supports DSV41_MAX_CONCURRENCY=1 only")
+            from engine.spec_depth import DepthPolicy, ConfidenceDepthPolicy
+            self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS or (3, 5))
+            if CONFIDENCE_DEPTHS:
+                self.confidence_depth_policy = ConfidenceDepthPolicy()
+                log("experimental confidence depth 1/3/5 for greedy requests; sampled requests use adaptive 3/5")
+            log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
+        from engine.prefill_graphs import enabled as prefill_graphs_enabled, PrefillFFNGraphs
+        self.model.prefill_graphs = None
+        if prefill_graphs_enabled():
+            if not (self.fast is not None and self.fast.lut is not None
+                    and self.kernel == 'triton-fp4' and self.ep.tensor_parallel
+                    and os.environ.get('DSV41_PREFILL_FIXED_ROUTING', '1') == '1'):
+                raise ValueError('prefill graphs require resident FP4 TP and fixed prefill routing')
+            if (self.replica_slots or PREFILL_TIMING
+                    or os.environ.get('DSV41_PREFILL_MOE_TIMING', '0') != '0'
+                    or int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) != 1):
+                raise ValueError('prefill graphs require concurrency 1, replicas/timing instrumentation off')
+            self.model.prefill_graphs = PrefillFFNGraphs(self.model, MAX_CHUNK)
+            log(f"experimental prefill FFN graphs, rows {self.model.prefill_graphs.rows}")
         torch.cuda.synchronize()
         if self.ep.active:
             # Force the NCCL communicator into existence now instead of inside the first
@@ -1093,6 +1128,8 @@ class V41Engine:
 
     # ------------------------------------------------------------------ generation
     def _reset(self):
+        self._decode_adapt_checks = []
+        self._decode_adapt_passes = []
         c = self.caches
         c.len = 0
         c._chunk_inputs.clear()
@@ -1390,15 +1427,21 @@ class V41Engine:
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
+                "decode_adaptation": {"checks": self._decode_adapt_checks,
+                                      "passes": self._decode_adapt_passes},
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
                 "spec_conf": _st.get("conf"),
+                "prefill_graphs": (self.model.prefill_graphs.report()
+                                   if getattr(self.model, 'prefill_graphs', None) else None),
                 "tree_probe": _st.get("tree"),
-                "spec_depth": (self.depth_policy.report() if getattr(self, "depth_policy", None) is not None
+                "spec_depth": (_st["depth_policy"].report() if _st.get("depth_policy") is not None
                                else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
                 "prefill_expert_misses": st["prefill_misses"], "nvme_gb": round(st["bytes_read"] / 1e9, 2),
                 "nvme_read_s": round(st["read_s"], 2),
                 "engram_rows": sum(t.stats["rows"] for t in self.tables.values()),
+                "engram_cache": {L: t.row_cache.report() for L, t in self.tables.items()
+                                 if t.row_cache is not None},
                 "engram_s": round(sum(t.stats["seconds"] for t in self.tables.values()), 3),
             "engram_read_s": round(sum(t.stats.get("read_s", 0.0) for t in self.tables.values()), 3),
                 "attn_s": round(m.stats["attn_s"], 2), "moe_s": round(m.stats["moe_s"], 2),
@@ -1751,19 +1794,51 @@ class V41Engine:
         return self.maintain_demand()
 
     def _decode_adapt_due(self, n_out: int) -> int:
-        """Rank 0, once per decode step: 1 if a decode-time adaptation pass should run before
-        this step. Every ADAPT.decode_tokens output tokens, the decode stretch since the last
-        check is judged by its OWN routed-miss rate against the same gate the prefill pass uses;
-        the check point then moves on whether or not a pass runs. One GPU read per interval."""
-        mark = getattr(self, "_decode_adapt_mark", None)
-        if not ADAPT.decode_tokens or mark is None or n_out - mark[0] < ADAPT.decode_tokens:
+        """Rank 0 returns 2 for urgent or 1 for periodic adaptation; control broadcasts it.
+
+        Rolling checks read the existing decode-only counter pair once per completed
+        verification burst. No layer kernels or expert reads are added by monitoring.
+        The periodic path retains its interval-only readback when urgent mode is off.
+        """
+        mark = getattr(self, '_decode_adapt_mark', None)
+        if not ADAPT.decode_tokens or mark is None:
             return 0
-        now = self.model.miss_snapshot() if hasattr(self.model, "miss_snapshot") else None
-        self._decode_adapt_mark = (n_out, now)
-        if now is None or mark[1] is None or now[1] <= mark[1][1]:
+        urgent = getattr(self, '_urgent_adapt', None)
+        periodic = n_out - mark[0] >= ADAPT.decode_tokens
+        if urgent is None and not periodic:
             return 0
-        self._decode_adapt_rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1])
-        return 1 if self._decode_adapt_rate >= ADAPT.swap_prefill_min_miss else 0
+        # The eager fallback labels its routes as prefill in existing accounting.
+        # Preserve its aggregate-counter delta; the fast path has a decode-only pair.
+        snapshot = (getattr(self.model, 'decode_miss_snapshot', self.model.miss_snapshot)
+                    if getattr(self, 'fast', None) is not None else self.model.miss_snapshot)
+        now = snapshot()
+        graphs = len(getattr(getattr(self, 'fast', None), 'graphs', {}))
+        recaptured = graphs != getattr(self, '_urgent_graph_count', graphs)
+        self._urgent_graph_count = graphs
+        if urgent is not None and recaptured:
+            urgent.restart(n_out, now)  # warm-up forwards are not decoded tokens
+        check = urgent.observe(n_out, now) if urgent is not None and not recaptured else None
+        checks = [check] if check is not None else []
+        if periodic:
+            self._decode_adapt_mark = (n_out, now)
+            valid = now is not None and mark[1] is not None and now[1] > mark[1][1]
+            rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1]) if valid else None
+            checks.append(dict(reason='periodic', output_tokens=n_out, window_tokens=n_out-mark[0],
+                               miss_rate=rate, threshold=ADAPT.swap_prefill_min_miss,
+                               triggered=bool(valid and rate >= ADAPT.swap_prefill_min_miss)))
+        for check in checks:
+            if not hasattr(self, '_decode_adapt_checks'):
+                self._decode_adapt_checks = []
+            self._decode_adapt_checks.append(check)
+            del self._decode_adapt_checks[:-64]  # bounded request diagnostics
+            if check['triggered']:
+                self._decode_adapt_mark = (n_out, now)
+                self._decode_adapt_rate = check['miss_rate']
+                self._decode_adapt_window = check['window_tokens']
+                if urgent is not None:
+                    urgent.attempted(n_out, now)
+                return 2 if check['reason'] == 'urgent' else 1
+        return 0
 
     def maintain_decode(self, n_out: int) -> int:
         """Re-fit the resident experts mid-decode. Both ranks reach this unconditionally when
@@ -1772,15 +1847,19 @@ class V41Engine:
         see plan_swaps) and broadcasts; both apply. Past tokens are untouched: their KV is
         already written, only later tokens route to the new experts."""
         t0 = time.perf_counter()
+        reason = 'urgent' if self.ep.control_flag == 2 else 'periodic'
+        cap = ADAPT.urgent_max if reason == 'urgent' else ADAPT.swap_max
         swaps = None
         if self.ep.rank == 0:
             try:
-                swaps = self.plan_swaps(max_swaps=ADAPT.swap_max, pending_request=True)
+                swaps = self.plan_swaps(max_swaps=cap, pending_request=True)
             except Exception as e:  # noqa: BLE001
                 log(f"decode adaptation planning failed ({type(e).__name__}: {e}); skipping")
                 swaps = None
         swaps = self.ep.broadcast_obj(swaps)
         if not swaps:
+            self._decode_adapt_passes.append(dict(output_tokens=n_out, swaps=0,
+                seconds=time.perf_counter()-t0, reason=reason))
             return 0
         try:
             n = self.apply_swaps(swaps)
@@ -1789,11 +1868,13 @@ class V41Engine:
             traceback.print_exc()
             log("decode adaptation failed after the plan was broadcast; the pair would desync")
             os._exit(1)
+        self._decode_adapt_passes.append(dict(output_tokens=n_out, swaps=n,
+            seconds=time.perf_counter()-t0, reason=reason))
         if self.ep.rank == 0:
-            log(f"decode adaptation at output token {n_out}: {n} expert slots in "
+            log(f"{reason} decode adaptation at output token {n_out}: {n} expert slots in "
                 f"{1000 * (time.perf_counter() - t0):.0f} ms "
                 f"(miss rate {getattr(self, '_decode_adapt_rate', 0.0):.1%} over the last "
-                f"{ADAPT.decode_tokens} tokens)")
+                f"{self._decode_adapt_window} decoded tokens)")
         return n
 
     def maintain_inline(self, new_tokens: int) -> int:
@@ -2123,6 +2204,13 @@ class V41Engine:
         # DSV41_BLOCK_DYNAMIC: rank 0's policy picks each step's depth and control() carries it,
         # so both ranks verify the same width. Without it the depth is the fixed T_DRAFT.
         pol = self.depth_policy if (self.spec and self.fast is not None) else None
+        # Whole-draft lookahead is qualified only for greedy verification. In sampling,
+        # later confidence depends on sampled prefix tokens; using it to select the
+        # prefix length needs a distribution-preservation proof, not just a hash test.
+        conf_pol = (self.confidence_depth_policy if pol is not None and temperature <= 0 else None)
+        if conf_pol is not None:
+            pol = conf_pol
+        out_st["depth_policy"] = pol
         if pol is not None:
             pol.reset_request()
         # Decode-time expert adaptation (engine/adapt_config.py: every ADAPT.decode_tokens
@@ -2131,10 +2219,19 @@ class V41Engine:
         decode_adapt = (ADAPT.decode_tokens > 0 and self.ep.rank == 0 and self.ep.active
                         and int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) == 1
                         and getattr(self, "model_prune_mask", None))
-        self._decode_adapt_mark = ((n_out, self.model.miss_snapshot()) if decode_adapt else None)
+        decode_snapshot = (self.model.decode_miss_snapshot if self.fast is not None
+                           else self.model.miss_snapshot)
+        self._decode_adapt_mark = ((n_out, decode_snapshot()) if decode_adapt else None)
+        self._urgent_adapt = None
+        self._urgent_graph_count = len(self.fast.graphs) if self.fast is not None else 0
+        if decode_adapt and ADAPT.urgent:
+            from engine.urgent_adapt import UrgentAdaptWindow
+            self._urgent_adapt = UrgentAdaptWindow(n_out, self._decode_adapt_mark[1],
+                ADAPT.urgent_window, ADAPT.urgent_miss, ADAPT.urgent_cooldown)
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
                               pol.decide() if pol is not None and self.ep.rank == 0 else 0,
-                              self._decode_adapt_due(n_out) if decode_adapt else 0):
+                              self._decode_adapt_due(n_out) if (decode_adapt and n_out < max_tokens
+                                                               and tok not in stop_ids) else 0):
             if self.ep.control_flag:
                 self.maintain_decode(n_out)
             t_iter = time.perf_counter()
@@ -2163,6 +2260,14 @@ class V41Engine:
                 lean = LEAN_STEP and self.fast is not None and temperature <= 0
                 if self.fast is not None:
                     drafts, q = self.fast.draft(tok, pos - 1, temperature)
+                    if conf_pol is not None:
+                        chosen = conf_pol.choose(self.fast.d_conf.tolist()) if self.ep.rank == 0 else 0
+                        # Both ranks always enter this second control call. Reuse the
+                        # three-int stop protocol so release_peer() can also abort here.
+                        if not self.ep.control(True, chosen):
+                            break
+                        depth = self.ep.control_value
+                        vblk, vout, vhost = self._vbufs[depth + 1]
                     if depth < drafts.numel():
                         # dynamic depth: verify the first `depth` of the deeper draft
                         drafts, q = drafts[:depth], q[:depth]
@@ -2467,9 +2572,14 @@ class V41Engine:
             "fp8_decode_warps": int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4")),
             "decode_merged_proj": getattr(self.fast, "merged_proj", 0),
             "decode_lean": getattr(self.fast, "lean", None) is not None,
+            "block_confidence": getattr(self, "confidence_depth_policy", None) is not None,
+            "prefill_graphs": (self.model.prefill_graphs.report()
+                               if getattr(self.model, 'prefill_graphs', None) else None),
             "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
             "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
             "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0") == "1",
+            "engram_cache_mb": round(sum(t.row_cache.report()['allocated_bytes'] for t in self.tables.values()
+                                         if t.row_cache is not None) / 1024**2, 3),
             "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
             "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
@@ -2490,6 +2600,7 @@ class V41Engine:
             "prefix_response_last": getattr(self, '_prefix_response_last', None),
             "prefix_disk": self.prefix_disk is not None,
             "prefix_disk_configured": PREFIX_DISK,
+            "prefix_disk_min_interval_s": PREFIX_DISK_MIN_INTERVAL_S,
             "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,
             "prefill_replica_slots": self.replica_slots,
             "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),
@@ -2497,6 +2608,10 @@ class V41Engine:
             "prefill_fused_attn": M_.PREFILL_FUSED_ATTN,   # not a second os.environ.get: see model.py
             "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
+            "urgent_adaptation": {"enabled": ADAPT.urgent, "window_tokens": ADAPT.urgent_window,
+                                  "miss_threshold": ADAPT.urgent_miss,
+                                  "max_swaps": ADAPT.urgent_max,
+                                  "cooldown_tokens": ADAPT.urgent_cooldown},
             "prune_select": getattr(self, "prune_select", None),
             "hot_profile": self.hot_profile,
             "prefill_chunk": MAX_CHUNK,

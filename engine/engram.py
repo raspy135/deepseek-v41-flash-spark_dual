@@ -21,7 +21,8 @@ import torch
 
 
 class EngramTable:
-    def __init__(self, model_dir: str, index: dict, layer: int, device: str, threads: int = 32):
+    def __init__(self, model_dir: str, index: dict, layer: int, device: str, threads: int = 32,
+                 cache_bytes: int = 0):
         wm = index["weight_map"]
         self.path = os.path.join(model_dir, wm[f"layers.{layer}.engram.embed.weight"])
         with open(self.path, "rb") as f:
@@ -34,6 +35,10 @@ class EngramTable:
         self.w_off = base + w["data_offsets"][0]
         self.s_off = base + s["data_offsets"][0]
         self.n_rows = w["shape"][0]
+        self.row_cache = None
+        if cache_bytes:
+            from engine.engram_cache import PackedRowCache
+            self.row_cache = PackedRowCache(cache_bytes, self.n_rows)
         self.fd = os.open(self.path, os.O_RDONLY)
         os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         # Row gather over a memmap instead of a Python loop of preads. The loop cost ~12 us/row
@@ -110,6 +115,12 @@ class EngramTable:
         return out
 
     def _gather_rows(self, ids: np.ndarray) -> np.ndarray:
+        cache = getattr(self, 'row_cache', None)
+        if cache is not None and cache.enabled:
+            return cache.gather(ids, self._gather_rows_uncached)
+        return self._gather_rows_uncached(ids)
+
+    def _gather_rows_uncached(self, ids: np.ndarray) -> np.ndarray:
         """Parallel memmap gather of the unique rows. Page faults do the I/O, so the threads are
         blocked in the kernel rather than fighting over the GIL.
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 import uuid
 
 import torch
@@ -150,6 +151,77 @@ class PrefixDiskTests(unittest.TestCase):
         p = self.adapter()
         self.assertEqual(p.restore([1, 2, 3, 4], 0), 0)
         self.assertEqual(p.engine.caches.ckv[0].count_nonzero(), 0)
+
+    def saving_adapter(self, rank=0):
+        p = self.adapter()
+        value = payload()
+        p.engine._prefix_cache = value['snapshots'][6]
+        p.engine._prefix_snapshots = dict(value['snapshots'])
+        p.engine.caches.ckv = value['ckv']
+        p.engine.caches.ik = value['ik']
+        p.engine.ep.rank = rank
+        p.engine.ep.broadcast_obj = Mock(side_effect=lambda value: value)
+        p.min_interval_s, p._last_save_attempt = 300, None
+        from concurrent.futures import ThreadPoolExecutor
+        p.pool = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(p.pool.shutdown)
+        return p
+
+    def test_save_interval_skips_staging_but_keeps_ram_and_disk_prefixes(self):
+        p = self.saving_adapter()
+        ids = list(payload()['ids'])
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(ids)
+        p.join()
+        original = self.disk.candidates(ids)
+        ram = p.engine._prefix_cache
+        with patch('engine.prefix_persistence.time.monotonic', return_value=399), \
+                patch('engine.prefix_persistence.cpu_tree') as copy, \
+                patch.object(p, 'join') as join:
+            p.save(ids)
+            copy.assert_not_called()
+            join.assert_not_called()
+        self.assertIs(p.engine._prefix_cache, ram)
+        self.assertEqual(self.disk.candidates(ids), original)
+        with patch('engine.prefix_persistence.time.monotonic', return_value=400):
+            p.save(ids)
+        p.join()
+        self.assertGreater(len(self.disk.candidates(ids)), len(original))
+        self.assertEqual(p.engine.ep.broadcast_obj.call_count, 3)
+
+    def test_peer_uses_rank_zero_decision_despite_local_clock(self):
+        p = self.saving_adapter(rank=1)
+        # A first save would be locally due, but rank zero says skip.
+        with patch('engine.prefix_persistence.cpu_tree') as copy:
+            p.save(list(payload()['ids']))
+            copy.assert_not_called()
+        # Conversely, a recent local attempt must not veto rank zero's save.
+        p._last_save_attempt = 999999
+        bid = uuid.uuid4().hex
+        p.engine.ep.broadcast_obj.side_effect = lambda _: bid
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1):
+            p.save(list(payload()['ids']))
+        p.join()
+        self.assertIn((bid, 6), self.disk.candidates(list(payload()['ids'])))
+        self.assertEqual(p.engine.ep.broadcast_obj.call_count, 2)
+
+    def test_zero_interval_saves_every_boundary(self):
+        p = self.saving_adapter()
+        p.min_interval_s = 0
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(list(payload()['ids']))
+            p.save(list(payload()['ids']))
+        p.join()
+        self.assertEqual(len(self.disk.candidates(list(payload()['ids']))), 6)
+
+    def test_failed_staging_is_also_rate_limited(self):
+        p = self.saving_adapter()
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100), \
+                patch('engine.prefix_persistence.cpu_tree', side_effect=RuntimeError('copy failed')) as copy:
+            p.save(list(payload()['ids']))
+            p.save(list(payload()['ids']))
+            self.assertEqual(copy.call_count, 1)
+        self.assertIsNone(p.pending)
 
 
 if __name__ == '__main__':
