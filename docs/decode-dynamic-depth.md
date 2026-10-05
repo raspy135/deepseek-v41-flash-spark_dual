@@ -259,3 +259,61 @@ Sparks, built from the tested CUDA runtime plus the current engine/tools/server
 source. The head launcher's `.env` selects this image and forwards identical
 settings to both ranks. The user subsequently requested switching the active
 service from Qwen TensorFold to DS4.1 with this default enabled.
+
+## Per-step confidence at all temperatures, 2026-10-04
+
+`DSV41_BLOCK_CONFIDENCE=1` now chooses verification depth 1/3/5 every step for
+both greedy and sampled requests. The API temperature default remains 1.0;
+clients do not need to select greedy decoding. Set the flag to 0 to restore
+the older acceptance-window controller.
+
+Greedy keeps the existing whole-block expected-token/cost comparison.
+Sampling instead uses a proposal-prefix stopping rule: include depth 1,
+then decide whether to extend to 3, then whether to extend to 5. At each
+boundary d, the chooser reads only confidences through index d. DSpark's
+confidence at that index depends on the token before the next proposal, so
+all proposals influencing the decision are already included. The next two
+confidences are estimated from the boundary score when comparing expected
+tokens per step against measured cost. The score's accuracy affects which
+width is economical, not the sampler's acceptance/rejection correction.
+
+Inclusion of a proposal is decided without consulting that proposal or its
+suffix. Its conditional proposal probability q therefore remains valid for
+the existing `min(1, p/q)` acceptance rule and positive-residual correction.
+Do not simply use the greedy whole-block argmax at positive temperature:
+it can condition inclusion on a token that is then excluded. Rounding a
+token-dependent cutoff down to an available graph width has the same risk.
+Even invalid-confidence fallback checks must stop at the included prefix.
+
+`engine/test_confidence_depth.py` enumerates all five-token proposals and
+acceptance/rejection outcomes of a two-state Markov model, then checks the
+joint distribution of the first three output tokens. It matches ordinary
+target sampling to twelve decimal places at temperatures 0.1/0.6/1.0/2.0
+and top_p 0.5/0.95/1.0. As a negative control, substituting the greedy
+whole-block selector fails six of the twelve cases. The combined policy,
+control, prefetch, and sampled-verifier CPU/GPU suite passes 42 tests.
+
+Rank 0 chooses each step's depth and both ranks unconditionally enter the
+existing second control broadcast. The sampling-policy version is in the
+boot config guard. `spec_depth.selection` reports `lookahead` for greedy
+and `prefix` for sampling. Different schedules can consume different random
+draws; matching seeds across unequal widths is not a distribution test.
+No sampled throughput or broad quality improvement is claimed.
+
+The two-Spark qualification completed 26 requests with no rank disagreement:
+64-token greedy HTML at alternating/fixed depths 1/3/5 and both policies;
+fixed-depth-3 old/new seeded comparisons at all four positive temperatures;
+and variable sampled requests at each of the twelve temperature/top_p pairs.
+Fixed-width seeded output matched at every temperature. Variable sampled
+requests selected depth 1 on 304 steps and depth 3 on 162; this short story
+workload did not select 5. Peak PyTorch allocation was 102.261 GB on rank 0.
+Placement and prefix reuse were frozen for qualification. Retained reports
+and both logs: `results/confidence-all-temp-20261004/`. These are short-context
+correctness checks, not long-context or thinking-mode performance measurements.
+
+The installed `deepseek-v41-flash-spark:confidence-all-temp` image is identical
+on both Sparks. Its engine files match the qualification image; the final
+layer also refreshes the sampled-verifier test harness. A live request that
+omitted temperature (default 1.0) returned the integers 1 through 8 exactly,
+used the `prefix` policy at depth 5 on two steps, and retained
+`dense_fp4=off`. See `http-smoke.json` and `summary.json` in the same directory.

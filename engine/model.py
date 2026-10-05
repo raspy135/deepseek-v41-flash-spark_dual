@@ -170,7 +170,7 @@ def _aph(name, t0):
     """Call-site compatible with the old host-timer helper; records an event instead."""
     _mark(name)
     return t0
-KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_topk)
+KEY_BLOCK = 512  # score tile along the compressed-key axis; independent of index_topk
 R.MM_TILE = MM_TILE
 
 # Fused sinked-softmax attention for prefill-sized calls (T > 16). Same kernel the decode path

@@ -54,6 +54,7 @@ def namespace(engine):
                          'world': engine.ep.world, 'rank': engine.ep.rank,
                          'prune_keep': engine.prune_keep, 'act_quant': engine.act_quant,
                          'kernel': engine.kernel, 'max_context': engine.max_context,
+                         'index_topk': engine.args.index_topk,
                          'strict_routing': os.environ.get('DSV41_PREFIX_DISK_STRICT', '0'),
                          'swa_replay': engine.swa_replay}, sort_keys=True).encode())
     return h.hexdigest()

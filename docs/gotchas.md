@@ -984,3 +984,19 @@ GATE_IMAGE=<immutable-image-id> GATE_LOG_DIR=results/prefill-rails-tp-check \
   bash tools/run_two_node_gate.sh bench_prefill_rails_tp.py \
   --out /app/results/prefill-rails-tp-check
 ```
+
+## FP8 attention exposed a typed-load failure in L2 prefetch (2026-10-04)
+
+With `DSV41_DENSE_FP4=off` and `DSV41_L2PF_MB=2`, both ranks started and
+`/health` returned 200, but the first decode graph capture failed in
+`engine/l2pf.py`: `cannot cast int32[constexpr[4096]] to fp8e4nv`. The masked
+prefetch load tried to cast `other=0` into the weight's FP8 dtype. Startup
+health alone therefore missed the failure; the server marked the pair out of
+step after the request failed.
+
+Prefetch now views the same storage as uint8 and budgets bytes directly. It
+does not decode or alter weights. The byte-load version and prefetch budget
+are checked in the EP2 boot config guard. `tools/test_l2pf_cuda.py` passed
+three GPU tests in 0.639 s on the serving runtime: seven storage dtypes and
+masked byte tails, wrapper/budget handling, and FP8 graph capture/replay.
+Both ranks must restart after the original failure.

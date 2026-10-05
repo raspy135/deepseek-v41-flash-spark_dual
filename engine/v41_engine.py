@@ -477,6 +477,11 @@ class V41Engine:
         self.lock = threading.Lock()
         index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
         self.args = R.Args.from_json(os.path.join(model_dir, "inference", "config.json"))
+        # Serving preference, independent of the checkpoint's reference value (512).
+        # Wider attention is experimental: no measured hallucination reduction is claimed.
+        self.args.index_topk = int(os.environ.get("DSV41_INDEX_TOPK", "1024"))
+        if self.args.index_topk <= 0:
+            raise ValueError("DSV41_INDEX_TOPK must be positive")
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
         self.eos_token_id = 1
@@ -868,7 +873,8 @@ class V41Engine:
             # partial where its peer computes a whole, and the first all-reduce then sums
             # mismatched tensors -- no error, just wrong numbers. Checked here because a boot-time
             # refusal is the only cheap moment; at runtime it is invisible without a validator.
-            from engine.fastdecode import T_DRAFT
+            from engine.fastdecode import T_DRAFT, l2pf
+            from engine.spec_depth import ConfidenceDepthPolicy
             cfg = {
                 "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
@@ -891,6 +897,10 @@ class V41Engine:
                 "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
+                "index_topk": self.args.index_topk,
+                "candidate_topk_blocks": self.args.candidate_topk_blocks,
+                "candidate_block_size": self.args.candidate_block_size,
+                "candidate_source_layer": self.args.candidate_source_layer,
                 # Dense/attention re-quantization, the LM head's stored format and the drafter's
                 # cheaper head. All are read from the environment at load and change numerics, so
                 # a pair started with them differing would compute different logits or draft
@@ -925,13 +935,16 @@ class V41Engine:
                 "hc_fused": bool(M_.HC_FUSED),
                 "hc_mm_tile": R.HC_MM_TILE,
                 "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
+                "l2pf_bytes": l2pf.budget_bytes(),
+                "l2pf_version": l2pf.VERSION,
                 # Which verify widths exist (buffers, graphs). The depth each step uses is
                 # decided on rank 0 and broadcast with the control flag, so the other
                 # DSV41_BLOCK_DYNAMIC_* policy knobs only need to be right on rank 0.
                 "block_dynamic": os.environ.get("DSV41_BLOCK_DYNAMIC", ""),
-                # v1 adds a second control broadcast after drafting on GREEDY requests.
+                # Confidence adds a second control broadcast after drafting on all requests.
                 # A split pair must fail at boot, before either rank can enter that call.
                 "block_confidence_v1": os.environ.get("DSV41_BLOCK_CONFIDENCE", "0"),
+                "block_confidence_sampling_version": ConfidenceDepthPolicy.VERSION,
                 "spec_conf": os.environ.get("DSV41_SPEC_CONF", "0"),
                 # Decode fp8 scheduling and projection merging are meant to be bit-identical to
                 # the defaults, but that is a measured property of this GPU and compiler, not a
@@ -1098,7 +1111,7 @@ class V41Engine:
             self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS or (3, 5))
             if CONFIDENCE_DEPTHS:
                 self.confidence_depth_policy = ConfidenceDepthPolicy()
-                log("experimental confidence depth 1/3/5 for greedy requests; sampled requests use adaptive 3/5")
+                log("confidence depth 1/3/5 at every temperature (sampled requests use prefix decisions)")
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
         from engine.prefill_graphs import enabled as prefill_graphs_enabled, PrefillFFNGraphs
@@ -2204,10 +2217,9 @@ class V41Engine:
         # DSV41_BLOCK_DYNAMIC: rank 0's policy picks each step's depth and control() carries it,
         # so both ranks verify the same width. Without it the depth is the fixed T_DRAFT.
         pol = self.depth_policy if (self.spec and self.fast is not None) else None
-        # Whole-draft lookahead is qualified only for greedy verification. In sampling,
-        # later confidence depends on sampled prefix tokens; using it to select the
-        # prefix length needs a distribution-preservation proof, not just a hash test.
-        conf_pol = (self.confidence_depth_policy if pol is not None and temperature <= 0 else None)
+        # Greedy can use all five scores. Sampling uses a proposal-prefix stopping rule
+        # so inclusion of a draft never depends on that token or later proposals.
+        conf_pol = self.confidence_depth_policy if pol is not None else None
         if conf_pol is not None:
             pol = conf_pol
         out_st["depth_policy"] = pol
@@ -2261,7 +2273,11 @@ class V41Engine:
                 if self.fast is not None:
                     drafts, q = self.fast.draft(tok, pos - 1, temperature)
                     if conf_pol is not None:
-                        chosen = conf_pol.choose(self.fast.d_conf.tolist()) if self.ep.rank == 0 else 0
+                        if self.ep.rank == 0:
+                            choose = conf_pol.choose if temperature <= 0 else conf_pol.choose_sampled
+                            chosen = choose(self.fast.d_conf.tolist())
+                        else:
+                            chosen = 0
                         # Both ranks always enter this second control call. Reuse the
                         # three-int stop protocol so release_peer() can also abort here.
                         if not self.ep.control(True, chosen):
@@ -2524,6 +2540,9 @@ class V41Engine:
             "transient_slots": self.store.transient_slots,
             "resident_expert_pct": round(self.slots / (self.args.n_layers * self.args.n_routed_experts) * 100, 1),
             "max_seq": self.max_context,
+            "index_topk": self.args.index_topk,
+            "candidate_topk_blocks": self.args.candidate_topk_blocks,
+            "candidate_block_size": self.args.candidate_block_size,
             "spec": self.spec,
             "trace_stats": self.trace_stats,
             "kernel": self.kernel,

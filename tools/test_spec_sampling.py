@@ -187,7 +187,7 @@ class EngineIntegrationTests(unittest.TestCase):
         wrapper = ast.parse('''
 def sampled_tail(self, logits, q, drafts, temperature, top_p, stop_ids, max_tokens, m):
     pos, n_out, tok, steps = 10, 0, 0, 0
-    ph = pen = grammar = None
+    ph = pen = grammar = conf_hist = pol = None
     accepted_hist, out, out_st = [], [], {}
     for _ in range(1):
         pass
@@ -212,6 +212,7 @@ def sampled_tail(self, logits, q, drafts, temperature, top_p, stop_ids, max_toke
                     calls.append(True)
                     return verify_sampled(*args)
                 eng = SimpleNamespace(batched_verify=enabled, _verify_sampled=verify, device="cpu",
+                                      _decode_adapt_observe=lambda emitted: None,
                                       fast=SimpleNamespace(_ev_begin=lambda _: None))
                 model = SimpleNamespace(c=SimpleNamespace(rollback=rollback.append))
                 got = list(self.run_tail(eng, logits, q, drafts, .6, 1., stops, budget, model))

@@ -1,4 +1,4 @@
-"""L2 weight prefetch during the decode all-gathers. ``DSV41_L2PF_MB=0`` (default) is off.
+"""L2 weight prefetch during the decode all-gathers. ``DSV41_L2PF_MB=0`` disables it.
 
 The all-gather is a network wait: the GPU is busy, DRAM is idle. Reading the next layer's weights on
 a side stream then leaves them in L2 for the kernels that follow, out of bandwidth nothing else is
@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 MB = int(os.environ.get("DSV41_L2PF_MB", "2"))
+VERSION = 2  # Raw-byte loads: FP8 storage must not enter Triton's masked-load casts.
 _SINK = None
 
 
@@ -61,9 +62,12 @@ def touch(stream, tensors, budget: int):
             flat = raw(t)
             if flat is None or flat.numel() == 0 or left <= 0:
                 continue
-            flat = flat.reshape(-1)
-            take = min(flat.numel(), max(1, left // flat.element_size()))
-            left -= take * flat.element_size()
+            # Prefetch storage, not numeric values. A typed FP8 masked load tries to cast
+            # `other=0` from int32 to fp8e4nv and fails during the first decode capture
+            # when DSV41_DENSE_FP4=off. This view aliases the same bytes without conversion.
+            flat = flat.reshape(-1).view(torch.uint8)
+            take = min(flat.numel(), left)
+            left -= take
             blocks = min(triton.cdiv(take, 4096), _SINK.numel())
             _touch[(blocks,)](flat[:take], _SINK[:blocks], take, BLOCK=4096, num_warps=4)
     return budget - left

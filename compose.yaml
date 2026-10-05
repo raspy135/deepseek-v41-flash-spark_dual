@@ -37,6 +37,7 @@ services:
       MODEL_DIR: /models/${MODEL_NAME:-DeepSeek-V4.1-Flash}
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-deepseek-v4.1-flash}
       MAX_SEQ: ${MAX_SEQ:-32768}
+      DSV41_INDEX_TOPK: ${DSV41_INDEX_TOPK:-1024}
       ARENA_GB: ${ARENA_GB:-}
       TRACE_STATS: ${TRACE_STATS:-}
       DEFAULT_THINKING: ${DEFAULT_THINKING:-off}

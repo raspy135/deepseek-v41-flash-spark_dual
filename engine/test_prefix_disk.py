@@ -10,7 +10,7 @@ import uuid
 import torch
 
 from engine.prefix_disk import PrefixDisk
-from engine.prefix_persistence import PersistentPrefixes
+from engine.prefix_persistence import PersistentPrefixes, namespace
 
 
 def payload(tokens=(1, 2, 3, 4, 5, 6)):
@@ -61,6 +61,21 @@ class PrefixDiskTests(unittest.TestCase):
         self.assertEqual(PrefixDisk(self.tmp.name, 'model-b', 1000000).candidates([1, 2, 3, 4]), [])
         self.assertEqual(self.disk.candidates([1, 2, 3, 4], 'route-b'), [])
         self.assertEqual(len(self.disk.candidates([1, 2, 3, 4], 'route-a')), 2)
+
+    def test_attention_width_changes_persistent_namespace(self):
+        model = Path(self.tmp.name) / 'model'
+        (model / 'inference').mkdir(parents=True)
+        for name in ('model.safetensors.index.json', 'inference/config.json', 'tokenizer.json'):
+            (model / name).write_text('{}')
+        engine = SimpleNamespace(model_dir=model, ep=SimpleNamespace(world=2, rank=0),
+                                 prune_keep=0.6, act_quant=False, kernel='fp4',
+                                 max_context=32768, swa_replay=True,
+                                 args=SimpleNamespace(index_topk=512))
+        old = namespace(engine)
+        engine.args.index_topk = 1024
+        self.assertNotEqual(namespace(engine), old)
+        engine.args.index_topk = 512
+        self.assertEqual(namespace(engine), old)
 
     def test_corrupt_and_missing_blob_are_misses(self):
         bid = self.save()

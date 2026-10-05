@@ -608,8 +608,12 @@ class FastDecoder:
             self.candidates[:, :score.size(1)].copy_(selected)
         elif 0 <= a.candidate_source_layer < L:
             score = score.masked_fill(~self.candidates[:, :score.size(1)], float("-inf"))
-        idx = score.topk(a.index_topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        return torch.where(idx < compress_lens[:, None], idx, torch.full_like(idx, -1))
+        # Small context allocations can have fewer cache rows than the serving top-k.
+        # Preserve the fixed output width expected by attention and captured graphs.
+        idx = score.topk(min(a.index_topk, score.size(1)), dim=-1, sorted=False).indices.sort(dim=-1).values
+        idx = torch.where(idx < compress_lens[:, None], idx, torch.full_like(idx, -1))
+        pad = a.index_topk - idx.size(1)
+        return F.pad(idx, (0, pad), value=-1) if pad else idx
 
     # ------------------------------------------------------------------ layer graphs
     def _tap(self, name, L, t):

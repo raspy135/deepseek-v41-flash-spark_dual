@@ -1,6 +1,6 @@
 """Speculative depth policies: recent acceptance and opt-in per-draft confidence.
 
-ConfidenceDepthPolicy implements DSV41_BLOCK_CONFIDENCE for greedy requests.
+ConfidenceDepthPolicy implements DSV41_BLOCK_CONFIDENCE for all temperatures.
 The original DSV41_BLOCK_DYNAMIC controller below supports greedy and sampling:
 
 Why: the best draft depth depends on how predictable the text is. Measured on TP2
@@ -38,7 +38,7 @@ from collections import deque
 
 
 def confidence_depths(dynamic_depths=None):
-    """Resolve the opt-in policy without importing CUDA; sampled requests retain 3/5."""
+    """Resolve the opt-in policy without importing CUDA."""
     value = os.environ.get("DSV41_BLOCK_CONFIDENCE", "0")
     if value not in ("0", "1"):
         raise ValueError("DSV41_BLOCK_CONFIDENCE must be 0 or 1")
@@ -53,11 +53,13 @@ def confidence_depths(dynamic_depths=None):
 
 
 class ConfidenceDepthPolicy:
-    """Greedy-only per-draft expected tokens / measured step cost.
+    """Per-draft expected tokens / measured step cost.
 
     DSpark's logits estimate conditional acceptance, so survival to position k is
     the product of the first k probabilities. Include the guaranteed verifier token.
     Never consult the current step's actual acceptance to choose its width.
+    Greedy uses whole-block lookahead. Sampling extends a guaranteed prefix at
+    width boundaries, without looking at proposals it might exclude.
 
     The 88/106/124 ms priors are historical TP2 measurements. Unseen widths inherit
     the median measured/prior scale; observed widths use robust local timings.
@@ -66,6 +68,7 @@ class ConfidenceDepthPolicy:
     """
     depths = (1, 3, 5)
     priors = {1: .088, 3: .106, 5: .124}
+    VERSION = 2  # Sampled width selection is a proposal-prefix stopping rule.
 
     def __init__(self):
         self._samples = {d: deque(maxlen=32) for d in self.depths}
@@ -77,6 +80,7 @@ class ConfidenceDepthPolicy:
         self.depth = 3
         self.steps = dict.fromkeys(self.depths, 0)
         self.switches = self.invalid_confidence = 0
+        self.selection = None
 
     def _times(self):
         ratios = [t / self.priors[d] for d, t in self.step_s.items() if t is not None]
@@ -88,6 +92,7 @@ class ConfidenceDepthPolicy:
         return self.depth
 
     def choose(self, logits):
+        self.selection = "lookahead"
         if self.pinned is not None:
             if self.pinned not in self.depths:
                 raise ValueError("confidence depth must be 1, 3 or 5")
@@ -107,6 +112,60 @@ class ConfidenceDepthPolicy:
                 if k in times:
                     rates[k] = expected / times[k]
             target = max(self.depths, key=lambda d: rates[d])  # ties prefer shallower
+        return self._select(target)
+
+    def choose_sampled(self, logits):
+        """Extend 1 -> 3 -> 5 using only a prefix already selected for verification.
+
+        Confidence i depends on proposals BEFORE i (the Markov embedding), never
+        proposal i. At depth d, confidence[d] is therefore safe to use when
+        deciding whether to include the NEXT two proposals. Estimate both added
+        confidences from that boundary score instead of peeking at their tokens.
+
+        This makes the block length a stopping time of the proposal prefix:
+        inclusion of proposal i is decided without consulting proposal i or later
+        proposals. Its q remains the original conditional distribution, so the
+        existing min(1, p/q) acceptance and residual correction remain valid.
+        A whole-block argmax or rounding a token-dependent cutoff DOWN to a graph
+        width would violate that condition. Accuracy of the confidence estimate
+        affects cost, not the target distribution.
+        """
+        self.selection = "prefix"
+        if self.pinned is not None:
+            if self.pinned not in self.depths:
+                raise ValueError("confidence depth must be 1, 3 or 5")
+            return self._select(self.pinned)
+        if len(logits) != 5:
+            self.invalid_confidence += 1
+            return self._select(3)
+        times = self._times()
+        survival, expected, seen = 1.0, 1.0, 0
+        for depth, deeper in zip(self.depths, self.depths[1:]):
+            # All these positions are already included. Never validate future
+            # logits as a group: even an invalid-value fallback can leak lookahead.
+            for x in logits[seen:depth]:
+                if not math.isfinite(x):
+                    self.invalid_confidence += 1
+                    return self._select(depth)
+                survival *= self._sigmoid(x)
+                expected += survival
+            seen = depth
+            x = logits[depth]
+            if not math.isfinite(x):
+                self.invalid_confidence += 1
+                return self._select(depth)
+            probability = self._sigmoid(x)
+            extra = survival * sum(probability ** k for k in range(1, deeper - depth + 1))
+            if (expected + extra) / times[deeper] <= expected / times[depth]:
+                return self._select(depth)
+        return self._select(self.depths[-1])
+
+    @staticmethod
+    def _sigmoid(x):
+        z = math.exp(-abs(x))
+        return 1 / (1 + z) if x >= 0 else z / (1 + z)
+
+    def _select(self, target):
         self.switches += target != self.depth
         self.depth = target
         return target
@@ -122,7 +181,7 @@ class ConfidenceDepthPolicy:
         return None  # per-step switches belong in aggregate stats, not the server log
 
     def report(self):
-        return {"policy": "confidence", "depths": list(self.depths),
+        return {"policy": "confidence", "selection": self.selection, "depths": list(self.depths),
                 "steps": {str(d): n for d, n in self.steps.items()},
                 "switches": self.switches, "invalid_confidence": self.invalid_confidence,
                 "step_ms": {str(d): None if t is None else round(t * 1000, 1)
