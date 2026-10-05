@@ -317,3 +317,107 @@ layer also refreshes the sampled-verifier test harness. A live request that
 omitted temperature (default 1.0) returned the integers 1 through 8 exactly,
 used the `prefix` policy at depth 5 on two steps, and retained
 `dense_fp4=off`. See `http-smoke.json` and `summary.json` in the same directory.
+
+## Default-off decode experiments (2026-10-04)
+
+Three experiments preserve the target's attention/head precision and participate
+in the EP2 boot guard. Lookup and bypass require single-request graphed speculation.
+The TP draft-head flag controls allocation separately; the fast drafter uses the
+copy when present, and callers that omit MTP loading do not allocate it.
+
+* `DSV41_LOOKUP_DRAFT_ENABLED=1` restores request-local continuation copying.
+  `DSV41_LOOKUP_DRAFT_NGRAM=16` alone no longer enables it. Rank 0 chooses a
+  continuation and depth from settled history before drafting, broadcasts that
+  proposal, and skips DSpark. At positive temperature its proposal probabilities
+  are delta rows, consumed by the existing acceptance/residual verifier after
+  target grammar/penalty handling. The confidence broadcast is still entered by
+  both ranks; copied steps do not contaminate DSpark cost estimates.
+* `DSV41_TP_DRAFT_HEAD=1 DSV41_DRAFT_HEAD_FMT=fp8` builds a separate quantized
+  local vocabulary shard. It uses the existing vocabulary all-gather; the BF16
+  verifier shard is untouched. The actual 64640-by-5120 checkpoint shard adds
+  331,280,000 bytes per rank, allocated before arena sizing. A local five-row
+  graph replay microbenchmark, 25 ABBA quartets, measured 2.888 ms BF16 versus
+  1.502 ms FP8. This excludes all-gather, acceptance and the rest of the engine.
+* `DSV41_DRAFT_BYPASS=1` selects occasional ordinary target steps using only
+  completed-step cost/acceptance. It skips DSpark, runs the two-row graph on root
+  plus a discarded dummy, samples only root logits, and rolls back after root.
+  Ratio-2 compression currently prevents a genuine width-one graph. A bypass
+  selected from current proposal tokens would be invalid for sampling; this
+  policy decides before drawing any current proposals.
+
+The lookup CPU screen used exact-16 suffixes, 512 append/propose calls and three
+repetitions: periodic 16K/96K prompts took about 23 us per hit; random misses took
+2-3 us. Initial 96K indexing took 32-71 ms. Dense delta rows at vocabulary
+129280 occupy 0.52/1.55/2.59 MB for depths 1/3/5. These are host overhead figures,
+not model-throughput measurements.
+
+`engine/test_lookup_sampling.py` enumerates joint first-three-token distributions
+under four temperatures, three nucleus thresholds, masked/adjusted targets and
+four fixed/history-dependent width rules (96 combinations).
+`engine/test_decode_experiments.py` executes the actual control/commit branches
+without loading weights. `tools/test_tp_draft_head_cuda.py` checks real two-rank
+all-gathers and changing-input graph replay. `tools/bench_decode_ideas_tp.py`
+reuses one loaded engine for bounded rollout qualification followed by warmed
+head-format ABBA tests. Evidence is retained under
+`results/decode-ideas-20261004/`. Production switches remain off while these
+experiments are measured.
+
+### Warmed two-Spark screen
+
+The combined gate completed on both ranks with no output-hash disagreement.
+Lookup qualification comprised 41 requests per rank: periodic and stale-context
+greedy equality, forced rejection of a deliberately corrupted copied token, and
+seeded repeat/rank checks at temperatures 0.1/0.6/1.0/2.0 with top_p 0.5/0.95/1.0.
+Bypass qualification comprised 68 requests per rank: greedy off/forced-on/alternating/
+adaptive equality on explanation and Python, plus pinned seeded repeats and
+adaptive rank agreement across the same twelve sampling settings. The draft-only
+head matched greedy Python output and agreed across ranks on four sampled rollouts.
+The combined CPU/GPU suite passed 75 tests in 1.230 s; separate head tests and its
+real two-rank all-gather gate also passed. These checks do not establish broad
+language quality or sampled distribution equality from seeds alone.
+
+After graph/prompt warmup, each comparison ran
+baseline/candidate/candidate/baseline, two measured requests per arm. Warmups
+generated 32 tokens for copy/bypass and 64 for the head tests, shorter than the
+timed outputs, so later Engram rows can retain cold-read effects. All measured
+requests used top_p=0.95:
+
+| Experiment / workload | Temperature / output tokens | Baseline median tok/s | Candidate median tok/s | Change |
+| --- | --- | ---: | ---: | ---: |
+| Continuation copy / periodic text | 1.0 / 96 | 44.715 | 47.950 | +7.23% |
+| Forced draft bypass / explanation | 1.0 / 96 | 22.540 | 15.530 | -31.10% |
+| FP8 draft head / HTML | 0 / 256 | 51.515 | 51.975 | +0.89% |
+| FP8 draft head / Python | 0 / 256 | 54.920 | 56.265 | +2.45% |
+| FP8 draft head / explanation | 1.0 / 256 | 24.605 | 27.440 | +11.52% |
+
+These medians use the reported rounded decode rates. Copying is a favorable
+repeated-text case with depth pinned to 3: all 24 lookups and 72 copied proposals
+per run succeeded, skipping DSpark on every step. All four copy outputs matched.
+This is evidence for repeated continuations, not ordinary prose or miss-heavy
+requests. Forced bypass saved the draft pass but emitted only one token per step;
+95 bypass steps lost to the baseline's average 1.88 tokens per step. It remains off.
+
+Both greedy head comparisons emitted identical target tokens in every arm. HTML
+acceptance fell from 5.08 to 4.98 tokens per step, leaving its small throughput
+change within the run spread. Python acceptance remained 5.59. The sampled
+explanation changed proposal/RNG schedules and text; FP8 runs ranged from 25.96
+to 28.92 tok/s with acceptance 2.17 to 2.46, versus baseline acceptance 2.10.
+The larger median gain therefore includes different stochastic trajectories and
+confidence schedules; it needs representative repeated trials before promotion.
+
+The target head stayed BF16 and attention stayed FP8 (`dense_fp4=off`). Placement,
+prefix reuse and urgency were frozen. Both head arms retained the extra
+331,280,000-byte FP8 shard per rank and the same 90.1 GB arena/0.61 keep fraction;
+this comparison does not price a reduction in expert residency. Peak PyTorch
+allocation was 102.726 GB on each rank. `INDEX_TOPK=512` explicitly matched the
+existing serving configuration despite the host tree's new default of 1024.
+Context capacity was 524288, but these were short prompts, without long-context,
+thinking-mode or concurrent-client measurements.
+
+The experiments were not deployed. All three switches remain off. The original
+`confidence-all-temp` pair was restored and passed health plus a default-temperature
+HTTP request returning exactly `1 2 3 4`; extra attention quantization and the
+draft head remain off, with confidence depth enabled.
+Exact samples, both rank reports and the summary are retained under
+`results/decode-ideas-20261004/model-gate/` and
+`results/decode-ideas-20261004/summary.json`.

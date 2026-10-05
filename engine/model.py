@@ -265,19 +265,23 @@ class Weights:
         # ... and, with DSV41_HEAD_FMT, in fp8 or fp4 instead: the head is read in full on every
         # decode step, so its stored format is worth as much as a dense projection group's.
         head = get('head.weight')
+        from engine.tensor_parallel import draft_head_bytes, make_tp_draft_head
         if os.environ.get('DSV41_TP_HEAD', '0') == '1':
             from engine.tensor_parallel import VocabParallelHead
             rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
             if world != 2 or head.shape[0] % world:
                 raise ValueError('vocabulary TP requires two equal shards')
             self.head = VocabParallelHead(R.make_head(head.chunk(world, dim=0)[rank].to(device)), world)
-            self.draft_head = None  # the drafter has no second vocab shard to run against
+            self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp)
         else:
             self.head = R.make_head(head.to(device))
             # DSV41_DRAFT_HEAD_FMT: the verifier keeps `head`; only the drafter reads the cheaper
             # copy. None means "reuse the verifier's" (off, already quantized, or FP32 reference).
             # Gated on load_mtp: diagnostics that never draft should not pay for a second head.
             self.draft_head = R.make_draft_head(self.head) if load_mtp else None
+        # This is extra resident storage, allocated before the engine prices its expert arena.
+        # It is reported separately so draft speed is not bought with hidden model memory.
+        self.draft_head_bytes = draft_head_bytes(self.draft_head)
         del head
         self.norm = get("norm.weight").to(device).to(torch.bfloat16)
         self.layers = []

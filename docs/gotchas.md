@@ -1000,3 +1000,108 @@ are checked in the EP2 boot config guard. `tools/test_l2pf_cuda.py` passed
 three GPU tests in 0.639 s on the serving runtime: seven storage dtypes and
 masked byte tails, wrapper/budget handling, and FP8 graph capture/replay.
 Both ranks must restart after the original failure.
+
+## Owning-copy expert swap staging loses its read-only screening test (2026-10-04)
+
+An asynchronous reader could overlap swap disk reads with installation while
+preserving the agreed plan and application boundary. The first prototype retained
+owning CPU copies from `ExpertStore.read_expert` in a bounded four-expert window,
+with two reader workers. The production baseline passes its leased pinned bytes
+directly to the installer, avoiding those extra copies. Merely making the reads
+concurrent therefore adds work before there is anything to overlap.
+
+On the head Spark, 32 real packed checkpoint experts across layers, warm working
+set without a global page-cache flush, three samples per arm in alternating order:
+
+| Simulated install delay per expert | Serial leased reader, median | Owning-copy staged reader, median | Staged change |
+| --- | ---: | ---: | ---: |
+| 0 ms | 77.53 ms | 104.23 ms | +34.4% time |
+| 0.25 ms | 89.34 ms | 107.39 ms | +20.2% time |
+| 1 ms | 113.99 ms | 110.67 ms | -2.9% time |
+
+The install intervals are CPU sleeps, **not measured GPU copies**. This runner
+loads no inference model and executes no GPU copy, collective, expert eviction or
+routing update. The small apparent win at 1 ms is within the staged-arm spread
+(100.88–113.66 ms); it does not justify a serving integration or throughput claim.
+The initial staged expert matched the independently reread checkpoint bytes, and
+the peak retained payload was exactly the configured 75,202,560-byte budget,
+returning to zero after completion. Existing store I/O buffers are outside that
+incremental payload budget. PyTorch was 2.13.0+cu130 with 20 CPU intra-op threads.
+
+The prototype remains a standalone experiment in `engine/swap_staging.py`;
+`V41Engine.apply_swaps` and the production ExpertStore load path are unchanged.
+Ten CPU tests cover exact file-byte ownership, fixed plan order/ownership,
+initial and later read failures, cancellation, stale generation/plan rejection,
+borrowed record lifetime, and the memory bound across superseded plans.
+A future zero-copy lease design would need to retain source buffers through
+installation and prove it cannot starve other ExpertStore readers. Staging a plan
+across decode steps would also require a new application boundary, which can change
+routing trajectories; this experiment does not claim to preserve that behavior.
+
+Evidence: `results/swap-staging-micro-20261004/rank0.json`. Reproduce the screening
+test with the pair stopped:
+
+```bash
+.venv/bin/python tools/bench_swap_staging.py \
+  --model-dir /home/ryan/models/DeepSeek-V4.1-Flash \
+  --count 32 --rounds 3 --window 4 --workers 2 \
+  --out results/swap-staging-micro-20261004/rank0.json
+python3 tools/test_swap_staging.py -v
+```
+
+## Skipping DSpark can save a pass and lose throughput (2026-10-04)
+
+The default-off draft-bypass prototype uses the existing two-row graph on the
+root token plus a discarded dummy. Only the root logits produce an ordinary
+target sample; the dummy is rolled back. This avoids DSpark but still reads
+the main model's weights and emits only one token per step.
+
+On the disposable two-Spark gate, sampled sky/sunset explanation at temperature
+1.0/top_p=0.95, 96 output tokens, warmed off/on/on/off with two samples per arm:
+the normal confidence-controlled DSpark path measured **22.29/22.79 tok/s**;
+forced bypass measured **15.53/15.53 tok/s**. Medians were **22.54 -> 15.53 tok/s,
+-31.10%**. Normal steps yielded 1.88 tokens on average, while bypass needed 95
+one-token steps. The sampled texts differ because their proposal/RNG schedules
+change; this is a throughput screen, not a quality comparison. It does not show
+that an adaptive policy could never use bypass on a worse-acceptance workload.
+
+The prototype passed 68 short qualification requests per rank: greedy equality
+for off/forced-on/alternating/adaptive modes on two prompts, plus seeded-repeat
+and rank checks across four temperatures and three top_p settings. All 20
+measured combined-gate request hashes also agreed across ranks. Target head
+BF16 and attention FP8 stayed fixed, with no extra attention quantization;
+expert placement, prefix reuse and urgency were frozen, and `INDEX_TOPK=512`
+matched serving. The context was sized for 524288, but prompts were short.
+
+Keep `DSV41_DRAFT_BYPASS=0`. Source and tests remain for investigation; no
+experiment was deployed. Retain the ordinary speculative path whenever its
+extra accepted tokens repay the draft cost. A genuine width-one graph would
+also need compressor work; the current ratio-2 path requires a dummy row.
+Evidence: both reports in `results/decode-ideas-20261004/model-gate/` and
+`results/decode-ideas-20261004/summary.json`.
+
+## Sampled confidence depth can get stuck behind an expensive intermediate width (2026-10-04)
+
+`results/code.json` records the HTTP code benchmark at temperature 0.6/top_p 0.95,
+1024 output tokens and sparse-attention width 1024. Confidence policy version 2
+used depth 1 on 1538 of 1569 measured steps (98.0%); mean accepted block lengths
+were 1.90/2.13/1.86, at 24.52/24.45/23.79 tok/s. The two depth-1-only runs had
+roughly 90%/86% draft-token acceptance, so the near-two block counter does not
+establish a weak drafter.
+
+The retained depth-3 estimate was 155.4 ms while depth 1 cost 73.4-75.2 ms and
+depth 5 cost 107.3-113.1 ms. The sampled prefix rule first asks whether extending
+1 to 3 pays, and stops without considering 5 if it does not. When depth 3 costs
+more than twice depth 1, even perfect predicted acceptance cannot justify that
+first extension: the maximum expected-token ratio is only 4/2. Replaying the
+saved costs with near-certain confidence therefore still selects 1. These costs
+persist across requests, and an unselected width receives no new measurements.
+
+The mixed-width run included 31 depth-5 steps. Even allowing every one of its
+449 depth-1 steps to accept its draft, the rounded overall mean implies at least
+about 3.94 tokens per depth-5 step. The drafter is capable of longer blocks here.
+The source of the anomalous depth-3 timing is not yet established. Restore the
+previously qualified acceptance-based 3/5 controller for a baseline comparison;
+do not dismiss this scheduling problem as sampling temperature alone. A fix that
+skips an expensive intermediate width must still use only the already-included
+proposal prefix, with exact sampled-distribution tests and a new boot-guard version.

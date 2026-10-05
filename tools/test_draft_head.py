@@ -18,12 +18,14 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, "..")]
 import v41_ref as R  # noqa: E402
+from engine.tensor_parallel import VocabParallelHead, draft_head_bytes, make_tp_draft_head
 
 DEV = "cuda"
 VOCAB, K = 1024, 512
@@ -37,7 +39,8 @@ def _head():
 
 class DraftHead(unittest.TestCase):
     def setUp(self):
-        self._env = {k: os.environ.get(k) for k in ("DSV41_HEAD_FMT", "DSV41_DRAFT_HEAD_FMT", "DSV41_HEAD_FP32")}
+        self._env = {k: os.environ.get(k) for k in ("DSV41_HEAD_FMT", "DSV41_DRAFT_HEAD_FMT", "DSV41_HEAD_FP32",
+                                                  "DSV41_TP_DRAFT_HEAD")}
         for k in self._env:
             os.environ.pop(k, None)
         if R.quantize_to_fp8 is None or R.quantize_to_fp4 is None:
@@ -109,6 +112,49 @@ class DraftHead(unittest.TestCase):
         os.environ["DSV41_DRAFT_HEAD_FMT"] = "int8"
         with self.assertRaises(ValueError):
             R.draft_head_fmt()
+
+    def test_tp_copy_and_gather_preserve_verifier(self):
+        os.environ['DSV41_TP_DRAFT_HEAD'] = '1'
+        os.environ['DSV41_DRAFT_HEAD_FMT'] = 'fp8'
+        full = _head()
+        x = torch.randn(5, K, device=DEV, dtype=torch.bfloat16)
+        local_heads = [VocabParallelHead(part.clone(), 2) for part in full.chunk(2)]
+        originals = [h.local.clone() for h in local_heads]
+        target_before = [R.head_logits(x, h.local) for h in local_heads]
+        drafts = [make_tp_draft_head(h) for h in local_heads]
+        expected_parts = [R.head_logits(x, h.local) for h in drafts]
+        expected = torch.cat(expected_parts, dim=-1)
+        expected_gather = torch.cat(expected_parts, dim=0)
+        for rank, (head, draft) in enumerate(zip(local_heads, drafts)):
+            self.assertIsInstance(draft.local, R.FP8Weight)
+            self.assertTrue(torch.equal(head.local, originals[rank]))
+            self.assertTrue(torch.equal(R.head_logits(x, head.local), target_before[rank]))
+            self.assertLess(draft_head_bytes(draft), draft_head_bytes(head))
+            gathers = []
+            def gather(output, local, group=None):
+                gathers.append((tuple(local.shape), local.dtype))
+                self.assertTrue(torch.equal(local, expected_parts[rank]))
+                output.copy_(expected_gather)
+            with patch('engine.tensor_parallel.comm.all_gather_fast', gather), \
+                    patch('engine.tensor_parallel.collective_group', return_value=None):
+                got = R.head_logits(x, draft)
+            self.assertEqual(gathers, [((5, VOCAB // 2), torch.float32)])
+            self.assertTrue(torch.equal(got, expected))
+
+    def test_tp_off_formats_do_not_allocate(self):
+        os.environ['DSV41_TP_DRAFT_HEAD'] = '1'
+        head = VocabParallelHead(R.make_head(_head()), 2)
+        for fmt in ('off', 'bf16'):
+            os.environ['DSV41_DRAFT_HEAD_FMT'] = fmt
+            self.assertIsNone(make_tp_draft_head(head))
+        os.environ['DSV41_DRAFT_HEAD_FMT'] = 'fp8'
+        os.environ['DSV41_HEAD_FMT'] = 'fp8'
+        quantized = VocabParallelHead(R.make_head(_head()), 2)
+        self.assertIsNone(make_tp_draft_head(quantized))
+        os.environ['DSV41_HEAD_FMT'] = 'bf16'
+        os.environ['DSV41_HEAD_FP32'] = '1'
+        reference = VocabParallelHead(R.make_head(_head()), 2)
+        self.assertIsNone(make_tp_draft_head(reference))
 
 
 if __name__ == "__main__":

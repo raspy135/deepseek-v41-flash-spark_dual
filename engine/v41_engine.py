@@ -78,6 +78,11 @@ PREFILL_SWAP_MIN_MISS = ADAPT.swap_prefill_min_miss
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 
+# Experiments stay off until their two-rank gates and representative A/Bs pass.
+LOOKUP_DRAFT_ENABLED = os.environ.get("DSV41_LOOKUP_DRAFT_ENABLED", "0") == "1"
+LOOKUP_DRAFT_NGRAM = int(os.environ.get("DSV41_LOOKUP_DRAFT_NGRAM", "16"))
+LOOKUP_DRAFT_CANDIDATES = int(os.environ.get("DSV41_LOOKUP_DRAFT_CANDIDATES", "8"))
+
 
 class StepPhases:
     """Accumulating per-phase timer, printed as a table over a whole run."""
@@ -464,6 +469,14 @@ class V41Engine:
         self.model_dir = model_dir
         self.device = device
         self.spec = spec
+        from engine import draft_bypass
+        from engine.tensor_parallel import tp_draft_head_enabled
+        self.draft_bypass_enabled = draft_bypass.enabled()
+        tp_draft_head_enabled()  # validate even on the unsharded path
+        if os.environ.get("DSV41_LOOKUP_DRAFT_ENABLED", "0") not in ("0", "1"):
+            raise ValueError("DSV41_LOOKUP_DRAFT_ENABLED must be 0 or 1")
+        if LOOKUP_DRAFT_ENABLED and (LOOKUP_DRAFT_NGRAM < 2 or LOOKUP_DRAFT_CANDIDATES < 1):
+            raise ValueError("lookup drafting needs NGRAM >= 2 and CANDIDATES >= 1")
         # A/B switches for the two numerics arms that have no server flag.  Both change what the
         # engine computes, so they are in the EP2 boot guard below:
         #   DSV41_ACT_QUANT=1    -- fake-quantize activations to the reference's fp8-per-32 UE8M0
@@ -875,6 +888,8 @@ class V41Engine:
             # refusal is the only cheap moment; at runtime it is invisible without a validator.
             from engine.fastdecode import T_DRAFT, l2pf
             from engine.spec_depth import ConfidenceDepthPolicy
+            from engine.lookup_draft import VERSION as LOOKUP_VERSION
+            from engine.tensor_parallel import TP_DRAFT_HEAD_VERSION
             cfg = {
                 "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
@@ -919,6 +934,14 @@ class V41Engine:
                 "ablate_wob_digest": R_ablit.digest(),
                 "head_fmt": R.head_fmt(),
                 "draft_head_fmt": R.draft_head_fmt(),
+                "tp_draft_head": tp_draft_head_enabled(),
+                "tp_draft_head_version": TP_DRAFT_HEAD_VERSION,
+                "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
+                "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
+                "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
+                "lookup_draft_version": LOOKUP_VERSION,
+                "draft_bypass": self.draft_bypass_enabled,
+                "draft_bypass_version": draft_bypass.VERSION,
                 "hc_kernel": R.HC_KERNEL,
                 "hc_prec": R.HC_PREC,
                 "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
@@ -1114,6 +1137,12 @@ class V41Engine:
                 log("confidence depth 1/3/5 at every temperature (sampled requests use prefix decisions)")
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
+        if LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled:
+            if not (self.spec and self.fast is not None and self.fast.use_graphs
+                    and int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 1):
+                raise ValueError('draft experiments require single-request graphed speculation')
+            if self.draft_bypass_enabled and 2 not in VERIFY_WIDTHS:
+                raise ValueError('draft bypass requires the two-row graph (confidence depth 1)')
         from engine.prefill_graphs import enabled as prefill_graphs_enabled, PrefillFFNGraphs
         self.model.prefill_graphs = None
         if prefill_graphs_enabled():
@@ -1449,6 +1478,8 @@ class V41Engine:
                 "tree_probe": _st.get("tree"),
                 "spec_depth": (_st["depth_policy"].report() if _st.get("depth_policy") is not None
                                else None),
+                "lookup_draft": (_st['lookup_draft'].report() if _st.get('lookup_draft') is not None else None),
+                "draft_bypass": (_st['draft_bypass'].report() if _st.get('draft_bypass') is not None else None),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
                 "prefill_expert_misses": st["prefill_misses"], "nvme_gb": round(st["bytes_read"] / 1e9, 2),
                 "nvme_read_s": round(st["read_s"], 2),
@@ -2225,6 +2256,20 @@ class V41Engine:
         out_st["depth_policy"] = pol
         if pol is not None:
             pol.reset_request()
+        lookup = None
+        bypass = None
+        if (self.spec and self.fast is not None and conf_hist is None and tree_hist is None):
+            if LOOKUP_DRAFT_ENABLED and self.ep.rank == 0:
+                from engine.lookup_draft import ExactDraftCache
+                history = host_ids if host_ids is not None else ids.tolist()
+                lookup = ExactDraftCache(list(history) + [tok], LOOKUP_DRAFT_NGRAM,
+                                         LOOKUP_DRAFT_CANDIDATES)
+            if getattr(self, 'draft_bypass_enabled', False):
+                from engine.draft_bypass import DraftBypassPolicy
+                bypass = DraftBypassPolicy()
+                bypass.pinned = getattr(self, '_bypass_pinned', None)
+        out_st['lookup_draft'] = lookup
+        out_st['draft_bypass'] = bypass
         # Decode-time expert adaptation (engine/adapt_config.py: every ADAPT.decode_tokens
         # output tokens, gated on that stretch's miss rate). Rank 0 decides; control() carries
         # the flag so both ranks run the pass at the same step. Single-request serving only.
@@ -2241,7 +2286,8 @@ class V41Engine:
             self._urgent_adapt = UrgentAdaptWindow(n_out, self._decode_adapt_mark[1],
                 ADAPT.urgent_window, ADAPT.urgent_miss, ADAPT.urgent_cooldown)
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
-                              pol.decide() if pol is not None and self.ep.rank == 0 else 0,
+                              self._decode_step_value(pol, lookup, bypass,
+                                  n_out < max_tokens and tok not in stop_ids),
                               self._decode_adapt_due(n_out) if (decode_adapt and n_out < max_tokens
                                                                and tok not in stop_ids) else 0):
             if self.ep.control_flag:
@@ -2250,8 +2296,10 @@ class V41Engine:
             # A step that captures a CUDA graph (first use of a width/parity/bucket, or the
             # drafter) costs seconds; timing it would skew the policy's step-time estimate.
             n_graphs = (len(self.fast.graphs) + (self.fast.draft_graphs is not None)
-                        if pol is not None else 0)
-            depth = self.ep.control_value if pol is not None else self._tv - 1
+                        if pol is not None or bypass is not None else 0)
+            mode = self.ep.control_value
+            copied, root_only = mode < 0, mode == 0
+            depth = abs(mode) if mode else 0
             if pol is not None and self.ep.rank == 0:
                 sw = pol.pop_switch()
                 if sw is not None:
@@ -2263,19 +2311,31 @@ class V41Engine:
                         f"{sw['tokens_per_step']} tokens/step over {sw['steps']} steps; "
                         + ", ".join(f"depth {d} {'would be ' if d == other else ''}{r} tok/s"
                                     for d, r in sorted(sw["rate"].items())))
-            vblk, vout, vhost = self._vbufs[depth + 1]
+            vblk, vout, vhost = self._vbufs[2 if root_only else depth + 1]
             if ph is not None:
                 ph.start()
             if self.spec:
                 # the lean path applies to greedy decoding only; temperature > 0 keeps the original
                 # sequential rejection-sampling loop so its RNG stream is bit-for-bit unchanged
-                lean = LEAN_STEP and self.fast is not None and temperature <= 0
+                lean = LEAN_STEP and self.fast is not None and temperature <= 0 and not root_only
                 if self.fast is not None:
-                    drafts, q = self.fast.draft(tok, pos - 1, temperature)
+                    if copied:
+                        from engine.lookup_draft import deterministic_draft_probs
+                        proposal = self.ep.broadcast_obj(getattr(self, '_lookup_step_tokens', None))
+                        drafts = torch.tensor(proposal, dtype=torch.long, device=self.device)
+                        q = deterministic_draft_probs(drafts, self.args.vocab_size)
+                    elif root_only:
+                        drafts = torch.empty(0, dtype=torch.long, device=self.device)
+                        q = torch.empty((0, self.args.vocab_size), device=self.device)
+                    else:
+                        drafts, q = self.fast.draft(tok, pos - 1, temperature)
                     if conf_pol is not None:
                         if self.ep.rank == 0:
-                            choose = conf_pol.choose if temperature <= 0 else conf_pol.choose_sampled
-                            chosen = choose(self.fast.d_conf.tolist())
+                            if copied or root_only:
+                                chosen = depth
+                            else:
+                                choose = conf_pol.choose if temperature <= 0 else conf_pol.choose_sampled
+                                chosen = choose(self.fast.d_conf.tolist())
                         else:
                             chosen = 0
                         # Both ranks always enter this second control call. Reuse the
@@ -2283,7 +2343,7 @@ class V41Engine:
                         if not self.ep.control(True, chosen):
                             break
                         depth = self.ep.control_value
-                        vblk, vout, vhost = self._vbufs[depth + 1]
+                        vblk, vout, vhost = self._vbufs[2 if root_only else depth + 1]
                     if depth < drafts.numel():
                         # dynamic depth: verify the first `depth` of the deeper draft
                         drafts, q = drafts[:depth], q[:depth]
@@ -2293,7 +2353,12 @@ class V41Engine:
                         drafts = drafts.clone(); q = q.clone()
                     if ph is not None:
                         ph.mark("draft")
-                    if lean:
+                    if root_only:
+                        # Ratio-2 compression requires two rows. The dummy is causal,
+                        # never emitted and rolled back; only row 0 supplies a sample.
+                        block = vblk
+                        block.fill_(tok)
+                    elif lean:
                         # no H2D and no allocation: fill_ bakes the token into the kernel argument
                         block = vblk
                         block[0].fill_(tok)
@@ -2378,6 +2443,9 @@ class V41Engine:
                     if ph is not None:
                         ph.mark("rollback")
                     accepted_hist.append(a)
+                    if lookup is not None:
+                        if copied:
+                            lookup.record_accept(a)
                     if conf_hist is not None:
                         conf_hist.append((depth, a, self.fast.d_conf.tolist()))
                     if tree_hist is not None:
@@ -2395,6 +2463,8 @@ class V41Engine:
                     pos = pos + a + 1
                     tok = emitted[-1] if emitted else tok
                     if emitted:
+                        if lookup is not None:
+                            lookup.extend(emitted)
                         if pen is not None:
                             pen.observe(emitted)
                         out += emitted
@@ -2409,8 +2479,10 @@ class V41Engine:
                             ph.mark("consumer")
                         if any(t in stop_ids for t in emitted):
                             break
-                    if pol is not None and self.ep.rank == 0:
+                    if pol is not None and self.ep.rank == 0 and not copied:
                         pol.observe(depth, a, len(emitted), self._policy_step_s(t_iter, n_graphs))
+                    if bypass is not None and self.ep.rank == 0 and not copied:
+                        bypass.observe(False, len(emitted), self._policy_step_s(t_iter, n_graphs))
                     steps += 1
                     out_st["steps"] = steps
                     if ph is not None:
@@ -2420,7 +2492,7 @@ class V41Engine:
                 # fixed-count random draws and one compact result transfer. The default keeps
                 # the historical, variable-length RNG stream and sequential stop semantics.
                 _ev_sample = self.fast._ev_begin("sample") if self.fast is not None else None
-                if self.batched_verify and temperature > 0 and 0 < top_p <= 1:
+                if self.batched_verify and temperature > 0 and 0 < top_p <= 1 and not root_only:
                     a, new, bonus = self._verify_sampled(
                         logits, q, drafts, temperature, top_p, stop_ids)
                 else:
@@ -2464,6 +2536,8 @@ class V41Engine:
                 if ph is not None:
                     ph.mark("rollback")
                 accepted_hist.append(a)
+                if lookup is not None and copied:
+                    lookup.record_accept(a)
                 if conf_hist is not None:
                     conf_hist.append((depth, a, self.fast.d_conf.tolist()))
                 emitted = list(new)
@@ -2473,6 +2547,8 @@ class V41Engine:
                 pos = pos + a + 1
                 tok = emitted[-1] if emitted else tok
                 if emitted:
+                    if lookup is not None:
+                        lookup.extend(emitted)
                     if pen is not None:
                         pen.observe(emitted)
                     out += emitted
@@ -2487,8 +2563,10 @@ class V41Engine:
                         ph.mark("consumer")
                     if any(t in stop_ids for t in emitted):
                         break
-                if pol is not None and self.ep.rank == 0:
+                if pol is not None and self.ep.rank == 0 and not root_only and not copied:
                     pol.observe(depth, a, len(emitted), self._policy_step_s(t_iter, n_graphs))
+                if bypass is not None and self.ep.rank == 0 and not copied:
+                    bypass.observe(root_only, len(emitted), self._policy_step_s(t_iter, n_graphs))
                 steps += 1
                 out_st["steps"] = steps
                 if ph is not None:
@@ -2520,6 +2598,22 @@ class V41Engine:
                     grammar.observe([tok])
                 yield [tok]
         out_st.update(n_out=n_out, steps=steps)
+
+    def _decode_step_value(self, pol, lookup, bypass, keep_going=True):
+        """Rank 0 selects a proposal mode before any current proposal is drawn.
+
+        Positive = DSpark depth; negative = copied depth; zero = root-only.
+        Every rank follows the same control value, including all graph collectives.
+        """
+        if self.ep.rank != 0 or not keep_going:
+            return 0
+        depth = pol.decide() if pol is not None else self._tv - 1
+        self._lookup_step_tokens = lookup.propose(depth) if lookup is not None else None
+        if self._lookup_step_tokens is not None:
+            return -depth
+        if bypass is not None and bypass.decide():
+            return 0
+        return depth
 
     # ------------------------------------------------------------------ introspection
     supports_penalties = True
@@ -2571,6 +2665,11 @@ class V41Engine:
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
             "ablate_wob": R_ablit.enabled(),
             "draft_head_fmt": R.draft_head_fmt(),
+            "tp_draft_head": os.environ.get('DSV41_TP_DRAFT_HEAD', '0') == '1',
+            "draft_head_bytes": getattr(self.W, 'draft_head_bytes', 0),
+            "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
+            "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
+            "draft_bypass": self.draft_bypass_enabled,
             "hc_kernel": R.HC_KERNEL,
             "hc_prec": R.HC_PREC,
             "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",

@@ -130,6 +130,9 @@ The main capacity and speed controls:
 | `SPEC=1` | Enable speculative decoding. Speed depends on how many draft tokens are accepted. |
 | `DSV41_BLOCK_CONFIDENCE=1` | Recipe default: choose verify depth 1/3/5 each step at every temperature, using confidence and measured cost. Sampling uses prefix decisions; greedy uses whole-block lookahead. Set 0 to restore acceptance-window adaptation. Requires speculation, CUDA graphs, concurrency 1, and `DSV41_BLOCK=5` or unset. See [measurements and limitations](docs/decode-dynamic-depth.md#two-spark-result). |
 | `DSV41_BLOCK_DYNAMIC=3,5` | Acceptance-window adaptation when confidence is disabled. For fixed depth, disable confidence, remove this setting, and set `DSV41_BLOCK=3`. Needs `DSV41_MAX_CONCURRENCY=1`. |
+| `DSV41_LOOKUP_DRAFT_ENABLED=1` | Experimental request-local continuation copies at every temperature. Set `DSV41_LOOKUP_DRAFT_NGRAM=16`; copies bypass DSpark and retain target verification. Default off. |
+| `DSV41_TP_DRAFT_HEAD=1` | Experimental separate draft vocabulary shard. Also set `DSV41_DRAFT_HEAD_FMT=fp8`; the target head keeps its existing format. Default off; adds 331 MB/rank for FP8. |
+| `DSV41_DRAFT_BYPASS=1` | Experimental pre-proposal decision to skip DSpark and emit one target sample using the two-row graph. Requires confidence widths and concurrency 1. Default off. |
 | `DSV41_MAX_CONCURRENCY=1` | Experimental: `2` serves two requests together on TP. Needs extra cache memory; prefill still runs one prompt at a time. See [concurrency notes](docs/concurrency.md). |
 | `DSV41_HC_MM_TILE=32` | Faster FP32 hyper-connection decode projections. `16` restores the previous summation order. See [measurements](docs/decode-fp32-experiments.md). |
 | `DSV41_PREFILL_CHUNK=1024` | Prefill chunk size. Smaller chunks give finer prefix-cache boundaries; larger chunks reduce dispatch overhead. |

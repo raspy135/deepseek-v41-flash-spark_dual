@@ -11,6 +11,45 @@ from engine.collective_rails import group as collective_group
 from engine import comm
 
 
+TP_DRAFT_HEAD_VERSION = 1
+
+
+def tp_draft_head_enabled():
+    """Opt in separately: DRAFT_HEAD_FMT historically had no effect with vocab TP."""
+    value = os.environ.get('DSV41_TP_DRAFT_HEAD', '0')
+    if value not in ('0', '1'):
+        raise ValueError('DSV41_TP_DRAFT_HEAD must be 0 or 1')
+    return value == '1'
+
+
+def make_tp_draft_head(head, *, load_mtp=True):
+    """Quantize this rank's draft-only vocab shard; retain the verifier and gather layout.
+
+    The separate opt-in preserves the old TP behavior when DRAFT_HEAD_FMT is left
+    at its low-level FP8 default. The format decision remains R.make_draft_head's:
+    off, an already quantized verifier and the FP32 reference do not allocate.
+    No collective runs while constructing the copy. At decode, both heads use
+    VocabParallelHead.tp_logits, including its unconditional disjoint all-gather.
+    """
+    if not tp_draft_head_enabled() or not load_mtp:
+        return None
+    if not isinstance(head, VocabParallelHead):
+        raise TypeError('TP draft head requires a VocabParallelHead verifier')
+    import v41_ref as R
+    local = R.make_draft_head(head.local)
+    return None if local is None else VocabParallelHead(local, head.world)
+
+
+def draft_head_bytes(head):
+    """Additional resident tensor bytes of a separate head, including quantization scales."""
+    if head is None:
+        return 0
+    local = head.local if isinstance(head, VocabParallelHead) else head
+    tensors = ((local,) if isinstance(local, torch.Tensor)
+               else (local.w, local.s))
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
 def shard(weight, dim, rank, world):
     if isinstance(weight, torch.Tensor):
         if weight.shape[dim] % world:
