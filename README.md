@@ -11,6 +11,15 @@ Adaptation improves coverage; it does not guarantee full-model quality.
 
 ## Why use this engine?
 
+- **Vision support.** Send images and text through the same chat API. The vision
+  tower can run on the second node and share image embeddings with both ranks;
+  this freed **0.97 GB** on the head in our tests while preserving image support.
+- **Flexible memory configuration, including room for TTS.** Adjust the resident
+  expert count, context allocation and each node's Engram cache to fit your setup.
+  The development pair runs this engine alongside TTS using the smaller expert
+  budget documented below. You can trade some expert capacity for another service
+  without downloading or converting a different weight pack. See the
+  [coexistence checks and memory limitations](RESULTS.md).
 - **Keep the original expert weights.** Routed experts use native MXFP4 from the
   checkpoint, with no additional EXL3 conversion or separate quantized weight pack.
   The default also keeps dense layers at their checkpoint precision.
@@ -26,10 +35,6 @@ Adaptation improves coverage; it does not guarantee full-model quality.
 - **See what the engine is doing.** The live expert map shows loading, residency
   and arena ownership. Request statistics expose both routing-count and
   router-score-weighted misses, making selection changes inspectable.
-- **Budget memory around other services.** Tune the exact resident count, context
-  allocation and each node's Engram cache. Peer-only vision freed **0.97 GB** on
-  the head in our tests, leaving more room for experts or a companion service such
-  as TTS. See [measurements and limitations](RESULTS.md).
 
 TP2 output sharding, native FP4 kernels, RoCE communication, speculative decoding
 and RAM prefix reuse support this design. The distinctive feature is their
@@ -46,9 +51,9 @@ The main difference is **where the memory saving comes from**:
 | Workload adaptation | Changes which experts occupy the fixed memory budget | Weight quantization stays fixed; memory policy depends on the runtime |
 | Main tradeoff | Preserve stored expert precision while accepting residency misses | Accept requantization error to fit more expert weights |
 
-Choose this engine when you want to retain checkpoint expert precision, tailor
-residency to your own traffic, and control how memory is shared with other
-services. It is especially useful for experimenting with expert selection and
+Choose this engine when you want image input, flexible memory allocation for
+services such as TTS, and checkpoint expert precision with residency tailored
+to your own traffic. It is especially useful for experimenting with expert selection and
 seeing the effect directly in the map and routing statistics.
 
 EXL3 remains a strong alternative: fitting all experts avoids this engine's
