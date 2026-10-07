@@ -1784,3 +1784,53 @@ occupy 2,124,472,320 bytes per node; the total arena grows by 2.1 decimal GB
 (its spare capacity decreases). Both nodes need headroom, regardless of which
 node hosts TTS. The larger configuration has not been launched or validated
 under sustained long-context load.
+
+### 2026-10-06 — Live throughput for the README
+
+Ran seven bounded requests without restarting or changing the live configuration:
+one warmup plus two measured runs each for code and prose, then one random 8K
+request. TP2, 9,574 residents, arena 90.2 GB per node, 524,288 context allocation,
+1,024-token prefill chunks, native MXFP4 experts, dense FP4 off, native attention
+abliteration overlay enabled, DSpark depth 3/5, router-score adaptation high/prior
+4, RAM prefixes on, disk/response caches off, prediction in shadow mode. The TTS
+service stayed loaded; no concurrent speech request was submitted by the bench.
+This measures the existing TTS-sized profile, not the larger engine-only example.
+
+Harness: `bench/bench.py`, model `deepseek`, temperature 0, top_p 0.95, thinking
+off, `ignore_eos=true`. Code/prose requested 256 output tokens and random requested
+128; every measured response reached exactly that length. Fresh prompt tags (or
+random words) yielded zero cached tokens in every measured request. Normal
+adaptation and predictor observation stayed active and learned from the traffic.
+
+| Workload | Prompt / output tokens | Decode tok/s, measured runs | Median TTFT | Routing misses, measured runs |
+| --- | --- | --- | --- | --- |
+| LRU Python module: TTL, thread safety, callbacks and pytest suite | 62 / 256 | 26.480, 27.263 (median 26.872) | 0.889 s | 4.99%, 3.87% |
+| Coastal-ecosystem essay | 45 / 256 | 19.206, 17.833 (median 18.519) | 0.875 s | 5.64%, 4.73% |
+| Random 8K | 8,177 / 128 | 23.182 (one run) | 21.360 s | 27.81% |
+
+Random-input prefill took 21.345 s, or 383.09 input tok/s. Code/prose warmup decode
+rates were 26.89 and 18.09 tok/s, excluded from the medians. Median engine
+`accept_len_mean` was 2.82 for code and 1.92 for prose; random was 2.72. This metric
+includes the verified token: it is output tokens per verification step, not a
+count of accepted draft tokens alone. Engine store hit rate was 1.0 while routing
+misses remained nonzero; store hits must not be presented as complete expert
+coverage. Measured code/prose runs had no urgent decode swap pass.
+
+Client decode rate is `(completion_tokens - 1) / (total_s - first_content_time)`;
+it excludes TTFT and uses usage tokens, not streamed chunk count. The random
+prompt's high miss rate and the varying output tokens per step illustrate why
+throughput depends on workload and learned residency. All outputs were token-capped,
+so these measurements do not qualify complete code or answer quality. This is a
+small sequential serving benchmark, not a matched EXL3 comparison or proof of a
+regression/speedup against earlier configurations. The final health check was OK
+and idle. No settings were changed to obtain the numbers.
+
+Reproduction: code/prose use `--osl 256 --warmup 1 --runs 2 --temperature 0
+--ignore-eos`, with labels `readme-20261006-code` and `readme-20261006-prose`.
+Random uses `--workload random --isl 8192 --osl 128 --warmup 0 --runs 1
+--temperature 0 --ignore-eos --label readme-20261006-random`. Live history can
+change the outputs and timing between executions. The artifact directory records the Git identity, source hashes and serving image
+identity; the benchmark used the already-running service.
+
+Artifacts: `results/readme-throughput-20261006/`: per-workload JSON, combined
+`summary.json`, `run.py`, warmup log and before/after health snapshots.

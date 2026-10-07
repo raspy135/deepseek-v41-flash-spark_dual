@@ -57,6 +57,35 @@ serving depend on the particular EXL3 runtime; this profile serves one request a
 a time. See [recorded experiments](RESULTS.md) rather than treating native weight
 precision or a lower miss rate as an answer-quality guarantee.
 
+## Performance
+
+Measured on two DGX Sparks on **2026-10-06**, using the live TTS-sized profile:
+9,574 resident experts, 90.2 GB/node, 512K context allocation, native dense
+precision, abliteration enabled, speculative depth 3/5, and adaptation active.
+Predictive prefill was in shadow mode. TTS remained loaded; concurrent speech
+generation was not part of this benchmark.
+
+| Workload | Decode speed | Time to first token |
+| --- | ---: | ---: |
+| Python LRU cache with TTL, thread safety and tests | **26.9 tok/s** (26.5–27.3) | 0.89 s |
+| Coastal-ecosystem essay | **18.5 tok/s** (17.8–19.2) | 0.87 s |
+| Uncached random 8K prompt | **23.2 tok/s** | 21.36 s |
+
+The 8K input contained 8,177 tokens and prefilled at **383 tok/s**. All measured
+requests reused zero cached prefix tokens. Code/prose figures are medians of two
+256-token runs after one warmup each; 8K is one run with 128 output tokens.
+Thinking was off, temperature zero, and output length fixed. Decode speed excludes
+time to first token. These are short throughput checks, not answer-quality tests
+or measurements of the larger 9,800-expert example. Prompt content, draft acceptance,
+expert history and cache reuse affect speed. See [full results](RESULTS.md).
+
+Reproduce an individual workload against a running server:
+
+```bash
+python3 bench/bench.py --model deepseek --workload code --osl 256 \
+  --warmup 1 --runs 2 --temperature 0 --ignore-eos --label readme-20261006-code
+```
+
 ## Setup
 
 You need two DGX Sparks, Docker with NVIDIA GPU support, a working RoCE link,
