@@ -187,3 +187,68 @@ class VisionTower:
             print(f"[vision] span {types.numel()} tok, {img.patches.shape[0]} patches, "
                   f"{rows.shape[0]} rows in {_t.perf_counter() - _t0:.2f}s", flush=True)
         return h
+
+
+class PeerVisionTower:
+    """TP2: rank 1 encodes images; both ranks receive identical complete spans.
+
+    The head keeps config metadata only, so prepare_vl/image validation remains
+    available without loading the ViT, aligner or delimiter weights there.
+    """
+    VERSION = 1
+
+    def __init__(self, model_dir, ep, device='cuda', dtype=torch.bfloat16):
+        if not ep.active or not ep.tensor_parallel or ep.world != 2:
+            raise ValueError('peer vision requires TP2')
+        self.ep = ep
+        self.cfg = _vision_args(model_dir)[1]
+        self.device, self.dtype = device, dtype
+        self.local = VisionTower(model_dir, device, dtype) if ep.rank == 1 else None
+
+    @torch.inference_mode()
+    def splice(self, h, images):
+        import torch.distributed as dist
+        for img in images or ():
+            error = None
+            try:
+                size = img.types.numel()
+                if img.start < 0 or img.start + size > h.shape[0]:
+                    raise ValueError('image span runs past prefill chunk')
+                if self.local is not None:
+                    self.local.splice(h, [img])
+            except Exception as exc:
+                error = f'{type(exc).__name__}: {exc}'
+            # Reached by BOTH ranks, even when only the owner failed encoding.
+            # Do not leave the head waiting for a tensor the owner cannot send.
+            errors = self.ep.gather_objects(error)
+            if any(e is not None for e in errors):
+                raise RuntimeError(f'peer vision encoding failed: {errors}')
+            span = h[img.start:img.start + size]
+            payload = span.contiguous()
+            dist.broadcast(payload, src=1)
+            span.copy_(payload)
+        return h
+
+
+def make_vision(model_dir, ep, device='cuda', *, enabled=True, mode='replicated', log=print):
+    """Agree on ownership before loading; report owner failure on both ranks."""
+    modes = ep.gather_objects((enabled, mode))
+    if any(item != modes[0] for item in modes):
+        raise ValueError(f'vision configuration differs across ranks: {modes}')
+    if mode not in ('replicated', 'peer'):
+        raise ValueError('DSV41_VISION_MODE must be replicated or peer')
+    if not enabled:
+        return None
+    tower, error = None, None
+    try:
+        tower = (PeerVisionTower(model_dir, ep, device) if mode == 'peer'
+                 else VisionTower(model_dir, device))
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'
+    errors = ep.gather_objects(error)
+    if any(e is not None for e in errors):
+        if mode == 'peer':
+            raise RuntimeError(f'peer vision load failed: {errors}')
+        log(f'vision tower unavailable on the pair ({errors}); image inputs rejected')
+        return None
+    return tower

@@ -116,3 +116,12 @@ generation starts right after `<｜Assistant｜><think>` (thinking) or `<｜Assi
   `"tool_grammar": false` (one request) to sample freely instead -- the tolerant parser then
   recovers what it can -- and `DSV41_LOG_TOOL_GRAMMAR=1` to log the grammar. `POST /v1/debug/prompt`
   returns it as `tool_grammar` alongside the rendered prompt.
+
+## Live expert memory map
+
+`GET /expert-map` serves the interactive layer/expert and arena-sector views.
+`GET /v1/expert-map` returns a CPU-only snapshot of the native v41 expert store:
+states, expert-to-sector addresses, current loads and a bounded recent load log.
+The page polls once per second and can be paused. Other engine adapters return
+501 for the JSON route. The observer exposes no prompt text and does not take
+the generation lock or perform GPU readbacks/TP collectives.

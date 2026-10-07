@@ -32,6 +32,7 @@ def _stub(n_layers=2, n_experts=4):
     s._want_counts = z(n_layers, n_experts)
     s._want_mass = z(n_layers, n_experts)
     s._req_counts = z(n_layers, n_experts)
+    s._req_mass = z(n_layers, n_experts)
     return s
 
 
@@ -77,8 +78,10 @@ class PruneUnitRequestTest(unittest.TestCase):
         s = _stub()
         s._want_counts[0, 0] = 5.0
         s._req_counts[0, 0] = 7.0
+        s._req_mass[0, 0] = 9.0
         M.Model.reset_request_demand(s)
         self.assertEqual(float(s._req_counts.sum()), 0.0)
+        self.assertEqual(float(s._req_mass.sum()), 0.0)
         self.assertEqual(float(s._want_counts[0, 0]), 5.0)
 
     def test_slot_mode_flush_is_a_noop(self):
@@ -95,6 +98,25 @@ class PruneUnitRequestTest(unittest.TestCase):
         M.Model.flush_request_demand(s, 50)
         self.assertIsNone(s._req_counts)
         self.assertIsNone(s._want_counts)
+
+    def test_score_history_is_request_normalized_and_new_evidence_is_not_decayed(self):
+        s = _stub()
+        s._want_mass[0] = torch.tensor([1., 0., 0., 0.])
+        s._req_counts[0] = torch.tensor([3., 1., 0., 0.])
+        s._req_mass[0] = torch.tensor([1., 9., 0., 0.])
+        M.Model.flush_request_demand(s, 1.)
+        torch.testing.assert_close(s._want_mass[0],
+                                   torch.tensor([.6, .9, 0., 0.], dtype=torch.float64))
+        self.assertEqual(float(s._req_mass.sum()), 0.)
+        self.assertEqual(float(s._want_mass[1].sum()), 0.)
+
+    def test_score_history_is_independent_of_request_length(self):
+        short, long = _stub(), _stub()
+        for s, scale in ((short, 1.), (long, 1000.)):
+            s._req_counts[0] = torch.tensor([3., 1., 0., 0.]) * scale
+            s._req_mass[0] = torch.tensor([1., 9., 0., 0.]) * scale
+            M.Model.flush_request_demand(s, 0)
+        torch.testing.assert_close(short._want_mass, long._want_mass)
 
 
 if __name__ == "__main__":

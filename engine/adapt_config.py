@@ -21,6 +21,11 @@ sensitivity (2% at medium, 1% at high), a 512-swap cap, a 0.005 gain floor -- an
 old per-setting variables, naming them in the startup log. With neither set, every legacy
 DSV41_PRUNE_* variable is read exactly as before, with the same defaults.
 
+DSV41_PRUNE_METRIC=frequency (default) ranks by selection counts; score uses the sum of raw
+positive router scores for the unmasked top-k picks. In request units each request contributes
+one normalized score distribution per layer. This is router preference, not measured expert
+output contribution. The shipped frequency trace remains the cold-start prior in either mode.
+
 Resolved once at import from the environment, which the launcher forwards identically to both
 ranks; the EP2 boot guard compares the resolved values (`boot_fields`).
 """
@@ -45,6 +50,7 @@ REPLACED = ("DSV41_PRUNE_UNIT", "DSV41_PRUNE_PRIOR", "DSV41_PRUNE_HALFLIFE", "DS
 @dataclass(frozen=True)
 class AdaptConfig:
     source: str                  # "knobs" or "legacy"
+    metric: str                  # "frequency" or pre-mask router "score"
     record: bool                 # record routing demand (DSV41_PRUNE_MISS)
     use_db: bool                 # blend the saved demand DB into the boot ranking (DSV41_PRUNE_ADAPT)
     request_unit: bool           # one vote per request (else per routing slot)
@@ -96,6 +102,8 @@ class AdaptConfig:
         """What both ranks must agree on: anything that decides whether a collective happens
         (the prefill-boundary pass) or what the ranking/mask is built from."""
         return {"adapt_source": self.source, "adapt_request_unit": self.request_unit,
+                "prune_metric": self.metric, "prune_score_history_version": 2,
+                "prune_record": self.record,
                 "adapt_prior": self.prior, "adapt_halflife": round(self.halflife, 6),
                 "adapt_swap": self.swap, "adapt_decode_tokens": self.decode_tokens,
                 "adapt_urgent_v1": self.urgent, "adapt_urgent_window": self.urgent_window,
@@ -140,15 +148,24 @@ def _decode_tokens(raw: str | None) -> int:
 def resolve(env=None) -> AdaptConfig:
     env = os.environ if env is None else env
     get = env.get
+    metric = get("DSV41_PRUNE_METRIC", "frequency").strip().lower()
+    if metric not in ("frequency", "score"):
+        raise ValueError(f"DSV41_PRUNE_METRIC={metric!r}: use frequency or score")
+    def db_path(request):
+        default = REQUEST_DB if request else "results/prune_demand.npz"
+        if metric == "score":
+            default = default.removesuffix(".npz") + "_score.npz"
+        return get("DSV41_PRUNE_DB", default)
     sens_raw, prior_raw = get("DSV41_ADAPT_SENSITIVITY"), get("DSV41_ADAPT_PRIOR")
     if sens_raw is None and prior_raw is None:
         request = get("DSV41_PRUNE_UNIT", "slot") == "request"
         return AdaptConfig(
             source="legacy",
-            record=get("DSV41_PRUNE_MISS", "0") == "1",
+            metric=metric,
+            record=metric == "score" or get("DSV41_PRUNE_MISS", "0") == "1",
             use_db=get("DSV41_PRUNE_ADAPT", "1") == "1",
             request_unit=request,
-            db_path=get("DSV41_PRUNE_DB", "results/prune_demand.npz"),
+            db_path=db_path(request),
             prior=float(get("DSV41_PRUNE_PRIOR", "2e7")),
             halflife=float(get("DSV41_PRUNE_HALFLIFE", "2e7")),
             swap=get("DSV41_PRUNE_SWAP", "0") == "1",
@@ -183,10 +200,11 @@ def resolve(env=None) -> AdaptConfig:
         raise ValueError('DSV41_ADAPT_URGENT must be 0 or 1')
     return AdaptConfig(
         source="knobs",
+        metric=metric,
         record=True,                 # demand is the input to everything below, and the miss report
         use_db=get("DSV41_PRUNE_ADAPT", "1") == "1",
         request_unit=True,
-        db_path=get("DSV41_PRUNE_DB", REQUEST_DB),
+        db_path=db_path(True),
         prior=prior,
         halflife=halflife if on else float("inf"),
         swap=on and not freeze,

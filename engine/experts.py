@@ -165,6 +165,8 @@ class ExpertStore:
         self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
+        from engine.expert_activity import ExpertActivity
+        self.activity = ExpertActivity()
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
         if read_threads is None:
             read_threads = int(os.environ.get("DSV41_READ_THREADS", 24))
@@ -299,6 +301,13 @@ class ExpertStore:
         return st
 
     def _load_into_slot(self, key: tuple, slot: int, prefix: str | None = None):
+        activity = getattr(self, 'activity', None)
+        if activity is None:  # minimal CPU store fixtures
+            return self._load_slot_data(key, slot, prefix)
+        with activity.loading(key, slot):
+            return self._load_slot_data(key, slot, prefix)
+
+    def _load_slot_data(self, key: tuple, slot: int, prefix: str | None = None):
         """Read one expert straight from NVMe into its arena slot.
 
         The pinned staging buffer is handed to `arena.load_slot` directly instead of being cloned

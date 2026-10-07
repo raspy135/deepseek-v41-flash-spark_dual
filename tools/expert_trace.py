@@ -116,6 +116,7 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--save-scores", action="store_true", help="also store full 384-way gate scores (fp16)")
     ap.add_argument("--no-act-quant", action="store_true", help="skip fp8 activation fake-quant (debug)")
+    ap.add_argument("--output-norms", action="store_true", help="record unweighted expert-output norm estimates in fp32")
     a = ap.parse_args()
 
     if a.no_act_quant:
@@ -189,6 +190,7 @@ def main():
             ew = R.EngramWeights(lambda n, eg=eg: eg.get_tensor(n), L, dev)
 
         rec_idx, rec_w, rec_scores, rec_cat, rec_tok = [], [], [], [], []
+        rec_norms = []
         expert_cache: dict = {}
         for s, st in zip(seqs, states):
             if ew is not None:
@@ -203,13 +205,21 @@ def main():
                 rec_cat.extend([s["category"]] * indices.size(0))
                 rec_tok.extend(s["ids"])
 
-            R.block_forward(st, w, experts, args, expert_cache, record)
+            def record_norms(norms):
+                arr = norms.float().cpu().numpy()
+                if not np.isfinite(arr).all():
+                    raise ValueError(f'nonfinite output norms in layer {L}')
+                rec_norms.append(arr)
+
+            R.block_forward(st, w, experts, args, expert_cache, record,
+                            record_norms if a.output_norms else None)
         n_uniq = len(expert_cache)
         del expert_cache, w, experts, ew
         torch.cuda.empty_cache() if dev.startswith("cuda") else None
 
         np.savez_compressed(os.path.join(a.out, "trace", f"layer{L}.npz"),
                             indices=np.concatenate(rec_idx), weights=np.concatenate(rec_w),
+                            output_norms=(np.concatenate(rec_norms) if a.output_norms else np.zeros(0, np.float32)),
                             scores=(np.concatenate(rec_scores) if a.save_scores else np.zeros(0, np.float16)),
                             category=np.array(rec_cat), token=np.array(rec_tok, dtype=np.int32))
         torch.save({"layer": L, "states": [{"h": st.h.cpu(), "pre_mix": st.pre_mix.cpu(),

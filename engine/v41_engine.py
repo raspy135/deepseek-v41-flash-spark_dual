@@ -322,7 +322,8 @@ def sample_probs(logits: torch.Tensor, temperature: float, top_p: float) -> torc
     return p
 
 
-def build_keep_masks(counts: dict, frac: float, select: str, device, min_per_layer: int = 24):
+def build_keep_masks(counts: dict, frac: float, select: str, device, min_per_layer: int = 24,
+                     layer_counts: tuple | None = None):
     """Which experts stay routable under a budget of ceil(frac*384) per layer ON AVERAGE.
 
     select="uniform": the top ceil(frac*384) experts of every layer (the v0.2.0-wip scheme).
@@ -336,9 +337,16 @@ def build_keep_masks(counts: dict, frac: float, select: str, device, min_per_lay
     n_keep = max(6, _m.ceil(frac * 384))
     total = n_keep * len(counts)
     keep = {}
+    if layer_counts is not None:
+        from engine.expert_budget import parse_layer_counts
+        layer_counts = parse_layer_counts(','.join(map(str, layer_counts)), len(counts),
+                                         384, 6, frac, select)
+        if sorted(counts) != list(range(len(counts))):
+            raise ValueError('explicit layer counts require contiguous layer IDs')
     if select == "uniform":
         for L, c in counts.items():
-            keep[int(L)] = np.argsort(np.asarray(c))[::-1][:n_keep]
+            quota = n_keep if layer_counts is None else layer_counts[int(L)]
+            keep[int(L)] = np.argsort(np.asarray(c))[::-1][:quota]
     elif select == "global":
         keys = []
         for L, c in counts.items():
@@ -409,7 +417,21 @@ def load_prune_db(path: str = PRUNE_DB):
             log(f"prune demand DB {path} is in {'request' if have else 'slot'} units but this run "
                 f"uses {'request' if want else 'slot'}; ignoring it and starting from the trace")
             return None
-        return d["counts"], d["mass"]
+        version = int(d["score_history_version"][0]) if "score_history_version" in d.files else 0
+        counts, mass = d["counts"], d["mass"]
+        if version != 2 and ADAPT.request_unit:
+            if ADAPT.metric == "score":
+                log(f"prune demand DB {path} has legacy unnormalized score history; "
+                    "score ranking starts fresh (frequency history is preserved on disk)")
+                return None
+            # Old request counts are usable, but their score column isn't a request EWMA.
+            mass = np.zeros_like(counts)
+        if (counts.shape != mass.shape or counts.ndim != 2 or
+                not np.isfinite(counts).all() or not np.isfinite(mass).all() or
+                (counts < 0).any() or (mass < 0).any()):
+            raise ValueError("invalid routing-demand arrays")
+        d.close()
+        return counts, mass
     except Exception as e:  # noqa: BLE001
         log(f"prune demand DB unreadable ({e}); starting fresh")
         return None
@@ -424,7 +446,8 @@ def save_prune_db(counts, mass, path: str = PRUNE_DB):
     # and leave the rename below pointing at a file that was never created. Hand it a HANDLE.
     with open(tmp, "wb") as f:
         np.savez(f, counts=counts, mass=mass,
-                 unit=np.array([1 if ADAPT.request_unit else 0]))
+                 unit=np.array([1 if ADAPT.request_unit else 0]),
+                 score_history_version=np.array([2]))
     os.replace(tmp, path)
 
 
@@ -440,14 +463,20 @@ def blend_demand(trace_counts: dict, db, prior_slots: float):
 
     A cold database changes nothing and a well-exercised one dominates, with no threshold to
     tune or trip over.
+
+    DSV41_PRUNE_METRIC=score uses score mass for the observed distribution. The calibration
+    trace contains counts only, so the prior stays frequency-based until fresh traffic lands.
     """
     import numpy as np
-    counts, _mass = db
+    counts, mass = db
     out, ws = {}, []
     for L, tr in trace_counts.items():
-        obs = np.asarray(counts[L], dtype=np.float64)
+        obs = np.asarray(mass[L] if ADAPT.metric == "score" else counts[L], dtype=np.float64)
         n = obs.sum()
-        w = float(n / (n + prior_slots)) if n > 0 else 0.0
+        # Request score distributions sum to one, just like counts. Slot-mode score units
+        # depend on router magnitude: use counts for confidence, scores only for placement.
+        evidence = n if ADAPT.request_unit or ADAPT.metric == "frequency" else float(counts[L].sum())
+        w = float(evidence / (evidence + prior_slots)) if n > 0 else 0.0
         ws.append(w)
         t = tr / (tr.sum() or 1.0)
         o = obs / (n or 1.0)
@@ -490,6 +519,89 @@ class V41Engine:
         self.lock = threading.Lock()
         index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
         self.args = R.Args.from_json(os.path.join(model_dir, "inference", "config.json"))
+        from engine.expert_budget import parse_layer_counts
+        self.prune_layer_counts = parse_layer_counts(
+            os.environ.get('DSV41_PRUNE_LAYER_COUNTS', ''), self.args.n_layers,
+            self.args.n_routed_experts, self.args.n_activated_experts, prune_keep, prune_select)
+        from engine.expert_profiles import ExpertProfile
+        self.expert_profile = ExpertProfile(os.environ, self.args.n_layers, self.args.n_routed_experts)
+        self.expert_profile.validate(prune_keep, prune_select, self.prune_layer_counts, ADAPT)
+        from engine.layer_stream import parse_layers
+        self.stream_layers = parse_layers(os.environ.get('DSV41_STREAM_LAYERS', ''), self.args.n_layers)
+        self.user_prompt_stream = os.environ.get('DSV41_USER_PROMPT_STREAM', '0') == '1'
+        self.user_prompt_max_loads = int(os.environ.get('DSV41_USER_PROMPT_MAX_LOADS', '0'))
+        if self.user_prompt_max_loads < 0:
+            raise ValueError('DSV41_USER_PROMPT_MAX_LOADS must be nonnegative (0 is unlimited)')
+        self.dynamic_experts = os.environ.get('DSV41_DYNAMIC_EXPERTS', '0') == '1'
+        from engine.expert_budget import resident_budget
+        self.resident_budget = resident_budget(os.environ.get('DSV41_RESIDENT_EXPERTS', ''),
+            dynamic=self.dynamic_experts, layers=self.args.n_layers,
+            experts=self.args.n_routed_experts, topk=self.args.n_activated_experts, fraction=prune_keep)
+        from engine.global_residency import layer_weights
+        self.prune_layer_weights = layer_weights(os.environ.get('DSV41_PRUNE_LAYER_WEIGHTS', ''), self.args.n_layers)
+        self.dynamic_layer_floor = self.args.n_activated_experts
+        if self.dynamic_experts and (self.prune_layer_counts is not None or any(w != 1. for w in self.prune_layer_weights)):
+            raise ValueError('fully dynamic allocation requires no fixed layer counts or layer discounts')
+        if self.dynamic_experts:
+            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+                raise ValueError('dynamic allocation requires adaptive pruned residency without layer streaming')
+            if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
+                raise ValueError('dynamic allocation requires concurrency 1')
+            if os.environ.get('DSV41_LUT', '1') != '1' or os.environ.get('DSV41_PRUNE_MISS', '0') != '1':
+                raise ValueError('dynamic allocation requires resident LUTs and PRUNE_MISS=1')
+            # RAM prefixes contain encoder state, not expert-sector addresses.
+            # With resident prefill they can retain historical KV across global
+            # swaps, just as with the original within-layer adaptive policy.
+            # Streaming still requires a fresh discovery/rebuild below.
+            for key in ('DSV41_PREFIX_DISK', 'DSV41_PREFIX_RESPONSE', 'DSV41_PREFILL_GRAPHS'):
+                if os.environ.get(key, '1' if key == 'DSV41_PREFIX_CACHE' else '0') != '0':
+                    raise ValueError('dynamic allocation requires '+key+'=0')
+        if self.user_prompt_stream:
+            if not self.swa_replay:
+                raise ValueError('latest-user streaming requires bounded replay to refresh the first answer after admission')
+            if os.environ.get('DSV41_PRUNE_MISS', '0') != '1':
+                raise ValueError('latest-user streaming requires DSV41_PRUNE_MISS=1')
+            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+                raise ValueError('latest-user streaming requires adaptive pruned residency without layer streaming')
+            if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
+                raise ValueError('latest-user streaming requires concurrency 1')
+            for key in ('DSV41_PREFIX_CACHE', 'DSV41_PREFIX_DISK', 'DSV41_PREFIX_RESPONSE', 'DSV41_PREFILL_GRAPHS'):
+                if os.environ.get(key, '1' if key == 'DSV41_PREFIX_CACHE' else '0') != '0':
+                    raise ValueError('latest-user streaming requires ' + key + '=0')
+            if os.environ.get('DSV41_LUT', '1') != '1':
+                raise ValueError('latest-user streaming requires resident LUTs')
+        from engine.layer_stream import LayerAblation
+        self.layer_ablation = LayerAblation(os.environ.get('DSV41_LAYER_ABLATION_FILE', ''), self.args.n_layers)
+        if self.layer_ablation.path:
+            if self.stream_layers != frozenset(range(self.args.n_layers)):
+                raise ValueError('layer ablation diagnostics require all backbone layers streamed')
+            if ADAPT.swap or PREFILL_SWAP or ADAPT.decode_tokens or ADAPT.urgent:
+                raise ValueError('layer ablation diagnostics require every adaptive swap trigger disabled')
+        if self.stream_layers:
+            if not prune_keep or not 0 < prune_keep < 1:
+                raise ValueError('layer streaming requires pruned residency')
+            if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
+                raise ValueError('layer streaming requires concurrency 1')
+            for key in ('DSV41_PREFIX_CACHE', 'DSV41_PREFIX_DISK', 'DSV41_PREFILL_GRAPHS'):
+                if os.environ.get(key, '1' if key == 'DSV41_PREFIX_CACHE' else '0') != '0':
+                    raise ValueError('layer streaming requires ' + key + '=0')
+            if os.environ.get('DSV41_LUT', '1') != '1':
+                raise ValueError('layer streaming requires resident LUTs')
+        from engine.critical_stream import CriticalStream
+        self.critical = CriticalStream(self.args.n_layers, self.args.n_routed_experts, transient_slots)
+        if self.critical.enabled:
+            if self.stream_layers or self.user_prompt_stream:
+                raise ValueError('choose calibrated rescue or layer streaming, not both')
+            if not prune_keep or not 0 < prune_keep < 1:
+                raise ValueError('critical prefill requires pruned residency')
+            if (os.environ.get('DSV41_PREFIX_CACHE', '1') != '0' or
+                    os.environ.get('DSV41_PREFIX_DISK', '0') != '0' or
+                    os.environ.get('DSV41_PREFILL_GRAPHS', '0') != '0'):
+                raise ValueError('critical prefill requires PREFIX_CACHE=0, PREFIX_DISK=0, PREFILL_GRAPHS=0')
+            if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
+                raise ValueError('critical prefill prototype requires concurrency 1')
+        from engine.predictive_prefill import PredictivePrefill
+        self.predictive = PredictivePrefill(self.args.n_layers, self.args.n_routed_experts)
         # Serving preference, independent of the checkpoint's reference value (512).
         # Wider attention is experimental: no measured hallucination reduction is claimed.
         self.args.index_topk = int(os.environ.get("DSV41_INDEX_TOPK", "1024"))
@@ -726,16 +838,16 @@ class V41Engine:
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
         # Vision tower: present only if the checkpoint has one, and skippable for a text-only
         # server that would rather keep the 0.9 GB (about 2.5 experts per layer at fp4).
-        self.vision = None
-        if os.environ.get("DSV41_VISION", "1") == "1":
-            try:
-                from engine.vision import VisionTower
-                self.vision = VisionTower(model_dir, device)
-                self.model.vision = self.vision
-                log(f"vision tower loaded ({self.vision.cfg['vision_n_layers']} layers, "
-                    f"{self.vision.cfg['vision_dim']} dim); image inputs enabled")
-            except Exception as e:  # noqa: BLE001
-                log(f"vision tower not loaded ({e}); image inputs will be rejected")
+        from engine.vision import make_vision
+        self.vision_mode = os.environ.get('DSV41_VISION_MODE', 'replicated')
+        self.vision = make_vision(model_dir, self.ep, device,
+            enabled=os.environ.get('DSV41_VISION', '1') == '1', mode=self.vision_mode, log=log)
+        self.model.vision = self.vision
+        if self.vision is not None:
+            log(f"vision enabled: {self.vision_mode} "
+                f"({self.vision.cfg['vision_n_layers']} layers, "
+                f"{self.vision.cfg['vision_dim']} dim; "
+                f"weights on {'rank 1' if self.vision_mode == 'peer' else 'both ranks'})")
         from engine.engram_cache import cache_budget_mb
         cache_mb = cache_budget_mb(self.ep.rank)
         if cache_mb and os.environ.get('DSV41_ENGRAM_MMAP', '1') != '1':
@@ -774,13 +886,20 @@ class V41Engine:
         # DSV41_PREFIX_SNAPSHOTS. The full-prompt snapshot above is the exact-extension fast path;
         # these are the fallback when a changed token stops the prompt from extending it.
         self._prefix_snapshots: dict = {}
+        self._expert_seed = None
+        self.expert_seed_sha256 = None
         self.prefix_disk = None
         self._prefix_route = ''
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
-            cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
-            assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
+            if self.expert_profile.static:
+                counts = self.expert_profile.scores(trace_stats, prune_keep)
+                log(f"fixed expert profile: {self.expert_profile.rank} on {self.expert_profile.source}; "
+                    f"topics: {', '.join(self.expert_profile.topics)}")
+            else:
+                cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
+                assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
             # How the two workloads are combined into one ranking. "sum" (the 0.2.0-wip default)
             # adds the per-layer-normalized frequencies, which favours experts moderately used by
             # both and drops each workload's specialists -- the coding and prose top sets overlap by
@@ -788,8 +907,10 @@ class V41Engine:
             # at keep 31 % a story prompt degenerated into a repeated phrase while the same budget
             # ranked on prose alone wrote clean text (NOTES 2026-09-12). "max" keeps an expert that
             # matters to EITHER workload, which is what a general-purpose server needs.
-            rank = os.environ.get("DSV41_PRUNE_RANK", "sum")  # "max" was measured worse (NOTES 2026-09-12)
-            if rank == "sum":
+            rank = self.expert_profile.rank
+            if self.expert_profile.static:
+                pass  # admission priorities / saliency retain their own units
+            elif rank == "sum":
                 counts = {L: cc[L] / cc[L].sum() + cg[L] / cg[L].sum() for L in range(40)}
             elif rank == "max":
                 counts = {L: np.maximum(cc[L] / cc[L].sum(), cg[L] / cg[L].sum()) for L in range(40)}
@@ -799,13 +920,31 @@ class V41Engine:
             # with the model; the demand DB is this box's own history and accumulates across
             # restarts, so a server used mostly for one kind of work drifts towards the experts
             # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
-            self._prune_trace = {L: v.copy() for L, v in counts.items()}   # pre-blend, for plan_swaps
+            self._prune_trace = (None if self.expert_profile.static else
+                                 {L: v.copy() for L, v in counts.items()})
             log(ADAPT.describe())
+            log(f"observed routing metric: {ADAPT.metric}; fixed profile {self.expert_profile.static}")
             db = load_prune_db() if ADAPT.use_db else None
+            # Rank 0 alone chooses the cold-start seed. Carry it in the existing
+            # ranking broadcast so peer-local DB files cannot diverge the map.
+            seed_error = None
+            if self.ep.rank == 0:
+                try:
+                    from engine.expert_seed import load_seed
+                    self._expert_seed = load_seed(
+                        PRUNE_DB, enabled=(self.dynamic_experts and ADAPT.use_db and
+                            os.environ.get('DSV41_EXPERT_SEED', '1') == '1'),
+                        request_unit=ADAPT.request_unit, metric=ADAPT.metric,
+                        layers=self.args.n_layers, experts=self.args.n_routed_experts)
+                    if self._expert_seed is not None:
+                        db = (self._expert_seed['counts'], self._expert_seed['mass'])
+                except Exception as exc:
+                    seed_error = str(exc)
             if db is not None:
                 prior = ADAPT.prior
                 counts, w = blend_demand(counts, db, prior)
-                log(f"prune ranking adapted from {PRUNE_DB}: observed weight {w:.1%} "
+                origin = 'bundled expert seed' if self._expert_seed is not None else PRUNE_DB
+                log(f"prune ranking adapted from {origin}: observed weight {w:.1%} "
                     f"({db[0].sum():,.0f} recorded routing slots)")
             self.prune_select = prune_select
             # ONE authority for the keep set. results/ is bind-mounted per box and sync-peer.sh
@@ -815,8 +954,31 @@ class V41Engine:
             # surfaced only because the swap validator refused to evict an expert rank 1 had
             # never made resident. Broadcasting the ranking (not the masks) keeps one code path:
             # build_keep_masks is deterministic, so identical input gives identical masks.
-            counts = self.ep.broadcast_obj(counts)
-            masks, keep = build_keep_masks(counts, prune_keep, prune_select, device)
+            packet = self.ep.broadcast_obj(dict(counts=counts, seed=self._expert_seed,
+                                                error=seed_error))
+            if packet['error'] is not None:
+                raise ValueError('cold-start expert seed: ' + packet['error'])
+            counts, self._expert_seed = packet['counts'], packet['seed']
+            if self._expert_seed is not None:
+                self.expert_seed_sha256 = self._expert_seed['sha256']
+                log(f"cold-start expert seed {self.expert_seed_sha256[:12]}: "
+                    "no local history; normal adaptation will continue")
+            if self.dynamic_experts:
+                from engine.global_residency import initial_selection
+                scores = {L:v/(v.sum() or 1.) for L,v in counts.items()}
+                budget = self.resident_budget or (max(self.args.n_activated_experts,
+                    int(np.ceil(prune_keep*self.args.n_routed_experts)))*self.args.n_layers)
+                from engine.expert_seed import seed_selection
+                keep = seed_selection(self._expert_seed, budget, self.dynamic_layer_floor)
+                if keep is None:
+                    keep = initial_selection(scores,budget,self.dynamic_layer_floor)
+                masks = {L:torch.zeros(self.args.n_routed_experts,dtype=torch.bool,device=device) for L in keep}
+                for L,ids in keep.items():
+                    masks[L][ids] = True
+            else:
+                masks, keep = build_keep_masks(counts, prune_keep, prune_select, device,
+                                              layer_counts=self.prune_layer_counts)
+            self.expert_profile.measure_coverage(keep)
             n_keep = max(len(v) for v in keep.values())
             ranked = [(float(counts[L][e]), L, int(e)) for L, ks in keep.items() for e in ks]
             ranked.sort(reverse=True)
@@ -866,14 +1028,41 @@ class V41Engine:
             ranked = (EX.rank_from_trace(trace_stats, profile=self.hot_profile) if trace_stats
                       else [(L, e) for e in range(384) for L in range(40)])
         self.model.prune_mask = self.model_prune_mask
+        self.resident_layer_counts = ([int(self.model_prune_mask[L].sum()) for L in sorted(self.model_prune_mask)]
+                                      if self.model_prune_mask else None)
+        from engine.expert_profiles import mask_digest
+        self.initial_keep_sha256 = mask_digest(self.model_prune_mask)
+        self.model.stream_layers = self.stream_layers
+        self.model.stream_keep = {L: torch.ones(self.args.n_routed_experts, dtype=torch.bool, device=device)
+                                  for L in self.stream_layers}
+        from engine.user_prompt import UserPrompt
+        self.user_prompt = UserPrompt(self.user_prompt_stream, self.args.n_layers,
+                                      self.args.n_routed_experts, device, self.user_prompt_max_loads, self.dynamic_experts)
+        if self.dynamic_experts and (not self.ep.tensor_parallel or self.kernel != 'triton-fp4'):
+            raise ValueError('dynamic expert allocation requires native FP4 tensor parallelism')
+        if self.predictive.mode != 'off':
+            if (not self.dynamic_experts or not self.ep.tensor_parallel or not ADAPT.request_unit
+                    or not ADAPT.record or not PREFILL_SWAP or self.user_prompt_stream
+                    or self.stream_layers or self.critical.enabled):
+                raise ValueError('predictive prefill requires dynamic TP2 request-unit adaptation without streaming')
+        self.model.user_prompt = self.user_prompt
+        if self.stream_layers or self.user_prompt_stream:
+            if not (self.ep.tensor_parallel and self.kernel == 'triton-fp4'
+                    and getattr(self.store.arena, 'tp_output', False)):
+                raise ValueError('layer streaming requires native FP4 output-layout TP')
+            from engine.layer_stream import validate_capacity
+            if not self.dynamic_experts:
+                validate_capacity(self.stream_layers or range(self.args.n_layers), self.model_prune_mask, transient_slots,
+                                  self.args.n_routed_experts)
+        self.model.critical_stream = self.critical
+        if self.critical.enabled and not (self.ep.tensor_parallel and self.kernel == 'triton-fp4'):
+            raise ValueError('critical prefill prototype requires native FP4 tensor parallelism')
         if self.ep.active:
             # Defence in depth for the failure above: the routable set drives the router on BOTH
             # ranks, so a difference is not a slow answer, it is two models pretending to be one.
             # Cheap to verify once at boot, and impossible to notice later without a validator.
-            mine = 0
-            if self.model_prune_mask:
-                for L in sorted(self.model_prune_mask):
-                    mine = (mine * 1000003 + int(self.model_prune_mask[L].sum())) % (2 ** 61 - 1)
+            # Cardinalities alone cannot detect different expert IDs at the same budget.
+            mine = self.initial_keep_sha256
             theirs = self.ep.broadcast_obj(mine)
             if mine != theirs:
                 raise RuntimeError(
@@ -907,6 +1096,29 @@ class V41Engine:
                 "tp_draft_experts": self.tp_draft_experts,
                 "tp_dense_rounding_version": 2,
                 "prune_keep": float(prune_keep or 0.0),
+                # Layer allocation changes routing even at the same total arena budget.
+                "prune_select": prune_select,
+                **self.expert_profile.boot_fields(),
+                "initial_keep_sha256": self.initial_keep_sha256,
+                "vision_mode": self.vision_mode,
+                "vision_enabled": self.vision is not None,
+                "vision_peer_version": 1,
+                "expert_seed_version": 1,
+                "expert_seed_enabled": os.environ.get('DSV41_EXPERT_SEED', '1'),
+                "expert_seed_sha256": self.expert_seed_sha256,
+                "prune_layer_counts": self.prune_layer_counts,
+                "stream_layers": tuple(sorted(self.stream_layers)),
+                "layer_stream_version": 2,
+                "user_prompt_stream": self.user_prompt_stream,
+                "user_prompt_policy_version": 6,
+                "user_prompt_max_loads": self.user_prompt_max_loads,
+                "dynamic_experts": self.dynamic_experts,
+                "resident_budget": self.resident_budget,
+                "dynamic_experts_version": 4,
+                "dynamic_layer_floor": self.dynamic_layer_floor,
+                "prune_layer_weights": self.prune_layer_weights,
+                "layer_ablation_file": self.layer_ablation.path,
+                "layer_ablation_version": 1,
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
                 "spec": bool(self.spec),
                 "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
@@ -1004,6 +1216,8 @@ class V41Engine:
                 # the two DSV41_ADAPT_* knobs and the legacy DSV41_PRUNE_* spellings must agree
                 # on what they MEAN, e.g. whether the prefill-boundary collective happens.
                 **ADAPT.boot_fields(),
+                **self.critical.boot_fields(),
+                **self.predictive.boot_fields(),
                 "prefill_chunk": MAX_CHUNK,
                 "prefill_graphs_v2": os.environ.get("DSV41_PREFILL_GRAPHS", "0"),
                 "prefill_graph_fixed_routing": os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1"),
@@ -1041,13 +1255,23 @@ class V41Engine:
                     f"collectives would sum mismatched tensors")
             log(f"EP2 config agrees across ranks ({len(cfg)} fields: "
                 f"{', '.join(sorted(cfg))})")
+        if self.predictive.mode != 'off' and self.ep.rank == 0:
+            self.predictive.configure(cfg, os.path.join(model_dir, 'inference', 'config.json'),
+                                      os.path.join(model_dir, 'tokenizer.json'))
+            log(f'predictive prefill: mode={self.predictive.mode}, samples={len(self.predictive.keys)}, '
+                f'database_error={self.predictive.io_error}')
         self.store.warm_start(ranked, log=log)
         if PRUNE_MISS:
             # Seed the accumulators from the persisted DB so what they hold is always the whole
             # history, not just this process's slice -- the per-request write-back then replaces
             # the file wholesale. Must precede FastDecoder, which captures graphs that record
             # into these exact tensors.
-            _db = load_prune_db()
+            # The history, like the initial keep-set, has one authority. This collective is
+            # unconditional when recording is enabled, which the boot guard pins on both ranks.
+            _db = load_prune_db() if self.ep.rank == 0 else None
+            if self.ep.rank == 0 and _db is None and self._expert_seed is not None:
+                _db = (self._expert_seed['counts'], self._expert_seed['mass'])
+            _db = self.ep.broadcast_obj(_db)
             if _db is not None:
                 self.model.load_demand(*_db)
                 # the swap trigger measures GROWTH, so the clock starts at what we just loaded --
@@ -1082,7 +1306,9 @@ class V41Engine:
             # computed.
             kept_pairs = getattr(self, "_kept_here", None)
             if kept_pairs is None:
-                kept_pairs = 40 * max(6, int(np.ceil((self.prune_keep or 0) * 384)))
+                kept_pairs = self.resident_budget or (self.args.n_layers * max(
+                    self.args.n_activated_experts,
+                    int(np.ceil((self.prune_keep or 0) * self.args.n_routed_experts))))
             resident = (self.prune_keep and self.prune_keep < 1.0 and
                         len(self.store.lru) >= kept_pairs and
                         os.environ.get("DSV41_LUT", "1") == "1")
@@ -1105,6 +1331,8 @@ class V41Engine:
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
                 % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
         self.prefill_replicas = None
+        if (self.stream_layers or self.user_prompt_stream or self.dynamic_experts) and (self.fast is None or self.fast.lut is None or self.replica_slots):
+            raise ValueError('streaming/dynamic allocation requires fast resident decode without replicas')
         if self.replica_slots:
             if getattr(self.model, "slot_lut", None) is None or not hasattr(self.model, "prefill_routes"):
                 raise ValueError('prefill replicas require pruned all-resident FP4 routing')
@@ -1170,6 +1398,7 @@ class V41Engine:
 
     # ------------------------------------------------------------------ generation
     def _reset(self):
+        self.critical.reset()
         self._decode_adapt_checks = []
         self._decode_adapt_passes = []
         c = self.caches
@@ -1365,7 +1594,7 @@ class V41Engine:
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
-                 ignore_eos=False, grammar=None):
+                 ignore_eos=False, grammar=None, user_prompt_ranges=None):
         """Yield bursts of new token ids.
 
         ``ignore_eos``: keep decoding until ``max_tokens`` even if EOS/stop ids come up. The
@@ -1379,7 +1608,7 @@ class V41Engine:
         """
         with self.lock:
             yield from self._generate(list(prompt_ids), max_tokens, temperature, top_p, set(stop_token_ids or ()),
-                                      seed, ignore_eos, grammar, penalties)
+                                      seed, ignore_eos, grammar, penalties, user_prompt_ranges)
 
     def _policy_step_s(self, t_iter: float, n_graphs: int):
         """Wall time of this decode step for DepthPolicy, or None if it captured a graph."""
@@ -1387,11 +1616,14 @@ class V41Engine:
         return None if now != n_graphs else time.perf_counter() - t_iter
 
     def _generate(self, prompt, max_tokens, temperature, top_p, stop_ids, seed, ignore_eos=False, grammar=None,
-                  penalties=None):
+                  penalties=None, user_prompt_ranges=None):
         if seed is not None:
             torch.manual_seed(seed)
         stop_ids = set() if ignore_eos else (set(stop_ids) | {self.eos_token_id})
         self._reset()
+        self.user_prompt.reset(user_prompt_ranges, len(prompt))
+        if self.layer_ablation.path:
+            self.layer_ablation.sync(self.model, self.ep)
         self._init_prefix_disk()
         m = self.model
         P = len(prompt)
@@ -1466,11 +1698,13 @@ class V41Engine:
             self.last_stats = {
                 "prompt_tokens": P, "completion_tokens": n_out, "prefill_s": round(t_prefill, 3),
                 "prefix_cached_tokens": _st.get("prefix_cached_tokens", 0),
+                "predictive_prefill": dict(self.predictive.last),
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
                 "decode_adaptation": {"checks": self._decode_adapt_checks,
                                       "passes": self._decode_adapt_passes},
+                "user_prompt": self.user_prompt.report(),
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
                 "spec_conf": _st.get("conf"),
                 "prefill_graphs": (self.model.prefill_graphs.report()
@@ -1610,6 +1844,12 @@ class V41Engine:
                     dm, dt = _m1[0] - _m0[0], _m1[1] - _m0[1]
                     self.last_stats["prune_miss_request"] = {
                         "miss_rate": round(dm / dt, 4), "missed_slots": int(dm), "slots": int(dt)}
+                _s1 = self.model.miss_mass_snapshot()
+                _s0 = getattr(self, "_miss_mass_at_request_start", None)
+                if _s0 is not None and _s1 is not None and _s1[1] > _s0[1]:
+                    dm, dt = _s1[0] - _s0[0], _s1[1] - _s0[1]
+                    self.last_stats.setdefault("prune_miss_request", {}).update(
+                        score_miss_rate=round(dm / dt, 6), missed_score=dm, total_score=dt)
                 # The accumulators were seeded from the DB at startup, so what they hold IS the
                 # updated database -- write it back whole. Rank 1 would write an identical file
                 # (both ranks run the same router over the same tokens); only rank 0 does, so the
@@ -1662,44 +1902,65 @@ class V41Engine:
             self.last_stats["accounting_covers"] = "prefill+decode"
 
     # ------------------------------------------------------------ online adaptation (stage 2)
-    def plan_swaps(self, max_swaps: int = 64, min_gain: float | None = None, pending_request: bool = False):
+    def plan_swaps(self, max_swaps: int = 64, min_gain: float | None = None, pending_request: bool = False,
+                   request_demand=None):
         """Which residents should be replaced, given everything the router has asked for since boot.
 
         Swaps are planned WITHIN each ownership class. Both ranks hold the same number of arena
         slots, so the count of kept-and-owned experts per (layer, rank) has to stay fixed -- pairing
         an owned promotion with a non-owned demotion would leave one arena over-subscribed and the
         other with a hole. Ownership is `e % world`, and both ranks record identical demand (the
-        router runs replicated over the same tokens), so both compute the SAME plan for BOTH classes
-        with no collective; each then loads only its own half, while the mask update applies to all
-        of it on both ranks.
+        router runs replicated over the same tokens). Rank 0 plans BOTH classes and broadcasts
+        the plan; each rank loads only its own weights, while the mask update applies everywhere.
 
         Returns [(layer, expert_out, expert_in, gain), ...], best gain first.
         """
         import numpy as np
+        focus = getattr(self, 'user_prompt', None)
         if self._prune_trace is None or not getattr(self, "model_prune_mask", None):
             return []
         rep = self.model.prune_miss_report()
         if rep is None:
             return []
-        _summary, demand, _mass = rep
+        _summary, demand, mass = rep
         demand = demand.numpy()
+        mass = mass.numpy()
         total = float(demand.sum())
-        if pending_request and ADAPT.request_unit and getattr(self.model, "_req_counts", None) is not None:
-            # Decode-time pass: plan as if THIS request's demand so far were folded in -- aged
+        if request_demand is not None and (pending_request or not ADAPT.request_unit):
+            raise ValueError('provisional demand requires request units and no pending-request override')
+        if request_demand is not None or (pending_request and ADAPT.request_unit and getattr(self.model, "_req_counts", None) is not None):
+            # Preview predicted prefill demand or observed decode demand without recording it: aged
             # history plus its normalized per-layer distribution, exactly what
             # flush_request_demand would write -- without writing it. The end-of-request fold
             # still adds exactly one vote; a pass every 600 tokens must not add one each time.
-            req = self.model._req_counts.cpu().numpy()
+            req = (self.model._req_counts.cpu().numpy() if request_demand is None
+                   else np.asarray(request_demand[0], dtype=np.float64))
+            req_mass = (self.model._req_mass.cpu().numpy() if request_demand is None
+                        else np.asarray(request_demand[1], dtype=np.float64))
+            if any(v.shape != demand.shape or not np.isfinite(v).all() or (v < 0).any()
+                   for v in (req, req_mass)):
+                raise ValueError('invalid provisional routing demand')
             tot = req.sum(axis=1, keepdims=True)
             decay = 0.5 ** (1.0 / ADAPT.halflife) if 0 < ADAPT.halflife < float("inf") else 1.0
             demand = demand * decay + np.divide(req, tot, out=np.zeros_like(req), where=tot > 0)
+            score_tot = req_mass.sum(axis=1, keepdims=True)
+            mass = mass * decay + np.divide(req_mass, score_tot, out=np.zeros_like(req_mass),
+                                           where=score_tot > 0)
             total = float(demand.sum())
         if total <= 0:
             return []
         prior = ADAPT.prior
         if min_gain is None:
             min_gain = ADAPT.swap_min_gain
-        ranked, _w = blend_demand(self._prune_trace, (demand, demand), prior)
+        ranked, _w = blend_demand(self._prune_trace, (demand, mass), prior)
+        if getattr(self, 'dynamic_experts', False):
+            from engine.global_residency import global_plan
+            keeps = {L:msk.cpu().numpy() for L,msk in self.model_prune_mask.items()}
+            scores = {L:ranked[L]*self.prune_layer_weights[L] for L in keeps}
+            swaps, _ = global_plan(keeps, scores, self.dynamic_layer_floor, max_swaps,
+                                  protected=self.user_prompt.protected,
+                                  min_gain=min_gain*float(np.mean(list(scores.values()))))
+            return swaps
         world = 1 if getattr(self.ep, 'tensor_parallel', False) else max(1, self.ep.world)
         out = []
         for L, msk in self.model_prune_mask.items():
@@ -1710,7 +1971,11 @@ class V41Engine:
                 # Pruned-mode startup guarantees that every kept expert is resident on its owner.
                 # The planner runs only on rank 0 and must still plan BOTH ownership classes; its
                 # local LRU cannot be used to filter rank 1's candidates.
-                kept_own = np.flatnonzero(keep & own)
+                protected = np.zeros(len(keep), dtype=bool)
+                focus = getattr(self, 'user_prompt', None)
+                if focus is not None:
+                    protected[focus.protected.get(L, [])] = True
+                kept_own = np.flatnonzero(keep & own & ~protected)
                 gone_own = np.flatnonzero(~keep & own)
                 if not len(kept_own) or not len(gone_own):
                     continue
@@ -1730,6 +1995,81 @@ class V41Engine:
         out.sort(key=lambda t: -t[3])
         return out[:max_swaps]
 
+    def promote_user_prompt(self):
+        """Rank 0 admits latest-user experts before decode; both ranks always rendezvous.
+
+        Protection outlives the response and idle maintenance. Only starting the
+        next request clears it. This deliberately bypasses history's gain floor:
+        the current user's routed experts have first priority within each quota.
+        """
+        if not self.user_prompt_stream:
+            return 0
+        from engine.user_prompt import capped_retention_plan
+        started, packet = time.perf_counter(), None
+        if self.ep.rank == 0:
+            try:
+                packet = dict(swaps=[], protected={}, overflow=0, deferred=0)
+                if self.user_prompt.mass is not None:
+                    mass = self.user_prompt.mass.cpu().numpy()
+                    rep = self.model.prune_miss_report()
+                    fallback, _ = blend_demand(self._prune_trace,
+                        (rep[1].numpy(), rep[2].numpy()), ADAPT.prior)
+                    keeps = {L:mask.cpu().numpy() for L,mask in self.model_prune_mask.items()}
+                    if getattr(self, 'dynamic_experts', False):
+                        from engine.global_residency import prompt_plan
+                        packet = prompt_plan(keeps, mass, fallback, self.dynamic_layer_floor,
+                                             self.prune_layer_weights, None)
+                    else:
+                        packet = capped_retention_plan(keeps, mass, fallback)
+            except Exception as exc:
+                packet = dict(error=type(exc).__name__)
+        # Empty/attachment-only/no-user requests participate too. No rank-local
+        # counters or masks can decide whether this collective is reached.
+        packet = self.ep.broadcast_obj(packet)
+        if 'error' in packet:
+            raise RuntimeError('latest-user retention planner failed: ' + packet['error'])
+        self.user_prompt.protected = packet['protected']
+        self.user_prompt.overflow = packet['overflow']
+        self.user_prompt.deferred = packet['deferred']
+        self.user_prompt.cross_layer = packet.get('cross_layer', 0)
+        self.user_prompt.discovery_loads = getattr(getattr(self, 'store', None), 'stats', {}).get('prefill_misses', 0)
+        if not self.user_prompt.max_loads:
+            self.user_prompt.loads_used = self.user_prompt.discovery_loads
+        self.user_prompt.promoted = self.apply_swaps(packet['swaps'])
+        self.user_prompt.promotion_s = time.perf_counter() - started
+        return self.user_prompt.promoted
+
+    def refresh_user_prompt_logits(self, previous, ids, spans):
+        m, focus = self.model, self.user_prompt
+        start = time.perf_counter()
+        replay_only = getattr(m, '_prefix_replay_only', False)
+        recording, streaming = focus.recording, focus.streaming
+        try:
+            m._prefix_replay_only = True
+            focus.recording = focus.streaming = False
+            # Every cached layer, including the encoder and the assistant cue,
+            # was computed before admission. Rebuild with the new resident set
+            # so the FIRST answer token actually uses those experts throughout.
+            # This is a resident pass, not a second streaming discovery pass.
+            c = self.caches
+            c.len = 0
+            c._chunk_inputs.clear()
+            for L in c.pending:
+                c.pending[L] = None
+            m.begin_prompt()
+            for s, e in spans:
+                m.forward(ids[s:e], s, prefill=True, need_logits=False, encoder_only=True)
+            logits, hidden, pos = m.decoder_replay(need_logits=True)
+            if self.spec:
+                m.dspark_seed(hidden, pos)
+            if not focus.ranges and focus.promoted == 0 and not PREFILL_SWAP:
+                focus.unchanged_replay_max_delta = float((logits[-1]-previous[-1]).abs().max())
+            return logits
+        finally:
+            m._prefix_replay_only = replay_only
+            focus.recording, focus.streaming = recording, streaming
+            focus.refresh_s = time.perf_counter() - start
+
     def apply_swaps(self, swaps) -> int:
         """Move the arena slots this rank owns and update the routing state in place.
 
@@ -1747,6 +2087,9 @@ class V41Engine:
         """
         if not swaps:
             return 0
+        focus = getattr(self, 'user_prompt', None)
+        if len(swaps[0]) == 5:
+            return V41Engine.apply_global_swaps(self, swaps)
         st = self.store
         world, rank = ((1, 0) if getattr(self.ep, 'tensor_parallel', False)
                        else (max(1, self.ep.world), self.ep.rank))
@@ -1755,6 +2098,9 @@ class V41Engine:
         # Validate before touching anything: a plan that is wrong is wrong before the first load,
         # and stopping here leaves the arena exactly as it was.
         for L, e_out, e_in, _g in swaps:
+            focus = getattr(self, 'user_prompt', None)
+            if focus is not None and e_out in focus.protected.get(L, ()):
+                raise RuntimeError(f'swap plan evicts protected latest-user expert: L{L} e{e_out}')
             if (e_in % world) != (e_out % world):
                 raise RuntimeError(f"swap plan pairs across ownership classes: L{L} {e_out}->{e_in}")
             if (e_in % world) != rank:
@@ -1794,11 +2140,80 @@ class V41Engine:
         self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
         self._requests_since_plan = 0   # a plan was applied; wait for the next request
         self.expert_generation += 1
+        if focus is not None:
+            focus.resident_loads = getattr(focus, 'resident_loads', 0) + len(swaps)
         if getattr(self, 'prefix_disk', None) is not None:
             from engine.prefix_persistence import routing_signature
             self._prefix_route = routing_signature(self)
         log(f"adapted {len(swaps)} expert slots to observed demand "
             f"(expert generation {self.expert_generation})")
+        return len(swaps)
+
+    def apply_global_swaps(self, swaps):
+        """Transfer sectors between layers; one authoritative directory on both TP ranks.
+
+        Decode graphs retain the LUT and masks' addresses. Eager prefill compact
+        maps are rebuilt for changed layers because their cardinalities can grow
+        or shrink. RAM prefix state has no sector pointers and remains historical
+        state, as with within-layer adaptation. Disk/response caches, prefill
+        graphs and replicas are disabled at boot.
+        Any load failure is fatal: a partially rewritten TP pair cannot continue.
+        """
+        if not getattr(self.ep, 'tensor_parallel', False):
+            raise RuntimeError('cross-layer sector transfers require TP')
+        focus, st = self.user_prompt, self.store
+        counts = {L:int(mask.sum()) for L,mask in self.model_prune_mask.items()}
+        outgoing, incoming = set(), set()
+        # Validate the complete plan against the original directory before I/O.
+        for Lo, eo, Li, ei, gain in swaps:
+            old, new = (Lo,eo), (Li,ei)
+            if (old in outgoing or new in incoming or old not in st.lru or new in st.lru
+                    or Li not in counts or not 0 <= ei < self.model_prune_mask[Li].numel()
+                    or eo in focus.protected.get(Lo, ())):
+                raise RuntimeError('invalid global expert sector transfer')
+            outgoing.add(old); incoming.add(new)
+            counts[Lo] -= 1; counts[Li] += 1
+            if counts[Lo] < self.dynamic_layer_floor:
+                raise RuntimeError('sector transfer violates streaming capacity floor')
+        if outgoing & incoming:
+            raise RuntimeError('sector transfer cycles are not supported')
+        changed = set()
+        for Lo, eo, Li, ei, gain in swaps:
+            slot = st.lru.pop((Lo,eo))
+            try:
+                st._load_into_slot((Li,ei), slot)
+            except Exception as exc:
+                st.lru[(Lo,eo)] = slot
+                raise RuntimeError('global expert load failed; TP pair must stop') from exc
+            st.lru[(Li,ei)] = slot
+            st.slot_key[slot] = (Li,ei)
+            self.fast.lut[Lo,eo] = st.null_slot
+            self.fast.lut[Li,ei] = slot
+            self.model_prune_mask[Lo][eo] = False
+            self.model_prune_mask[Li][ei] = True
+            changed.update((Lo,Li))
+        # The fixed compact maps were the second hidden per-layer restriction.
+        # Only eager prefill reads these arrays; no captured graph points at them.
+        routes = getattr(self.model, 'prefill_routes', None)
+        if routes is not None:
+            for L in sorted(changed):
+                owned = sorted((e,s) for (layer,e),s in st.lru.items() if layer == L)
+                ids = torch.full_like(routes[L][0], len(owned))
+                for i,(e,_) in enumerate(owned):
+                    ids[e] = i
+                slots = torch.tensor([s for _,s in owned]+[st.null_slot],
+                                     dtype=torch.int32, device=ids.device)
+                routes[L] = (ids,slots)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._swap_baseline = float(self.model.prune_miss_report()[1].sum())
+        self._requests_since_plan = 0
+        self.expert_generation += 1
+        focus.resident_loads = getattr(focus, 'resident_loads', 0) + len(swaps)
+        self.resident_layer_counts = [counts[L] for L in sorted(counts)]
+        log(f'adapted {len(swaps)} global expert sectors '
+            f'({sum(Lo != Li for Lo,eo,Li,ei,g in swaps)} across layers; '
+            f'residents/layer {min(counts.values())}-{max(counts.values())}, generation {self.expert_generation})')
         return len(swaps)
 
     def maintain_demand(self) -> bool:
@@ -2090,6 +2505,7 @@ class V41Engine:
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
+        self.predictive.begin(self, host_ids if host_ids is not None else ids.tolist(), prefix_start)
         # Every request, NOT only the cold ones. This is the baseline the per-request routed-miss
         # delta is measured from, and leaving it unreset on a prefix-cache hit made that delta span
         # every cached turn back to the last cold prompt -- so a conversation reported a miss rate
@@ -2097,6 +2513,8 @@ class V41Engine:
         # (31.6 -> 23.6 -> 19.1%). The adaptation looked broken when it was working, and
         # maintain_inline's gate reads this same delta to decide whether the prompt needs fixing.
         self._miss_at_request_start = m.miss_snapshot() if hasattr(m, "miss_snapshot") else None
+        self._miss_mass_at_request_start = (m.miss_mass_snapshot()
+                                           if hasattr(m, "miss_mass_snapshot") else None)
         if prefix_start == 0:
             # begin_prompt() EMPTIES the replay buffer, and on a prefix-cache hit _restore_prefix
             # has already filled it with the cached window tail -- so resetting here threw away
@@ -2204,7 +2622,16 @@ class V41Engine:
         # written. Outside the read-ahead context so the swap's NVMe loads do not contend with
         # engram reads still in flight. `P - prefix_start` is what this request actually prefilled
         # -- a prefix-cache hit recomputes nothing and so contributes no new demand.
+        self.predictive.finish(self)
+        self.promote_user_prompt()
         self.maintain_inline(P - prefix_start)
+        if self.user_prompt_stream:
+            # The first answer is sampled from the prefill logits. Admission
+            # AFTER those logits is too late for direct-letter answers, and
+            # leaves the decoder window built with the previous residents.
+            # Rebuild prompt state with the admitted residents. Both ranks run this
+            # when the guarded policy is enabled, even for an empty selection.
+            logits = self.refresh_user_prompt_logits(logits, ids, spans)
         # Vision inputs belong to the prompt only. Leaving them set would apply this request's
         # image mask to the next one's prefill, and the engine is single-sequence, so "the next
         # one" is any later request.
@@ -2726,11 +3153,32 @@ class V41Engine:
             "prefill_fused_attn": M_.PREFILL_FUSED_ATTN,   # not a second os.environ.get: see model.py
             "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
+            "prune_metric": ADAPT.metric,
+            **self.expert_profile.report(),
+            "initial_keep_sha256": self.initial_keep_sha256,
+            "expert_seed_sha256": self.expert_seed_sha256,
+            "vision_mode": self.vision_mode,
+            "vision_enabled": self.vision is not None,
+            "vision_weights_local": self.vision is not None and (self.vision_mode != 'peer' or self.ep.rank == 1),
+            "prune_score_history_version": 2,
             "urgent_adaptation": {"enabled": ADAPT.urgent, "window_tokens": ADAPT.urgent_window,
                                   "miss_threshold": ADAPT.urgent_miss,
                                   "max_swaps": ADAPT.urgent_max,
                                   "cooldown_tokens": ADAPT.urgent_cooldown},
             "prune_select": getattr(self, "prune_select", None),
+            "prune_layer_counts": self.prune_layer_counts,
+            "dynamic_experts": self.dynamic_experts,
+            "resident_budget": self.resident_budget,
+            "predictive_prefill": dict(self.predictive.last),
+            "dynamic_layer_floor": self.dynamic_layer_floor if self.dynamic_experts else None,
+            "prune_layer_weights": self.prune_layer_weights,
+            "resident_layer_counts": self.resident_layer_counts,
+            "stream_layers": sorted(self.stream_layers),
+            "layer_ablation": self.layer_ablation.report(),
+            "user_prompt_stream": self.user_prompt_stream,
+            "user_prompt_max_loads": self.user_prompt_max_loads,
+            "user_prompt": self.user_prompt.report(),
+            "critical_stream": self.critical.report(),
             "hot_profile": self.hot_profile,
             "prefill_chunk": MAX_CHUNK,
             "io_threads": self.store.io_threads,

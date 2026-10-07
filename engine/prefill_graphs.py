@@ -51,7 +51,8 @@ class PrefillFFNGraphs:
             return []
         tensors = {}
         for name in ('_want_counts', '_want_mass', '_want_phase', '_miss_tot',
-                     '_miss_phase', '_req_counts', '_rec_counts'):
+                     '_miss_phase', '_miss_mass_tot', '_req_counts', '_rec_counts',
+                     '_req_mass', '_rec_mass'):
             value = getattr(m, name, None)
             for tensor in value if isinstance(value, list) else [value]:
                 if tensor is not None:

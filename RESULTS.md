@@ -654,3 +654,1117 @@ kind of text, about 5 accepted tokens per step on markup against 2.5 on prose.
 ### What is not measured in this tag
 Sampled quality A/B at scale, long-context (8k+) generation quality, the container image end to end,
 and the tool grammar of `server/tool_grammar.py` on real weights (it is off by default).
+
+### Router-score placement smoke (2026-10-05)
+
+Added opt-in `DSV41_PRUNE_METRIC=score`: observed placement uses raw positive
+router scores for the original top-k selections, with separately normalized
+request score history. The existing frequency trace remains the cold-start prior.
+Native FP4 weights and numerical settings stayed unchanged; this is not EXL3.
+
+The two-Spark live profile uses keep 0.61 (235 experts/layer), a 90.1 GB arena,
+16 transient slots, 524288 context, speculation and the existing attention overlay.
+Both ranks agreed on 119 guarded fields. After five calibration prompts disjoint
+from evaluation, the same five fixed MMLU-Pro questions used in the preceding
+full-streaming smoke scored **4/5**, all valid, in **11.39 seconds total**
+(median 1.58 seconds). Answers A/G/A/B/D exactly matched that full-streaming
+run, which scored 4/5 in 52.38 seconds. Earlier frequency runs scored 3/5 and 4/5.
+
+On these five score-mode requests, aggregate selection misses were **17.44%**;
+score-weighted misses were **15.68%**. Historical frequency selection misses on
+the same questions were 23.14% and 22.21%, but their history, compiler warmup
+accounting, and cache state differed. This is a diagnostic smoke, not an isolated
+metric A/B, broad accuracy estimate, or sustained-throughput measurement. No
+large benchmark was run. Forty-seven selected tests passed in the serving image,
+including fused GPU recorder parity, graph replay, history units, and swap checks.
+
+Raw results, manifests, source hashes, launch settings and rollback settings:
+`../llm_benchmark/results/custom-router-score-20261005/`.
+
+### 2026-10-05: fixed-history expert ranking and bounded contribution rescue
+
+Small MMLU-Pro diagnostic: 14 new questions (seed 20261006, one per category),
+greedy direct answers, all swaps frozen, 9,400 resident experts at 61% kept.
+Each launch started from the same saved request-unit history, prior 4. Frequency,
+raw router score, score plus confidence depth, and score plus calibrated prefill
+rescue all answered 9/14, with identical letters and no invalid requests.
+Frequency and score differed by 257 placements; selection misses were 13.36% and
+13.99%, respectively. This gives no evidence that the lower missing rate or raw
+score ranking improves answers. It is a small diagnostic, not an accuracy estimate.
+
+The rescue profile used two disjoint public texts (132 tokens) and layers 0–3
+only. Nine layer/expert rescue events caused five actual expert reads across the
+14 questions, without correcting an answer. Median question time rose from
+0.897 to 0.973 s. Keep the prototype disabled. Details and limitations are in
+[critical-prefill.md](docs/critical-prefill.md).
+
+Two timed repetitions after one warmup, 128 output tokens each, unique prefixes
+(no prefix reuse): confidence depth improved code from 45.50 to 52.325 decode
+tok/s (+15.0%), with identical outputs; prose went 20.19 to 19.71 (-2.4%), also
+with identical outputs. End-to-end median times were code 3.193/2.835 s and
+prose 6.671/6.828 s. This is an opt-in code speed result, not a general default
+win; confidence remains off in production.
+
+Offline global layer allocation retained 95.765% versus uniform 95.678% of the
+blended calibration mass at the same budget. It was not run live after the goal
+was clarified as preserving critical experts rather than maximizing routing mass.
+
+Raw artifacts and paired comparisons: `/home/ryan/git/llm_benchmark/results/
+expert-tuning-20261005/`; launch/config/profile artifacts: `results/expert-tuning-20261005/`.
+
+### Full-routing control and layer allocation (2026-10-06)
+
+On the identical 14-question manifest above, unrestricted routing (keep 1,
+384 transient slots, same native FP4 weights and numerical settings) scored
+**11/14**, versus **9/14** for frozen score/uniform placement. The only changed
+answers were math 7867 (A -> J) and philosophy 11054 (I -> B), both recoveries.
+The math answer independently matches the analytic derivative, -153.5947587.
+Every request was valid and had zero prefix reuse. Full-routing request time
+totaled 101.87 s versus 35.20 s for uniform, including first-request warmup;
+medians were 6.121 versus 0.897 s. This control isolates two pruning-sensitive
+answers without changing the model format; it is not a broad quality estimate.
+
+An explicit fixed layer budget then kept 330 experts in layers 0–4 and 35–39,
+204 in layers 5–14, and 203 in layers 15–34: the same 9,400 total slots, no
+streaming, same ranking/history, all swaps frozen. It recovered math but lost
+biology 2868 (E -> F), leaving **9/14**. Philosophy remained wrong. The other
+category changed I -> A and remained wrong. This rejects this particular edge
+allocation as a quality improvement; it does not establish a general layer
+importance ranking. The allocation option is experimental and unset by default.
+
+Isolating the late budget (330 experts in layers 35–39, 222 in 0–14, 221 in
+15–34; again 9,400 total) scored **10/14**: math recovered, biology stayed correct,
+and all other letters matched uniform. All requests were valid with zero NVMe
+expert reads. This is a placement-only recovery on the diagnostic set; a separate
+validation set is needed before treating it as a general policy improvement.
+
+### Immediate layer streaming qualification and group probes
+
+`DSV41_STREAM_LAYERS` now supports prefill and decode, loading current router
+picks before MoE through the transient ring. The keep set stays at 9,400 experts;
+160 transient slots fit in the same arena without evictions of residents. Both
+ranks guard the selected layers and graph-split policy at boot. Fifty focused
+tests passed, including current-token load ordering and transient-only decode.
+
+All-layer streaming matched unrestricted routing on biology 2868, math 7867,
+and philosophy 11054: E/J/B, all correct. Separately streaming 0–4, 18–22, or
+35–39 produced E/A/I in every arm, matching the pruned baseline. None of these
+five-layer groups alone explains the recoveries. The late-only retention result
+above is consequently not proof of late-layer causal dominance.
+
+A short 39-token generation with layers 35–39 streamed correctly counted 1–20
+in nine completed verification steps, 2.53 s total, 1.64 GB expert reads and
+34.96 decode tok/s. This qualifies that mixed graph path on a short prompt;
+it is one functional check, not a sustained-throughput comparison. See
+[layer-stream.md](docs/layer-stream.md) for constraints. Answer probes and the
+multi-token check are saved under `../llm_benchmark/results/expert-tuning-20261005/`.
+
+The follow-up block-necessity sweep used only the two previously identified
+pruning-sensitive cases. It fully routed all layers except one five-layer block,
+which kept the original frozen 235-expert mask. These are post-hoc diagnostic
+cases, not a held-out accuracy estimate. All 16 requests were valid, with identical
+question prefixes and no prefix reuse. Each arm began from the same demand seed.
+
+| Pruned block; all others fully routed | Math 7867 | Philosophy 11054 |
+| --- | --- | --- |
+| 0–4 | A, wrong | B, correct |
+| 5–9 | J, correct | I, wrong |
+| 10–14 | J, correct | B, correct |
+| 15–19 | J, correct | B, correct |
+| 20–24 | J, correct | B, correct |
+| 25–29 | J, correct | B, correct |
+| 30–34 | J, correct | B, correct |
+| 35–39 | J, correct | B, correct |
+
+Thus early blocks are necessary under this particular full-routing control;
+restoring 0–4 alone was insufficient. Lack of damage from individually pruning
+later blocks does not prove they can all be pruned together, or that later layers
+are generally unimportant. Protocol: `results/expert-tuning-20261005/layer-ablation-protocol.json`;
+raw responses and summary: `../llm_benchmark/results/expert-tuning-20261005/layer-ablation-summary.json`.
+
+Streaming 0–9 with all other layers pruned at the original budget recovered
+philosophy but not math. On the full 14-question diagnostic it scored **10/14**;
+every other letter matched the 9/14 baseline. This demonstrates that the two
+early block-necessity results cannot simply be combined into a sufficient policy
+for both examples. It is a targeted diagnostic gain, not an independent accuracy
+estimate. Artifact: `stream-first10-quality.json` in the benchmark results directory.
+
+Fine-grained diagnostics used persistent per-layer mask tensors and an
+authoritative per-request broadcast, avoiding ten full model reloads. Each of
+layers 0–4 was separately pruned on math, and 5–9 on philosophy, in the otherwise
+fully routed model. **No individual layer broke its tested answer**. Pruning
+0–2 or 3–4 separately also preserved math; pruning 5–7 broke philosophy, while
+pruning 8–9 preserved it. These are joint effects, not proof of a single dominant
+layer or expert. Restoring the first **20** layers recovered both answers and
+preserved the biology control. Full-routing controls matched before and after.
+
+Fifty-one focused tests passed for the revised mask-control path, including
+root-authoritative masks with no peer file, in-place address preservation, and
+errors broadcast to both ranks. The first harness pass stopped on a transient
+busy state after its three correct reference answers; partial results were kept,
+and the harness now waits for idle before changing masks. Complete measurements:
+`single-layer-ablation-retry.json`; the partial pass is `single-layer-ablation.json`.
+
+Reducing the sufficient 20-layer policy to **0–9 plus 15–19** (15 streamed layers)
+preserved all three probe answers. Streaming **0–14** (also 15 layers) still lost
+math. Thus the middle block 15–19 matters under partial routing, despite its
+individual block ablation causing no damage under full routing. Layer importance
+depends on the other routing decisions, not just position. These two arms and an
+unchanged full-routing control are in `fifteen-layer-sufficiency.json`.
+
+Further preset subsets all preserved E/J/B on the three probes: 0–7 plus 15–19
+(13 layers), 0–2 plus 5–7 plus 15–19 (11), and **3–7 plus 15–19 (10)**.
+All had an unchanged full-routing control afterward. The ten-layer subset was
+then frozen for normal serving-path qualification and a separate 14-question
+validation seed 20261007. It is the smallest passing policy among these tested
+subsets, not a globally minimal or generally optimal layer set.
+
+### Ten-layer policy: matched validation and cost
+
+The fixed **3–7 plus 15–19** policy was then tested through the normal mixed
+serving path, with diagnostic mask changes disabled. All arms used native FP4,
+the same initial score-history seed, 235 residents per layer (9,400 total), the
+same 90.1 GB arena, 160 transient slots, and all swaps/prefix reuse disabled.
+
+| Manifest | Frozen resident routing | Ten layers fully routed | All layers fully routed |
+| --- | --- | --- | --- |
+| Diagnostic seed 20261006, 14 questions | 9/14 | 11/14 | 11/14 (earlier keep-1 control) |
+| Separate seed 20261007, 14 questions | 9/14 | 9/14 | 12/14 (all-layer streaming control) |
+
+The matched resident diagnostic reproduced every original baseline letter.
+Ten-layer streaming recovered math 7867 and philosophy 11054, and changed law
+1789 from G to A while still wrong. All other diagnostic letters matched the
+baseline. On the separate manifest, **every ten-layer answer letter matched
+the resident baseline**. Full routing recovered business 834 (G -> I),
+engineering 12071 (A -> J), and history 5003 (F -> C), with no other changes.
+Thus the ten-layer policy misses pruning-sensitive cases outside its selection
+set. It is not a demonstrated general quality improvement and remains off.
+
+A short identical-output decode check counted 1–20 (39 output tokens), using
+unique prompt identifiers, one warmup and two measured repetitions per arm.
+Resident / ten-layer medians were **1.219 / 2.184 s** per request and
+**45.35 / 39.58 decode tok/s**. Ten-layer median reported expert reads were
+0.95 GB versus zero for resident routing. No resident promotions occurred.
+This is a functional qualification and an exploratory cost comparison on a short
+fixed answer, not a sustained throughput estimate. On the separate 14-question
+manifest, median request times were 0.733 / 1.553 s for resident / ten-layer.
+
+The ten-layer policy was frozen before the separate manifest's responses;
+subsequent block analysis of its three full-routing recoveries is post-hoc.
+Raw responses, health configs and comparison: `candidate-10-quality.json`,
+`candidate-10-validation.json`, `validation-uniform-quality.json`,
+`validation-uniform-diagnostic.json`, `validation-full-stream-quality.json`,
+and `layer-policy-summary.json` under the benchmark results directory.
+The policy freeze and source hashes are in `results/expert-tuning-20261005/`.
+
+### New-case block sensitivity: early, middle, and later layers
+
+After validation, the three newly identified pruning-sensitive cases were used
+for a separate **post-hoc** block sweep. Graph topology stayed fixed with all
+layers split; only the authoritative routing masks changed. All 39 short requests
+were valid, no prefixes were reused, and expert generation stayed zero. Full
+routing controls before and after gave the same correct I/J/C answers.
+
+Combining the two earlier diagnostic cases with these three new cases gives this
+limited sensitivity map. Each row prunes only that block; all other layers retain
+full routing. A blank finding means no answer loss on these five cases, not proof
+that the block is unimportant in general.
+
+| Pruned block | Correct reference answers lost |
+| --- | --- |
+| 0–4 | Math 7867 |
+| 5–9 | Philosophy 11054; history 5003 |
+| 10–14 | Engineering 12071 |
+| 15–19 | Engineering 12071 |
+| 20–24 | None on these cases |
+| 25–29 | None on these cases |
+| 30–34 | Business 834 |
+| 35–39 | None on these cases |
+
+Three broad sufficiency policies were specified before this sweep's responses:
+
+| Full-routing layers; other layers pruned | Business 834 | Engineering 12071 | History 5003 |
+| --- | --- | --- | --- |
+| 0–19 | G, wrong | J, correct | C, correct |
+| 20–39 | I, correct | A, wrong | F, wrong |
+| 0–9 plus 30–39 | I, correct | A, wrong | C, correct |
+
+This provides direct counterexamples to a universal early/late preference:
+engineering depends on middle blocks, business on a later block, and history on
+an early block. Engineering also needs more than restoring 15–19 in the
+ten-layer policy, showing necessity and sufficiency differ. These findings guide
+future expert-level protection; they do not justify streaming whole regions by
+default or selecting a new policy on the same validation cases and calling it
+held out. Protocol: `results/expert-tuning-20261005/fresh-block-ablation-protocol.json`;
+responses and condensed table: `fresh-block-ablation.json` and
+`fresh-block-ablation-summary.json` in the benchmark results directory.
+
+Final state: the normal `deepseek` EP2 pair is restored on the latest local code
+image, with streaming, diagnostic mask control, explicit layer allocations,
+calibrated rescue and confidence depth disabled. The original 0.61 keep ratio,
+16 transient slots, 90.1 GB arena, production score database, prefix cache and
+adaptive swap settings are restored. Both running ranks and the workspace match
+on all six modified runtime modules; hashes are in `runtime-source-verified.json`.
+The final health/config check passed on both ranks, and a floor request returned
+A. Fifty-one focused tests passed; `git diff --check` passed. TensorFold remains
+stopped. No model downloads or conversions were performed for these trials.
+Final checks are saved in `results/expert-tuning-20261005/final-production-*`.
+
+## 2026-10-06: author's topic database and maxmin selection (TP2)
+
+Ported the author's fixed topic-selection path at upstream commit
+`45a0caffc8f080f8fd32d22f4e3d4e9122e25e5f`: 39 topics, frequency and saliency
+histograms for every 40 x 384 layer/expert position, plus the greedy maxmin
+ranker. The 13,048,828-byte statistics file is pinned by SHA256
+`eb5214a78791a1e8cc0db51353f6ea7931f4f2d18142776f90784e01e67f16d3`.
+Only statistics were obtained; no model weights were downloaded or converted.
+The tiny image overlays use the already-built runtime on both nodes.
+
+Saliency is the trace's accumulated gate-weight times expert-output norm.
+Maxmin normalizes each topic separately and repeatedly admits the best unused
+expert for the least-covered topic. Its priorities are selection order, not
+router-score mass. The port requires fixed placement: no history blending,
+prefill/end/decode/urgent swaps, or unequal layer allocation. Default counts/sum
+with no explicit topics retains the existing adaptive coding/general trace path.
+The existing unconditional score broadcast remains authoritative; no collective
+was added. The TP2 configuration guard now includes source, ranker, topics,
+statistics SHA256 and actual initial expert-ID SHA256, rather than only mask size.
+Profile coverage is reported as a trace proxy, not answer accuracy.
+
+Exact CPU parity with the pinned upstream maxmin function passed for **both
+families across all 39 topics, 40 layers, 384 experts**. Sixty focused tests
+passed, including nine profile tests. Both image copies have matching engine
+and profile modules and identical statistics checksums. Setup and parity records
+are in `results/expert-profile-20261006/`.
+
+### Fixed comparison and separate validation
+
+All arms use current output-sharded TP2, native FP4, 0.61 keep, **235 residents
+per layer / 9,400 total**, a **90.1 GB arena**, 16 transient slots and the same
+existing numerical settings/weight overlay. Streaming, calibrated rescue,
+explicit layer budgets, confidence scheduling, prefix reuse, prefill graphs and
+all swaps are disabled. No inference kernels changed for the profile port.
+
+The baseline reconstructs the normal two-topic trace plus an immutable snapshot
+of the current request-unit score database, with prior 4 and mean observed
+history weight **75.16%**. A CPU reconstruction verifies the exact baseline
+expert-ID fingerprint. New profiles use all 39 topics and no observed-history
+blend. Thus baseline-to-topic comparison changes both prior and selection
+policy; frequency-to-saliency comparison isolates histogram family at the same
+maxmin policy and topic list. They replace 3,085 / 3,036 of the baseline's
+resident IDs; frequency and saliency differ by 1,277 IDs.
+
+The frozen protocol uses MMLU-Pro direct-letter, nonthinking, greedy, max 16
+output tokens, one question per category. Seeds 20261008 and 20261009 and their
+manifests were recorded before responses. The first-set winner alone receives
+separate validation; a candidate must beat baseline there before promotion.
+No topic subset, keep budget or ranking parameter was tuned on these answers.
+
+| Expert selection | First set, 14 questions | Separate set, 14 questions | First-set raw miss rate |
+| --- | --- | --- | --- |
+| Current trace + router-score history, frozen | 8/14 | 12/14 | 13.89% |
+| 39-topic frequency + maxmin, fixed | 10/14 | 9/14, including one format failure | 27.19% |
+| 39-topic saliency + maxmin, fixed | 8/14 | Not selected for validation | 27.84% |
+
+Frequency recovered business 857 (G -> I) and law 1621 (I -> G) in the first
+set with no newly wrong correct answers. Chemistry 4225 changed between wrong
+answers. Saliency recovered business but lost biology 3425 (C -> D); chemistry
+and psychology changed between wrong answers. Its net score tied baseline.
+
+On the separate set, frequency lost engineering 11975 (E -> B) and health
+6764 (B -> D). Chemistry 3555 started explaining the Joule-Thomson coefficient
+instead of returning a letter and reached the unchanged 16-token limit.
+The original harness stopped there; its partial result is retained, and an
+explicit continuation ran only the remaining 11 questions. **No response was
+retried or given extra tokens.** All 14 observations are combined in
+`counts-validation-complete.json`; the invalid response is a failure in the
+all-14 denominator, not silently excluded as in valid-only accuracy.
+Physics changed between wrong answers. No baseline error was recovered.
+
+This is a small comparison, not an aggregate model-quality estimate. It rejects
+these fixed all-topic profiles as a serving default under the predeclared rule.
+The first-set result also demonstrates that raw miss rate alone cannot rank
+quality: frequency had almost twice the misses but two more correct answers.
+All quality requests reported zero expert NVMe reads and expert generation zero.
+
+### Short generation and timing checks
+
+Both topic profiles generated run-length encoding Python that parsed and passed
+seven cases, including empty and Unicode strings. Frequency gave exact 1–20
+counting outputs on all three short requests and converted `nihongomo ikeru?`
+to `日本語もいける？`. Saliency passed two exact counting checks; one echoed
+`run_1:` before otherwise correct numbers. It wrote `日本語も行ける？`, which
+fails the selected exact kana-form check but is a lexical variation, not an
+encoding error. Both outputs were valid UTF-8. These checks catch practical
+format/code failures; they do not establish broad quality.
+
+The same LRU-code and coastal-climate prompts were also timed at 128 output
+tokens, with one warmup and two measured repetitions per arm, prefix reuse off.
+
+| Workload | Baseline median request / decode rate | Frequency/maxmin median request / decode rate |
+| --- | --- | --- |
+| LRU Python code, 128 output tokens | 3.234 s / 44.85 tok/s | 3.996 s / 39.62 tok/s |
+| Coastal climate prose, 128 output tokens | 6.895 s / 19.44 tok/s | 5.894 s / 22.87 tok/s |
+
+Outputs differ between policies and are truncated by the token cap, so this is
+an exploratory throughput comparison, not a passing code-quality test or a
+universal speedup. The functional Python qualification above uses a complete,
+separate task. Saliency did not qualify for this additional timing comparison.
+
+Protocol, manifests, original/continued raw responses, statistics provenance,
+selection IDs, qualification code and condensed comparison are under
+`results/expert-profile-20261006/`. See `protocol.json`, `summary.json`,
+`selection-comparison.json`, `upstream-parity.json`, `*-qualification.json` and
+the `*-discovery.json` / `*-validation*.json` measurements. The production
+demand file and original environment stayed unchanged throughout the trials.
+The optional profile implementation remains available; the new image is used
+with the original adaptive selection settings.
+
+Final production health passed for `deepseek` on TP2. All original numerical,
+budget, adaptive swap and prefix settings match the pretrial service; only the
+image changes to include the optional profile code. The exact initial expert
+IDs reproduce the frozen baseline, and both running ranks match the workspace
+on seven runtime modules. No experimental profile, streaming, mask control,
+layer allocation, calibrated rescue or confidence policy is enabled.
+Normal-service counting, Japanese conversion and Python checks passed, including
+seven functional code cases. One preliminary functional check stopped while
+post-request adaptive work was still busy; the retained retry waits for idle and
+is not included in the frozen timing comparison. Production history resumes
+its normal updates after restoration. TensorFold remains stopped.
+Final evidence: `runtime-source-verified.json`, `production-runtime-env.json`,
+`production-restored-health.json`, `production-qualification-retry.json` and
+`production-final-health.json`. `git diff --check` passed.
+
+## 2026-10-06: lower priority for Mia's 2-bit layers
+
+Parsed the already-present EXL3 quantization metadata, SHA256
+`2949806ec66ff269a539caebe8afc55ba7d7c7220e011edc478fa67812a95ae1`.
+Every routed w1/w2/w3 matrix in layers **18–22** uses 2 bits (1,152 matrices per
+layer); the other 35 backbone layers use 3 bits. This is quantization tolerance
+evidence, not a measurement of expert-omission damage.
+
+One fixed **0.8 layer-priority factor** was chosen before responses. Normalizing
+to the same 9,400 residents yields **193 per layer in 18–22, 241 elsewhere**,
+instead of uniform 235. It removes 210 slots from those five layers and spreads
+six additional slots to each other layer. Lowering a layer's scalar scores with
+an unchanged uniform quota would not change its selected experts, so the test
+uses the existing explicit layer budgets and their TP2 boot guard. No runtime
+engine code, weights, numerical kernels or format changed for this test.
+
+Both arms use native FP4 TP2, 90.1 GB arena, 16 transient slots, the same trace,
+sum prior, router-score ranking and immutable current-history seed
+`beef789badad39c7c29b2eb5b1576ad1ea4ef9cb1d2e189345cc2012d06858e9`.
+Every swap/rescue/streaming trigger, prefix cache and prefill graph is disabled.
+Expert generation stays zero. History is copied to isolated arm databases, and
+the production environment and history file remain untouched during testing.
+
+The protocol predefines fresh MMLU-Pro seed **20261010**, one question in each
+of 14 categories, plus the five previously identified pruning-sensitive cases:
+math 7867, philosophy 11054, business 834, engineering 12071, history 5003.
+All requests are nonthinking, greedy, direct-letter, max 16 output tokens.
+The candidate must improve fresh accuracy with valid responses, avoid regression
+on the known-case total, and pass short functional checks to be promoted.
+No discount or topic was retuned after responses.
+
+| Allocation | Fresh questions | Prior sensitive probes | Total |
+| --- | --- | --- | --- |
+| Uniform 235 per layer | 8/14 | 2/5 | 10/19 |
+| Mia-informed 193 / 241 | 7/14 | 3/5 | 10/19 |
+
+All 38 responses were valid. The candidate lost law 1501 (E -> H) on the fresh
+set, recovered history 5003 (F -> C) on the probes, and changed engineering
+12071 between wrong answers (A -> G). Every other answer matched. The new
+current-history baseline already answers math and business correctly; older
+history's baseline results are therefore not appropriate controls here.
+
+The policy fails the predeclared fresh-set criterion and stays disabled. This
+is a measured tradeoff for one discount, not evidence that all bit-informed
+priorities fail. Compression keeps each selected expert's contribution while
+changing its weights; pruning changes which expert contributes. The latter
+needs its own quality measurement. No full streaming, TensorFold launch,
+model downloads, conversion or new service was used.
+
+Metadata, fixed quotas, manifest, seed hash, raw arm responses, source provenance
+and answer changes: `results/mia-layer-priority-20261006/protocol.json`,
+`layer-counts.txt`, `*-fresh.json`, `*-known*.json`, and `summary.json`.
+
+During this test, a separate user-message extraction helper was added and tested
+without changing serving or expert ranking. It selects the last actual user
+message from the original API input before the model encoder merges tool results
+or treats mid-conversation system messages as user-like. Nontext attachments,
+tool results and other messages are excluded. It preserves original messages
+and exact text spacing/Unicode. Six focused tests passed. Unmarked documents
+inside the same plain-text field require a client boundary. The current router
+recorder still counts the full request; token-scope/priority integration is a
+separate change. See `server/latest_user.py` and `docs/gotchas.md`.
+
+Final health passed on the original `deepseek` TP2 configuration: uniform layer
+budget restored, all experimental policies off, original adaptive swaps and
+prefix settings on. Its exact initial expert IDs match this trial's frozen
+baseline. The production environment and saved history still match the pretrial
+copies. Both containers are running; TensorFold remains stopped. Final record:
+`results/mia-layer-priority-20261006/production-final-health.json`.
+`git diff --check` passed.
+
+## 2026-10-06 — latest-user discovery, protected admission and 5% layer discount
+
+Implemented `DSV41_USER_PROMPT_STREAM`: verified tokenizer ranges locate only
+the last original user's explicit text before tool merging. During a streaming
+discovery prefill, those rows receive full expert routing. Their normalized
+gate-score mass orders admissions within the fixed layer quotas. Admitted used
+experts are protected from prefill, decode and idle adaptive eviction until the
+next request replaces the protection. Older messages, system/developer input,
+tool results and structured attachments are excluded from this temporary score;
+the conversation is still available for attention. Text-only and concurrency 1
+are currently required. Plain-text documents inside that same user text cannot
+be separated without a client boundary.
+
+Mia's 2-bit layers 18–22 receive relative layer weight 0.95, others 1.0.
+Largest-remainder rounding preserves 9,400 residents: 225 in those five layers,
+237 in layers 0–14 and 236 elsewhere. This moves 50 slots compared with uniform
+235/layer. The 90.1 GB arena remains fixed; 160 transient slots accommodate all
+cold experts in the smallest layer while retaining all residents. Native FP4
+checkpoint weights were unchanged. No model downloads or TensorFold launch.
+
+The first prototype loaded/promoted after first-answer logits were computed.
+It scored 10/14, losing engineering and math while recovering business. That
+timing is too late for a direct-letter answer. Version 2 therefore rebuilds the
+prompt once using the new resident set after admission, with streaming and
+demand collection paused. Both the encoder state and the first answer now use
+the chosen residents. The normal 128-token bounded decoder replay stays on;
+upper-layer discovery rows are the user-text intersection with that window.
+Protection/plan broadcast is unconditional on both ranks, including empty
+selections; the feature and version are in the TP2 boot guard.
+
+| Policy | Correct / 14 | Valid / 14 | Mean question wall time |
+|---|---:|---:|---:|
+| Frozen uniform control | 11 | 14 | 1.530 s |
+| Frozen 5% discount only | 11 | 14 | 1.551 s |
+| Prompt admission v1, rejected first-token timing | 10 | 14 | 8.944 s |
+| Prompt admission v2 + 5% discount | 12 | 14 | 8.659 s |
+
+All arms started from immutable history SHA256
+`beef789badad39c7c29b2eb5b1576ad1ea4ef9cb1d2e189345cc2012d06858e9`, with
+other adaptive swaps and prefix/response caching disabled. Questions were fixed
+before answers (seed 20261011; manifest
+`3e60f71315a4d09288a50a36cab1ae986942951aae2cc3af0aa7feaf2b777443`).
+Admission arms retain their promoted masks across this ordered small suite,
+as the real policy does. Version 2 reused the same questions to assess the
+timing repair; this is exploratory, not an independent holdout or broad quality
+claim. The discount alone changed no answers. Final admission recovered
+business q671 (H→D) and psychology q2367 (F→I), but lost engineering q11754
+(I→A). Law q1581 remained wrong. No response was retried or discarded.
+
+Three short counting requests per arm (one warmup, two measured) averaged
+1.465 s total baseline vs 2.886 s final policy, with prefill 0.408→1.869 s and
+decode 0.985→0.952 s. Outputs matched the 1–20 instruction. Japanese conversion
+passed and the generated Python RLE function passed seven cases, including
+Unicode and empty input. With no user selection/admission, full resident prompt
+rebuilds at 6 and 426 tokens reproduced the original logits exactly. The final
+question arm promoted 689–1,490 experts per request, protected 4,814–6,645,
+and reported at most 74 layer/expert overflow entries. All decode expert cache
+miss counters were zero: decode stays resident, rather than streaming.
+
+62 focused unit/integration checks and 17 mock-server end-to-end checks passed.
+The initial benchmark mistakenly required all 40 layers to process all user
+tokens despite bounded replay. Its assertion and first completed response were
+kept; the corrected check verifies exact window intersections and the suite
+resumed without repeating that question. Version 1 responses remain saved.
+
+The user-requested policy and 5% discount are retained as an explicit pilot,
+with the original production demand DB and adaptive settings restored. Required
+prefix/disk/response caches and prefill graphs stay off; transient slots are
+160. The policy offers a small measured net gain and substantially higher prompt
+latency. It does not establish that prompt router mass reliably predicts all
+later answer experts. Detailed protocol, raw responses, functional checks,
+source provenance, timings, rejected version and pilot settings are in
+`results/user-prompt-priority-20261006/`.
+
+Final live pilot health passed after restoring the original adaptive settings.
+A multi-turn counting check had 567 prompt tokens but only 15 selected latest
+user tokens: all 40 scheduled layers streamed those 15 rows, admitted 105
+experts and protected 1,604. Prefill and end-of-request adaptation also applied
+261 and 114 swaps, respectively, without evicting protected experts; the pilot
+remained healthy with those 1,604 still protected after idle maintenance. The
+five implementation modules match byte-for-byte on both running ranks and the
+workspace. Native `deepseek` serves on port 8000; TensorFold remains stopped.
+Final state: `pilot-smoke.json`, `pilot-final-health.json`, `rank*-source.json`,
+`pilot-changes.json`. `git diff --check` passed. Benchmark votes used separate
+demand DBs; the live pilot resumed the original DB and its qualification request
+contributed normally to that history.
+
+## 2026-10-06 — 100 resident loads and fully dynamic sector allocation
+
+The expert arena already maps `(layer, expert)` to fixed-size slots. TP2 stores
+9,400,320 bytes per slot per GPU; the peer stores the matching shard. Added
+cross-layer transfers, a global demand-based initial allocation, and
+`DSV41_DYNAMIC_EXPERTS`. Layer counts can grow/shrink without changing the total
+9,400 residents or 90.1 GB arena. No fixed quotas or Mia discount remain in the
+dynamic policy; six residents per layer is the routing minimum. Decode mask/LUT
+addresses remain stable. Changed layers' eager compact prefill maps are rebuilt.
+
+Full latest-user discovery now uses rank-0-authoritative token batches whose
+unique cold experts fit the transient ring, allowing layers below the previous
+224-resident capacity bound. Each row still executes all its chosen experts.
+No decode streaming, new quantization, checkpoint download or TensorFold launch.
+Both the policy and global-allocation version/settings are in the TP2 boot guard.
+
+`DSV41_USER_PROMPT_MAX_LOADS=100` bounds logical resident expert replacements
+across the entire request, including ordinary prefill/decode/end/idle adaptation.
+Both TP ranks apply the same 100-expert plan to their own half weights. It is
+neither a per-layer limit nor a total I/O limit: transient discovery stays
+uncapped. Deferred absentees are not protected as if they were resident.
+
+Same ordered 14-question MMLU-Pro set (seed 20261011, greedy max16), history
+SHA256 `beef789badad39c7c29b2eb5b1576ad1ea4ef9cb1d2e189345cc2012d06858e9`,
+normal adaptive swaps disabled, cache off. One new fixed-cap arm and one new
+dynamic arm; compared with saved uncapped v2, without retries or answer-driven
+tuning. This is exploratory reuse, not a holdout. Dynamic also removes the
+discount and changes startup selection, so the comparison does not isolate
+the effect of cross-layer transfers.
+
+| Whole policy | Correct / 14 | Valid / 14 | Mean question wall time |
+|---|---:|---:|---:|
+| Saved uncapped prompt v2, fixed quotas + 5% discount | 12 | 14 | 8.659 s |
+| Fixed quotas + 5% discount, cap 100 | 11 | 14 | 6.338 s |
+| Dynamic allocation, no discount, cap 100 | 10 | 14 | 6.998 s |
+
+The fixed cap lost psychology q2367 (I→F). Dynamic additionally lost math q8468
+(E→I); all other direct answers matched the fixed-cap arm. Every request used
+exactly 100 admissions. Dynamic made 95–100 cross-layer transfers per question
+(mean 97.57), with resident counts 206–271 at startup and 203–260 after the
+suite, total 9,400 throughout. Promotion mean was 0.327 s fixed-cap versus
+0.451 s dynamic. Resident rebuild mean was 0.775 versus 2.201 s. Discovery
+recorded 878–1,893 cold load events fixed-cap and 869–1,861 dynamic: the 100 cap
+does not remove streaming discovery cost. Neither quality nor speed improved
+over the fixed-cap arm on this small workload.
+
+Three counting requests (one warmup, two timed) averaged 2.682 s fixed-cap and
+3.382 s dynamic. Counting, Japanese conversion and the generated RLE function
+passed, including seven empty/Unicode cases. No-user resident rebuilds at 6
+and 426 tokens had exact logit delta zero. 57 focused checks and 17 mock-server
+tests passed. A separate six-token real-weight TP2 gate forced three discovery
+batches with six residents and eight transient slots: both ranks exactly
+matched an all-resident MoE, max absolute delta 0, resident directory unchanged.
+The first attempt to run that gate beside the live arena failed CUDA context
+initialization with OOM on both ranks; the successful gate ran during restart.
+
+At the user's explicit request, dynamic allocation stays enabled despite the
+measured regression. Original production history and ordinary adaptive settings
+are restored for live evaluation; benchmark demand files are separate. No
+parameter search or quality-based rollback. Protocol, all responses, timings,
+source hashes, batch gate and live qualification are in
+`results/dynamic-experts-20261006/`; the fixed-cap comparison is in
+`results/user-prompt-cap-100-20261006/`.
+
+Final live qualification passed with the original production DB and ordinary
+adaptation enabled. The 567-token multi-turn request selected only 15 latest
+user tokens, admitted 89 experts and protected 1,599. Ordinary adaptation used
+the remaining 11 loads: final total 100, remaining budget zero, resident total
+still 9,400. Both ranks passed the 145-field boot guard; seven implementation
+modules match the workspace byte-for-byte. `deepseek` is healthy on port 8000
+with context 524,288 and dynamic mode retained. TensorFold's stop marker remains.
+
+The launcher twice returned curl exit 23 after reporting healthy startup:
+`curl | head` under `pipefail` stopped reading the enlarged health response.
+`dual-up.sh` now reads the complete response before truncating its display,
+using the configured bind address; `bash -n` and `git diff --check` passed.
+The failed display exits and successful independent health checks are retained.
+
+## 2026-10-06 — Resident prefill with dynamic allocation retained
+
+The custom-harness incident had 15,434 total prompt tokens and 9,847 selected
+latest-user tokens. Discovery was still running after more than 113 seconds,
+before the first answer token. Role selection had not included every token,
+but mixed chunks entered the host streaming path and full discovery cold reads
+were unbounded. The 100-load limit covered resident replacements only. The
+incident record contains aggregate counters, not the user's prompt.
+
+At the user's request, `DSV41_USER_PROMPT_STREAM=0` is now persisted on both
+nodes. Dynamic allocation no longer requires prompt streaming. The resident
+replacement budget remains active when streaming is off; previously its
+disabled feature flag also disabled that budget. Global startup/adaptation,
+the six-resident layer floor, no fixed quotas/discounts, and the total 9,400
+resident experts remain. Prompt discovery and the extra first-answer rebuild
+are off. Policy versions: user prompt 5, dynamic allocation 3.
+
+Two predeclared synthetic counting requests used normal production adaptation,
+the original history DB, greedy max32 and thinking off. Both returned the exact
+sequence 1 through 10. The cold 38-token request took 8.553 s including initial
+graph warmup (prefill 6.699 s); the 10,014-token request took 41.326 s (prefill
+40.465 s). Both had zero discovery loads, zero streamed rows/batches and zero
+store resolves, and remained within 100 resident replacements after normal
+adaptation completed. Neither rebuilt prefill for prompt priority. These are
+operational checks, not a quality benchmark or a matched speed comparison with
+the incident. Resident compute still scales with prompt length; routed pruning
+misses remain even when the streaming I/O miss counters are zero.
+
+59 focused tests and 17 mock-server tests passed. Both TP2 ranks passed the
+145-field boot guard and seven implementation module hashes matched the
+workspace. The normal launcher exited successfully; TensorFold stayed stopped.
+Artifacts: `results/dynamic-resident-20261006/`. At this stage RAM/disk/response
+prefix caches were still off; the RAM restriction is addressed below.
+
+## 2026-10-06 — RAM prefix reuse with dynamic expert allocation
+
+The constant 0% prefix reuse was caused by the persisted `PREFIX_CACHE=0` and
+an overly broad dynamic-mode boot guard inherited from prompt streaming.
+RAM snapshots store encoder state, not expert-sector pointers. Resident
+prefill can therefore reuse historical KV after global sector transfers, as
+the original within-layer adaptive policy already did. Removed the RAM-cache
+restriction for dynamic allocation; prompt streaming still requires caches off.
+Disk/response caching and prefill graphs remain outside this prototype.
+Dynamic policy version 4 and `PREFIX_CACHE=1` are in the TP2 config guard.
+
+Three predeclared synthetic counting requests used native TP2, normal
+production adaptation/history, no prompt streaming, cap100, greedy max32,
+thinking off and seed 20261013. Both ranks applied the same global plans.
+
+| Request | Prompt tokens | Cached tokens | Prefill | Wall time |
+|---|---:|---:|---:|---:|
+| Cold base, includes graph warmup | 2,289 | 0 | 13.548 s | 15.319 s |
+| Exact repeat | 2,289 | 2,289 (100%) | 0.381 s | 1.346 s |
+| Extended conversation | 2,329 | 2,289 (98.3%) | 2.364 s | 2.927 s |
+
+All three returned the exact sequence 1 through 10. Expert generation advanced
+0→1→2→3, with 100 resident replacements per request and 9,400 residents
+throughout. Discovery loads, streamed rows and store resolves remained zero;
+there was no priority rebuild. These verify cache use across changing resident
+sets, not equality with fresh prefill under a new selection or general quality.
+The cold timing includes compilation; it is not a steady-state throughput arm.
+
+40 focused cache/media/disk/global/prompt tests and four prefix-state function
+checks passed. The new CPU integration check applies a cross-layer transfer
+on each TP rank, restores the historical encoder snapshot and verifies that
+the new expert directory remains active. Both live ranks passed the 145-field
+boot guard; seven module hashes match both ranks and the workspace. The pair
+was restarted successfully with RAM prefix caching enabled on both nodes;
+TensorFold remains stopped. `git diff --check` passed. Artifacts and all three
+synthetic responses: `results/dynamic-prefix-20261006/`.
+
+## 2026-10-06 — Correct the cap to streaming cold loads only
+
+The requested cap was on temporary streaming loads. Applying it to generic
+resident adaptation was a scope error. Prompt policy 6 removes the request-wide
+resident clamp from `plan_swaps`, fixed-layer swaps and global transfers.
+Prefill, periodic/urgent decode, request-end and idle adaptation now use their
+existing rules. The previous cap could consume all 100 loads during prefill
+and silently leave urgent adaptation with an empty plan.
+
+Bounded latest-user streaming now selects cold experts before routing and
+shares the allowed set and cold-load budget across TP2 ranks. Common transient
+hits are free; each selected cold set fits the ring. Later calls use resident
+routing once the cap is spent. This online policy prioritizes current rows,
+not future layers. Streaming remains OFF in production; RAM prefix reuse and
+fully dynamic allocation stay ON. The configured 100 cap is consequently
+inactive during ordinary production adaptation.
+
+70 focused tests passed, including the real store resolver with cap1 on both
+simulated ranks, a 101-transfer resident plan after exhausting the stream budget,
+and urgent decode planning with the exhausted budget. Two short live counting
+checks (19 prompt tokens, greedy max32) returned the exact count: resident loads
+were 160 then 110, with zero streaming loads. The repeat reused all 19 tokens.
+Wall times were 6.664 s (cold graph warmup) and 1.636 s; no quality or speed gain
+is claimed. Urgent adaptation is enabled at its existing 10%/~30-token threshold
+and 150-token cooldown; the short live responses did not exercise its trigger.
+Both ranks passed the 145-field boot guard and seven source hashes matched.
+Artifacts: `results/stream-load-cap-20261006/`.
+
+
+## 2026-10-06 — Live expert memory map
+
+`/expert-map` now displays all 15,360 routed experts and all 9,584 arena sectors.
+`/v1/expert-map` exposes the same snapshot as JSON. Resident, transient, missing
+and actively loading experts have distinct states; a bounded completion history
+keeps fast loads visible for three seconds. The page polls once per second,
+with layer/expert inspection, sector view, zoom, pause and state highlighting.
+It reads rank 0 CPU metadata without the generation lock, CUDA reads or new
+collectives. This is an approximate live snapshot, not an independent TP peer
+audit. Missing from the arena is not the same as a routed miss.
+
+45 focused tests, five HTTP/map tests and 17 mock server tests passed. A short
+19-token counting request returned the correct sequence while 30 map snapshots
+were sampled: 98 loads recorded, active transfers observed, 9,400 final residents,
+5,960 missing and zero streaming loads. Median snapshot fetch was 15.292 ms,
+maximum 90.117 ms in this one check; no inference speed or quality improvement
+is claimed. Browser checks covered both views, selection, zoom and pause/resume;
+no console errors were reported. Inspection also caught live polling overwriting
+number inputs; focused input text is now preserved and selection updates on input.
+
+Image `expert-map-v8` is persisted on both nodes. The final HTML was hot-updated
+in both running containers and included in the rebuilt image for future starts.
+Artifacts, snapshots, test logs and screenshot: `results/expert-map-20261006/`.
+
+
+## 2026-10-06 — Native TP2 and TTS coexistence
+
+Reduced the native expert arena from 90.1 to 88.7 GB per node and transient
+slots from 160 to 32. Capacity is now 9,435 sectors; all 9,400 resident experts
+still fit. The arena allocation decreases by 149 sectors × 9,400,320 bytes =
+1.401 GB per node. Dynamic allocation, prompt streaming OFF, 524,288 context
+and RAM prefix caching remain unchanged. TTS uses a 3,072 token buffer,
+reduced from 4,096 at the user's request; the 2,048 proposal was superseded.
+
+Starting TTS after DeepSeek had loaded and generated failed at CUDA memory
+initialization (`cudaMemGetInfo` reported out of memory), despite Linux reporting
+reclaimable memory. This failed order is not evidence that the two services
+cannot coexist. After stopping the pair, starting and warming TTS first, then
+starting DeepSeek, both came up with the requested settings. No model downloads
+or expert-budget reduction were needed. Both TP ranks passed the 145-field
+config guard and loaded 9,400 residents.
+
+One short text request and one short speech request were submitted concurrently.
+The 19-token count prompt (max32, greedy) returned exactly 1 through 10 in
+7.944 s including cold graph work. TTS returned a 153,644-byte mono 24 kHz PCM
+WAV in 7.532 s. This checks coexistence, not sustained-load capacity, audio
+quality or throughput improvement. Host MemAvailable afterward was about
+7.8 GiB; swap was already in use. TTS buffer savings were not separately
+measured. Artifacts: `results/tts-headroom-20261006/`.
+
+
+## 2026-10-06 — One previously failed math question on the live engine
+
+At the user's request, repeated only MMLU-Pro math question 7867, selected
+before its new response from the earlier `score-uniform.json` run. Identical
+prompt/options, greedy temperature 0, top_p 1, thinking off, max16; one request,
+no retries, calibration or extra diagnostic prompts. The user explicitly
+accepted this request contributing to production adaptation.
+
+Earlier frozen uniform allocation answered A (-75.98), incorrect. Current live
+dynamic allocation answered J (-153.59), matching the dataset key, in 2.723 s.
+The response was a valid single letter with stop termination. This is one
+historical failure recovered, not an overall benchmark score or a causal
+quality estimate: history, placement and other serving settings differ, and
+the question was selected because it previously failed. Exact protocol, raw
+response and before/after health: `results/single-math-20261006/`.
+
+
+## 2026-10-06 — Package the learned distribution for fresh starts
+
+Captured the idle generation-44 working set: 9,400 exact resident expert IDs,
+179–285 residents per layer, plus the current aggregate request-unit counts and
+router-score mass. The 231 KiB `profiles/learned-experts-v1.npz` includes no
+prompts, responses, KV caches or model weights. Its companion JSON records the
+layer counts, capture generation and checksum. The source history includes the
+single math retest the user explicitly authorized earlier; this export does not
+claim to be an uncontaminated benchmark arm or a generally optimal distribution.
+
+Fresh dynamic score/request-mode starts use the bundle only if the local demand
+DB path does not exist. At the 9,400 budget the exact captured map is restored;
+other budgets use normal global selection from the seeded demand blend. The
+same history initializes the model accumulators, so ordinary future write-back
+creates the new user's own DB. Existing DBs always bypass the bundle, even if
+incompatible or unreadable; explicit seed opt-out also bypasses it. The original
+trace remains the adaptation prior. No local production DB was replaced.
+
+Rank 0 alone reads the seed and sends it in the existing ranking broadcast;
+seed version, enabled flag and checksum join the boot guard. The example config
+now selects 0.61 keep, dynamic score placement and compatible cache switches.
+32 CPU tests passed, including the real boot-ranking segment with conflicting
+peer history, exact expert IDs, budget resizing, opt-out, invalid seed rejection
+and local-history precedence. Both nodes' new `learned-seed-v9` images load the
+identical seed checksum and 9,400 IDs in an offline CPU check. Both launch files
+point to that image for the next restart. The live engine and TTS were not
+restarted, and no inference/quality benchmark was run for this change.
+Artifacts: `results/default-distribution-20261006/`.
+
+
+## 2026-10-06 — 1,024-token prefill chunks beside TTS
+
+After the live 20,855-token session exhausted host headroom with 2,048-token
+chunks, reduced only `DSV41_PREFILL_CHUNK` to 1024 on both nodes. The 524,288
+context capacity, 88.7 GB arena, 32 transient slots, all 9,400 residents, dynamic
+allocation, prefix caching and TTS max-seq-len 3072 remain unchanged. No watchdog
+relaxation or CUDA-cache-reclamation code was added.
+
+A bounded text-only memory check used a copied demand DB: 20,775 prompt tokens
+with no cached prefix, then a 20,801-token extension producing 319 tokens while
+TTS synthesized one short sentence pair. Full prefill took 38.475 s; extension
+reused 20,480 tokens (98.5%) and prefilled in 2.646 s. Both text responses met
+their simple format checks, TTS returned a 399,404-byte WAV, and both ranks
+remained healthy. The main host was sampled every 0.25 s: minimum MemAvailable
+6.948 GB, final 7.404 GB. This is one memory coexistence check, not a matched
+speed comparison, quality benchmark or a guarantee for 524k/vision workloads.
+An urgent decode pass also occurred (64 swaps at output token 187), without
+exhausting the reserve.
+
+The production demand file remained byte-identical through the test. The test
+instance was stopped and production relaunched from that original history.
+Artifacts and memory samples: `results/memory-chunk-20261006/`.
+
+
+## 2026-10-06 — Peer-only vision and 100 more dynamic residents
+
+Added optional `DSV41_VISION_MODE=peer` for TP2. Rank 1 keeps the vision tower,
+aligner and delimiter embeddings; rank 0 keeps only metadata for input preparation.
+Both ranks exchange encoding status before broadcasting the complete image span.
+The boot guard includes ownership mode, enabled state and protocol version; an
+owner load/encode failure fails the pair rather than leaving the head waiting for
+an absent tensor. Text-only requests have no added vision collective.
+
+A standalone paired-GPU probe compared replicated and peer-only splice using
+synthetic patch tensors at 546×546 (184 embedding rows) and 1176×1344 (926 rows).
+Seven measured iterations per mode followed two warmups, alternating mode order,
+with synchronized timings covering the slower rank. Every output was bit-exact.
+Median replicated→peer times were 57.588→57.615 ms (+0.047%) and
+496.262→462.887 ms (−6.73%). These are tower/splice timings, not full-request
+throughput measurements. Dropping rank 0's tower released exactly 970,536,960
+allocated bytes. No inference history was read or modified by that probe.
+
+Added `DSV41_RESIDENT_EXPERTS` for an exact global dynamic budget, checked against
+the routing floor/model capacity and included in the boot guard. This avoids
+rounding the intended 9,500 to a multiple of 40 through `PRUNE_KEEP`. Static
+allocation retains its existing budget semantics. The existing resident-capacity
+check still requires the complete selected set to fit on each TP rank.
+
+Local configuration uses 9,500 residents, arena 89.7 GB, 32 transient slots,
+Engram caches 256 MiB / 1,024 MiB and peer-only vision. The extra resident weights
+cost 940,032,000 bytes per rank. Cache budgets free 805,306,368 bytes on rank 0
+and 3,221,225,472 on rank 1; combined with removed vision weights, this exceeds
+the 1 GB arena increase by about 0.776 GB / 2.221 GB respectively. These are
+allocation-budget differences, not guarantees about peak available memory.
+26 focused CPU tests passed (vision ownership/error ordering, exact budget,
+learned-seed selection and global residency). Artifacts: `results/peer-vision-20261006/`.
+
+An API smoke check with a synthetic red square returned `Red` while TTS returned
+a valid 126,764-byte WAV. It used a copied demand database; production history
+remained byte-identical. At 0.25 s sampling, rank 0 MemAvailable stayed at least
+7.701 GB during this short concurrent check. Both ranks loaded all 9,500 residents
+and agreed on all 152 guarded fields; logs confirmed 256/1,024 MiB Engram caches.
+The isolated test was stopped before restarting against the original production
+history. This does not measure long-context multimodal headroom or quality gains
+from the additional experts, nor decode-speed effects of the smaller row caches.
+
+
+## 2026-10-06 — Increase the live dynamic budget to 9,550
+
+Raised the exact resident budget from 9,500 to 9,550 and each arena from
+89.7 to 90.2 GB. The extra 50 TP expert shards use 470,016,000 bytes per node.
+Kept 32 transient slots, peer-only vision, 256/1,024 MiB Engram caches, 1,024-token
+prefill chunks and the 524,288 context limit. Both ranks restarted, loaded all
+9,550 residents and agreed on 152 guarded fields; the API and expert map confirmed
+9,550 residents (180–292 per layer at startup). Production demand history remained
+byte-identical through the restart, and TTS remained running. No inference or
+quality benchmark was run for this configuration-only increase. Artifacts:
+`results/residents-9550-20261006/`.
+
+
+## 2026-10-06 — Reassign 24 transient sectors to residents
+
+Reduced `TRANSIENT_SLOTS` from 32 to the supported minimum of 8 and increased
+`DSV41_RESIDENT_EXPERTS` from 9,550 to 9,574. The 90.2 GB arena stays unchanged:
+9,574 residents + 12 spare resident slots + 8 transient slots + 1 null slot =
+9,595 sectors. Streaming, critical rescue and prefill replicas are off; normal
+global adaptation overwrites donor resident slots directly and does not consume
+the transient reserve. This configuration does not establish capacity for a
+future unbounded streaming workload.
+
+Both ranks loaded all 9,574 residents, passed the existing 152-field config guard
+and became ready; the peer launch environment was also checked for the matching
+8-slot reserve. API and expert map confirmed the new allocation. Learned demand
+history remained byte-identical and TTS remained running. No inference benchmark
+was run for this configuration-only change. Artifacts:
+`results/residents-9574-20261006/`.
+
+
+## 2026-10-06 — One live retest of computer-science question 10632
+
+Retested the exact saved MMLU-Pro prompt and option order once with the live
+9,574-resident dynamic engine, temperature 0, top_p 1, thinking disabled and
+max_tokens 16. It returned `H` (incorrect; frozen key `F`) in 4.874 s, with 168
+prompt tokens and one output token. Historical custom passes both answered `I`
+(incorrect); Mia's two saved passes answered `H` (incorrect); the official API's
+two saved passes answered `F` (correct). This item did not improve to a correct
+answer. No repetition or alternative prompt was tried, and the reference
+endpoints were not rerun. The user accepted the single request's contribution
+to live adaptation. Prompt identity, protocol, response and health snapshots:
+`results/single-cs10632-20261006/`.
+
+At the user's request, two additional identical live attempts returned `H` /
+`H`, both incorrect (0.963 s / 0.798 s). Each reused all 168 prompt tokens from
+the RAM prefix cache, with adaptation active (reported generations 108 / 109).
+They are cached repeats, not independent full-prefill evaluations of the updated
+resident sets. Across the three live attempts, correctness was 0/3. Raw responses,
+health and protocol are in the `attempt-2/` and `attempt-3/` subdirectories of
+`results/single-cs10632-20261006/`. No further requests were sent.
+
+
+## 2026-10-06 — One live retest of law question 1911
+
+One request using the exact historical MMLU-Pro prompt and option order,
+temperature 0, top_p 1, thinking disabled and max_tokens 16 returned `F`
+(incorrect; frozen key `A`) in 3.071 s. Historical custom passes both returned
+`A` (correct), Mia's two passes returned `C` (incorrect), and the official API's
+two passes returned `A` (correct). This is a worse result on this individual
+question than the earlier custom runs; it does not isolate the effects of
+resident count, learned history or other intervening settings. No repeated
+request or reference-endpoint rerun was made. Protocol, paired historical
+answers, response and health snapshots: `results/single-law1911-20261006/`.
+
+One user-requested repeat of 1911 returned `F` again (incorrect) in 0.878 s.
+Reported request routing misses fell from 31.31% to 9.56%, and score-weighted
+misses from 34.09% to 5.52%. However, the repeat reused all 405 prompt tokens;
+recorded routing selections were 15,552 versus 66,582 on the first request.
+These rates cover different executed work and do not establish a reduction on
+fresh prefill of the full question. Reported expert generation advanced from
+111 to 112. Artifacts: `results/single-law1911-20261006/attempt-2/`.
+
+
+## 2026-10-06 — Thinking-on then thinking-off on law question 1911
+
+Ran one user-requested best-case adaptation probe on the original question:
+thinking on at effort 75, temperature 0/top_p 1, with a bounded 4,096-token
+reasoning-plus-answer budget; then the exact historical thinking-off request
+with max_tokens 16. Neither request included any answer or reasoning from the
+preceding response. Prompt-template rendering differed near the beginning;
+both runs reported zero cached prompt tokens without changing cache settings.
+
+The thinking run used all 4,096 tokens for reasoning and returned no final answer
+(finish=length), taking 148.695 s. It is incomplete, not a scored wrong answer.
+During decode, six urgent passes loaded 150 experts in total, and three periodic
+passes loaded 41. Prefill and post-response adaptation also remained active.
+
+The subsequent thinking-off run answered `A` correctly in 4.703 s. Against the
+original fresh thinking-off attempt (`F`, incorrect), request routing misses
+fell from 31.31% to 5.74%, and score-weighted misses from 34.09% to 3.12%.
+Both off runs executed 66,582 recorded routing selections and reused zero prompt
+tokens. This is a positive single-item warmup observation, not a general quality
+result or isolation of urgent adaptation: previous repeats, all other adaptation
+paths and run-to-run variation remain confounders. The truncated thinking pass
+does not establish whether thinking would eventually finish correctly. The
+engine remained healthy. Artifacts: `results/law1911-thinking-pair-20261006/`.
+
+
+## 2026-10-06 — Repeat thinking after the successful direct answer
+
+One further thinking-on attempt of law question 1911 used exactly the prior
+request body and rendered token IDs: effort 75, temperature 0, top_p 1, shared
+reasoning/answer cap 4,096. The server default effort was confirmed as 75
+(high); 60 maps to medium. The request did not contain prior reasoning or an
+answer, and reported zero cached prompt tokens.
+
+It again exhausted all 4,096 tokens in reasoning without a final answer,
+finish=length, in 149.134 s (previous thinking attempt: 148.695 s). Treat this
+as incomplete, not an incorrect selected option. Routing misses were 5.54%
+and score-weighted misses 3.60%, versus 7.38% / 5.00% on the previous thinking
+attempt. Better routing coverage did not make this bounded effort-75 attempt
+finish. The earlier fresh thinking-off attempt had answered correctly, so the
+observed additional thinking was unproductive within this budget; this does
+not establish how a larger budget or a lower effort would behave. No further
+inference requests were sent. Engine health remained OK.
+Artifacts: `results/law1911-thinking-repeat-20261006/`.
+
+
+## 2026-10-06 — Lower thinking effort to 50 for law question 1911
+
+One follow-up used the same question, temperature 0, top_p 1 and 4,096-token
+cap, with effort reduced from 75 to 50 and thinking explicitly enabled.
+The prompt-debug endpoint confirmed thinking=true and effort=50. This was a
+per-request setting; the server default remains 75.
+
+The run finished normally in 17.397 s, using 411 reasoning tokens (413 completion
+tokens total), and answered `C`, incorrect against the frozen key `A`. It reused
+zero cached prompt tokens. Routing misses were 4.67%, score-weighted misses 2.79%.
+Unlike both effort-75 attempts, it did not exhaust the budget; however, the lower
+effort did not reproduce the earlier correct thinking-off answer. This is one
+sequential live-adaptation comparison, not an isolated effort-only experiment.
+No additional inference requests were made. Engine health remained OK.
+Artifacts: `results/law1911-thinking-effort50-20261006/`.
+
+
+## 2026-10-06 — Thinking effort 60 on law question 1911
+
+One user-requested run used the same question, temperature 0, top_p 1 and
+4,096-token cap with thinking explicitly enabled and effort 60. Prompt-debug
+confirmed both settings. It finished normally in 60.963 s, using 1,549 reasoning
+tokens (1,551 completion tokens total), and answered `C`, incorrect against the
+frozen key `A`. Zero prompt tokens were cached. Request routing misses were
+4.01%, score-weighted misses 2.42%. This completed within the cap, unlike the two
+effort-75 runs, but used more reasoning than effort 50 (411 tokens) and selected
+the same incorrect option. Sequential live adaptation makes this an exploratory
+comparison rather than an isolated effect of effort. The server default remains
+75 and the engine remained healthy. No additional inference requests were made.
+Artifacts: `results/law1911-thinking-effort60-20261006/`.
+
+### 2026-10-06 — Predictive prefill prototype: CPU cost and shadow selection
+
+Added an optional bounded nearest-neighbor predictor that feeds provisional
+prefill demand into the existing global ranking policy before model execution.
+Actual post-prefill adaptation remains in place. Predictions never enter the
+persisted demand history; measured observations are folded by the normal path.
+This is an approximation, not an exact calculation of deep-layer routing from
+input tokens. Apply remains opt-in pending evidence of selection quality.
+
+Validation used copied demand history and separate predictor banks. Production
+history remained byte-identical to the pre-test backup. The live test overrides
+minimum examples to 1 to exercise the path; the normal minimum is 8. Every request
+used synthetic inventory notes, thinking off, greedy decoding, max 16 output
+tokens, and returned `READY`. These are integration checks, not answer-quality
+benchmarks.
+
+| Shadow request | Prompt / cached tokens | Prediction + planning | Result |
+| --- | --- | --- | --- |
+| Cold example | 10,260 / 0 | 12.250 ms | Collected first example; no prediction |
+| Similar fresh example | 10,260 / 0 | 36.859 ms | Predicted 189 promotions vs 202 from actual demand |
+| Cached extension | 10,349 / 10,240 (98.95%) | 1.355 ms | No similar suffix; safely skipped prediction |
+
+On the similar fresh example, feature cosine was 0.999876, mean demand total
+variation was 0.1113, promotion precision 76.72%, and recall 71.78%. Only two exact
+incoming/outgoing pairs matched. The 145 shared incoming experts do not establish
+quality equivalence: near-identical text still produced different routing after
+normal adaptation changed the residents. Keep this negative result when considering
+lower similarity thresholds or promoting the prototype to an apply default.
+The cached-extension example had cosine 0.5213 to the two full-prefill examples;
+reusing a prefix does not make new-suffix routing interchangeable with full-prefill
+routing. The bank needs relevant continuation examples as well.
+
+Observation/evaluation/persistence took 31.038, 81.101 and 78.927 ms respectively.
+Request wall times were 24.657, 14.471 and 2.467 s. These are sequential requests
+with different warmup/cache/residency states, not an A/B speed or quality claim.
+
+The separate CPU feature+neighbor microbenchmark (128 entries, five timed runs
+after warmup) measured medians 1.715 ms at 10k new tokens, 16.151 ms at 200k context
+with 2k new tokens, and 22.424 ms at 524,288 context with 5,243 new tokens. It excludes
+planning, expert weight I/O and model execution. Bank array storage was 17,301,504
+bytes. No GPU kernel was introduced. Focused unit coverage: 51 passing tests.
+
+Artifacts: `results/predictive-prefill-20261006/` (`feature-bench.json`,
+`live-summary.json`, per-request health snapshots, isolated histories and logs).
+
+A separate apply-mode integration probe restored the original pre-test demand
+history and used the isolated bank above (three entries, minimum 1). A fresh
+10,260-token near-variant loaded 362 predicted experts before prefill in
+1,167.950 ms, following 41.177 ms prediction/planning. It returned `READY`, with
+7.79% request routing misses and 6.88% score-mass misses (cold shadow probe:
+21.81% / 20.26%). Prefill took 18.421 s, request wall time 19.702 s. Observed demand
+TV against prediction was 0.08198; recording took 24.756 ms. Post-prefill correction
+remained active. This validates the distributed early-load path but uses nearby
+training examples and a trivial answer; it is not proof of preserved answer quality
+or a controlled speed comparison. Weight I/O is much larger than feature cost.
+
+Normal service uses the new image with `DSV41_PREDICTIVE_PREFILL=shadow`, minimum
+8, and an empty production bank. It retains the original production history,
+9,574 residents, eight transient sectors, prefix caching, peer vision and Engram
+cache sizes. Synthetic predictor banks are not copied into the production bank.
+
+### 2026-10-06 — Repository checkpoint and portable profile
+
+Compared the local serving environment with `.env.example` using resolved
+adaptation settings, not just raw variable names: adaptation now agrees exactly.
+The example selects high sensitivity/prior 4, 9,574 dynamic residents in a 90.2 GB
+arena with eight transient slots, a 524,288-token allocation, peer vision,
+256/1,024 MiB Engram caches, native dense precision, and speculative depth 3/5.
+RAM prefix reuse is explicit. Disk/post-response caches remain disabled; the
+300-second disk-save interval is documented as inactive in this mode. Experimental
+prediction stays opt-in in the template; the local server collects in shadow mode.
+Machine addresses, credentials, optional ablation weights and local image tags
+are not copied into the template. Older raw pruning overrides are omitted because
+the adaptation knobs derive their effective values.
+
+The README was reduced to setup, operation and the current profile. Detailed
+adaptation notes and historical measurements remain under `docs/`, including
+negative results. Pre-commit checks: 168 passed, three CUDA-only tests skipped
+with GPUs hidden to avoid interfering with live serving. This comprises 117
+focused unit tests, 30 persistence/response tests, four prefix-cache function
+tests, and 17 mock-API tests. Shell syntax, relative documentation links and diff
+whitespace checks passed. No new live quality benchmark was run for this commit.

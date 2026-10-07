@@ -198,7 +198,8 @@ def compute_hashes(model_dir: str, corpus: str, layer_ids):
         ids = torch.tensor([tok.encode(d["text"], add_special_tokens=False)])
         h = state(ids, 0)[0]  # [T, n_layers, 24]
         for li, L in enumerate(layout.layer_ids):
-            out[L][d["id"]] = h[:, li, :].numpy().astype(np.int64)
+            if L in out:
+                out[L][d["id"]] = h[:, li, :].numpy().astype(np.int64)
     return out, layout
 
 
@@ -218,11 +219,14 @@ def main():
     index = json.load(open(os.path.join(a.model_dir, "model.safetensors.index.json")))["weight_map"]
     hashes, layout = compute_hashes(a.model_dir, a.corpus, layer_ids)
     stats = {}
-    import requests
     for L in layer_ids:
         fname = index[f"layers.{L}.engram.embed.weight"]
         local = [p for p in a.local_shard if os.path.basename(p) == fname]
-        shard = LocalShard(local[0]) if local else RemoteShard(fname, lambda: requests.Session())
+        if local:
+            shard = LocalShard(local[0])
+        else:
+            import requests
+            shard = RemoteShard(fname, lambda: requests.Session())
         np.savez_compressed(os.path.join(a.out, f"layer{L}_hashes.npz"), **hashes[L])
         rows = np.unique(np.concatenate([v.reshape(-1) for v in hashes[L].values()]))
         n_tok = sum(v.shape[0] for v in hashes[L].values())

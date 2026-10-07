@@ -56,6 +56,7 @@ def make_engine_lane(engine):
         lane.model._want_mass = engine.model._want_mass
         if not PRUNE_UNIT_REQUEST:
             lane.model._rec_counts = lane.model._want_counts
+            lane.model._rec_mass = lane.model._want_mass
     lane._prefix_cache, lane._prefix_snapshots = None, {}
     lane._token_types = lane._images = None
     lane._requests_since_plan = 0

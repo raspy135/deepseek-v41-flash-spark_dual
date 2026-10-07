@@ -30,7 +30,7 @@ def _fake(seed_counts: bool):
         gen = torch.Generator(device="cuda").manual_seed(5)
         for t in (m._rec_counts, m._want_phase[0], m._want_phase[1]):
             t.copy_(torch.randint(0, 50, t.shape, generator=gen, device="cuda").double())
-        m._want_mass.copy_(torch.rand(m._want_mass.shape, generator=gen, device="cuda",
+        m._rec_mass.copy_(torch.rand(m._rec_mass.shape, generator=gen, device="cuda",
                                       dtype=torch.float64) * 10)
     return m
 
@@ -44,8 +44,9 @@ def _block(t, seed):
 
 
 def _state(m):
-    return {"counts": m._rec_counts, "mass": m._want_mass, "phase0": m._want_phase[0],
-            "phase1": m._want_phase[1], "miss_tot": m._miss_tot, "miss_phase": m._miss_phase}
+    return {"counts": m._rec_counts, "mass": m._rec_mass, "phase0": m._want_phase[0],
+            "phase1": m._want_phase[1], "miss_tot": m._miss_tot, "miss_phase": m._miss_phase,
+            "miss_mass": m._miss_mass_tot}
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
@@ -59,7 +60,7 @@ class PruneMissFusedTest(unittest.TestCase):
     def _compare(self, ref, got):
         for key, a in _state(ref).items():
             b = _state(got)[key]
-            if key == "mass":
+            if key in ("mass", "miss_mass"):
                 torch.testing.assert_close(b, a, rtol=1e-12, atol=1e-12, msg=key)
             else:
                 self.assertTrue(torch.equal(a, b), key)

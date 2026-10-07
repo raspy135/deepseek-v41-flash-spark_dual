@@ -31,7 +31,7 @@ NUM_WARPS = 4
 
 
 @triton.jit
-def _prune_miss_kernel(LOGITS, SCORES, KEEP, COUNTS, MASS, PHASE, MISS_TOT, MISS_PHASE,
+def _prune_miss_kernel(LOGITS, SCORES, KEEP, COUNTS, MASS, PHASE, MISS_TOT, MISS_PHASE, MISS_MASS,
                        T, E, stride_l, stride_s,
                        K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_E: tl.constexpr):
     # All rows at once as one [BLOCK_T, BLOCK_E] tile: K row-wise argmax passes, not T * K.
@@ -61,6 +61,8 @@ def _prune_miss_kernel(LOGITS, SCORES, KEEP, COUNTS, MASS, PHASE, MISS_TOT, MISS
     tl.store(MISS_TOT + 1, tl.load(MISS_TOT + 1) + slots)
     tl.store(MISS_PHASE, tl.load(MISS_PHASE) + missed)
     tl.store(MISS_PHASE + 1, tl.load(MISS_PHASE + 1) + slots)
+    tl.store(MISS_MASS, tl.load(MISS_MASS) + tl.sum(tl.where(keep == 0, mass, 0.0), axis=0))
+    tl.store(MISS_MASS + 1, tl.load(MISS_MASS + 1) + tl.sum(mass, axis=0))
 
 
 def supported(logits: torch.Tensor, scores: torch.Tensor, keep_mask: torch.Tensor) -> bool:
@@ -72,15 +74,15 @@ def supported(logits: torch.Tensor, scores: torch.Tensor, keep_mask: torch.Tenso
             and keep_mask.numel() == logits.size(1))
 
 
-def record(logits, scores, keep_mask, k: int, counts, mass, phase, miss_tot, miss_phase):
+def record(logits, scores, keep_mask, k: int, counts, mass, phase, miss_tot, miss_phase, miss_mass):
     """Accumulate one block: `counts`/`mass`/`phase` are this layer's [E] float64 rows,
     `miss_tot`/`miss_phase` its [2] float64 (missed, slots) rows. All updated in place."""
     T, E = logits.shape
-    for t in (counts, mass, phase, miss_tot, miss_phase):
+    for t in (counts, mass, phase, miss_tot, miss_phase, miss_mass):
         assert t.dtype == torch.float64 and t.is_contiguous() and t.device == logits.device
     assert counts.numel() == mass.numel() == phase.numel() == E and 0 < k <= E
     _prune_miss_kernel[(1,)](logits, scores, keep_mask.view(torch.uint8),
-                             counts, mass, phase, miss_tot, miss_phase,
+                             counts, mass, phase, miss_tot, miss_phase, miss_mass,
                              T, E, logits.stride(0), scores.stride(0),
                              K=k, BLOCK_T=max(2, triton.next_power_of_2(T)),
                              BLOCK_E=triton.next_power_of_2(E), num_warps=NUM_WARPS)

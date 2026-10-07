@@ -929,7 +929,7 @@ def engram_forward(h: torch.Tensor, rows: torch.Tensor, ew: EngramWeights, args:
 
 # ----------------------------------------------------------------------------- block
 def block_forward(st: SeqState, w: LayerWeights, experts: ExpertLoader, args: Args, expert_cache: dict,
-                  record=None):
+                  record=None, record_norms=None):
     """One backbone block over one sequence. `record(indices, weights, scores)` receives the router output.
     `expert_cache` maps expert id -> (w1,w2,w3) for experts already dequantized in this layer."""
     x = st.h
@@ -949,12 +949,18 @@ def block_forward(st: SeqState, w: LayerWeights, experts: ExpertLoader, args: Ar
     if record is not None:
         record(indices, weights, scores)
     out = torch.zeros_like(y, dtype=torch.float32)
+    norms = torch.zeros_like(weights, dtype=torch.float32) if record_norms is not None else None
     for e in torch.unique(indices).tolist():
         if e not in expert_cache:
             expert_cache[e] = experts(e)
         w1, w2, w3 = expert_cache[e]
         idx, top = torch.where(indices == e)
-        out[idx] += expert_ffn(y[idx], w1, w2, w3, args.swiglu_limit, weights[idx, top, None]).float()
+        contrib = expert_ffn(y[idx], w1, w2, w3, args.swiglu_limit, weights[idx, top, None]).float()
+        out[idx] += contrib
+        if norms is not None:
+            norms[idx, top] = contrib.norm(dim=-1) / weights[idx, top].clamp_min(1e-20)
+    if record_norms is not None:
+        record_norms(norms)
     out += expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, args.swiglu_limit).float()
     y = out.to(y.dtype)
 

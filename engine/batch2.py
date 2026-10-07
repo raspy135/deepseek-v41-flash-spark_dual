@@ -104,7 +104,8 @@ class Batch2FastDecoder:
         counters = {}
         for lane in self.lanes:
             values = [getattr(lane.m, name, None) for name in
-                      ('_want_counts', '_want_mass', '_req_counts', '_miss_tot', '_miss_phase')]
+                      ('_want_counts', '_want_mass', '_req_counts', '_req_mass',
+                       '_miss_tot', '_miss_phase', '_miss_mass_tot')]
             values.extend(lane.m._want_phase or [])
             values.extend((lane.rs_hits, lane.rs_uniq))
             for value in values:

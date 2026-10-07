@@ -92,6 +92,18 @@ class AdaptConfigTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=env):
                 resolve(env)
 
+    def test_score_metric_is_validated_guarded_and_has_separate_default_history(self):
+        c = resolve({"DSV41_ADAPT_SENSITIVITY": "high", "DSV41_PRUNE_METRIC": "score"})
+        self.assertEqual(c.metric, "score")
+        self.assertEqual(c.db_path, "results/prune_demand_req_score.npz")
+        self.assertEqual(c.boot_fields()['prune_metric'], 'score')
+        self.assertEqual(c.boot_fields()['prune_score_history_version'], 2)
+        c = resolve({"DSV41_PRUNE_METRIC": "score"})
+        self.assertTrue(c.record)
+        self.assertEqual(c.db_path, "results/prune_demand_score.npz")
+        with self.assertRaises(ValueError):
+            resolve({"DSV41_PRUNE_METRIC": "saliency"})
+
 
 if __name__ == "__main__":
     unittest.main()

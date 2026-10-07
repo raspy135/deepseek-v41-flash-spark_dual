@@ -6,6 +6,7 @@ two-lane TP scheduler batches independent speculative verification steps.
 
 Endpoints
     GET  /health
+    GET  /expert-map           GET /v1/expert-map
     GET  /v1/models            GET /v1/models/{id}
     POST /v1/chat/completions  (stream and non-stream, tools, reasoning)
     POST /v1/completions       (raw prompt, stream and non-stream)
@@ -105,6 +106,13 @@ class Tok:
 
     def decode(self, ids: List[int]) -> str:
         return self._tk.decode(ids, skip_special_tokens=False)
+
+    def encode_with_offsets(self, text):
+        if self.backend == 'tokenizers':
+            encoded = self._tk.encode(text, add_special_tokens=False)
+            return encoded.ids, encoded.offsets
+        encoded = self._tk(text, add_special_tokens=False, return_offsets_mapping=True)
+        return encoded['input_ids'], encoded['offset_mapping']
 
     def token_to_id(self, token: str) -> Optional[int]:
         if self.backend == "tokenizers":
@@ -286,7 +294,7 @@ def _log_prompt(prompt, ids, thinking, effort):
 
 
 def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
-                      effort: int, engine=None) -> Tuple[str, List[int], Optional[List[dict]], Optional[tuple]]:
+                      effort: int, engine=None, focus_out=None) -> Tuple[str, List[int], Optional[List[dict]], Optional[tuple]]:
     """Render a chat request. The third element is the tool list as the *model* sees it
     (namespaces folded into the names), which is what a tool grammar has to be built from; the
     fourth is (token_types, image_inputs) when the request carries images, else None.
@@ -332,7 +340,7 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
 
     try:
         prompt, media = enc.encode_messages(
-            messages,
+            copy.deepcopy(messages),
             thinking_mode="thinking" if thinking else "chat",
             reasoning_effort=effort,
             return_multi_modal_data=True,
@@ -349,13 +357,33 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
         except Exception as e:  # noqa: BLE001 - the encoder already accepted these
             log.warning("cannot normalise the tool list for the grammar: %s", e)
     images = media.get("images")
+    if images and focus_out is not None and getattr(engine, 'user_prompt_stream', False):
+        raise APIError(400, 'latest-user streaming currently requires text-only input', param='messages')
     if images and engine is not None and getattr(engine, "vision", None) is not None:
         try:
             ids, types, imgs = engine.prepare_vl(prompt, images)
         except Exception as e:  # noqa: BLE001
             raise APIError(400, f"cannot process image inputs: {e}", param="messages")
         return prompt, ids, rendered, (types, imgs)
-    return prompt, tok.encode(prompt), rendered, None
+    ids = tok.encode(prompt)
+    if focus_out is not None and getattr(engine, 'user_prompt_stream', False):
+        from server.latest_user import latest_user_ranges
+        # Image expansion changes token offsets; this text-only prototype fails
+        # closed for VL instead of assigning image/tool rows to the user question.
+        if images:
+            raise APIError(400, 'latest-user streaming currently requires text-only input', param='messages')
+        try:
+            offset_ids, offsets = tok.encode_with_offsets(prompt)
+            if offset_ids != ids:
+                raise ValueError('tokenizer offsets differ from model token IDs')
+            def render_marked(marked):
+                return enc.encode_messages(copy.deepcopy(marked),
+                    thinking_mode='thinking' if thinking else 'chat', reasoning_effort=effort,
+                    return_multi_modal_data=True)[0]
+            focus_out['ranges'] = latest_user_ranges(messages, render_marked, prompt, offsets)
+        except Exception as exc:
+            raise APIError(400, f'cannot locate latest user text: {type(exc).__name__}', param='messages')
+    return prompt, ids, rendered, None
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +647,8 @@ class State:
 
     def generate(self, prompt_ids: List[int], sampling: dict, *, thinking: bool,
                  detect_tool_calls: bool, result: GenerationResult,
-                 tools: Optional[List[dict]] = None, vl: Optional[tuple] = None) -> Iterator[Tuple[str, str]]:
+                 tools: Optional[List[dict]] = None, vl: Optional[tuple] = None,
+                 user_prompt_ranges=None) -> Iterator[Tuple[str, str]]:
         """Drive the engine; yield (kind, text) events; fill ``result`` at the end.
 
         The caller holds ``request_context()``. With concurrency enabled, only
@@ -649,6 +678,8 @@ class State:
 
         gen_kwargs = dict(max_tokens=max_tokens, temperature=sampling["temperature"],
                           top_p=sampling["top_p"], stop_token_ids=stop_ids, seed=sampling["seed"])
+        if getattr(self.engine, 'user_prompt_stream', False):
+            gen_kwargs['user_prompt_ranges'] = user_prompt_ranges or []
         pen = None
         if getattr(self.engine, "supports_penalties", False):
             from engine.v41_engine import Penalties
@@ -964,15 +995,20 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.state  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if (self.command == 'GET' and self.path.split('?', 1)[0].rstrip('/') == '/v1/expert-map'
+                and len(args) > 1 and str(args[1]) == '200'):
+            return  # one-second observer polls must not bury generation/adaptation logs
         log.info("%s %s", self.address_string(), fmt % args)
 
     # -- plumbing ----------------------------------------------------------
-    def _send_json(self, status: int, obj: Any) -> None:
+    def _send_json(self, status: int, obj: Any, *, cache_control=None) -> None:
         data = _json_bytes(obj)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        if cache_control is not None:
+            self.send_header('Cache-Control', cache_control)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1030,7 +1066,22 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         st = self.state
         try:
-            if path == "/health":
+            if path == "/expert-map":
+                with open(os.path.join(HERE, 'expert_map.html'), 'rb') as page:
+                    data = page.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            elif path == "/v1/expert-map":
+                from server.expert_map import snapshot
+                body = snapshot(st.engine, busy=st.lock.locked(), fault=st.ep_fault, model=st.model_name)
+                if body is None:
+                    raise APIError(501, 'Expert map requires the native v41 engine')
+                self._send_json(200, body, cache_control='no-store')
+            elif path == "/health":
                 body = {"status": "degraded" if st.ep_fault else "ok",
                         "model": st.model_name, "engine": st.args.engine,
                         "busy": st.lock.locked(), "max_context": st.engine.max_context,
@@ -1104,7 +1155,8 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         sampling = parse_sampling(body)
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
-        _prompt, prompt_ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine)
+        focus = {}
+        _prompt, prompt_ids, tools, vl = build_chat_prompt(body, st.enc, st.tok, thinking, effort, st.engine, focus)
         _log_prompt(_prompt, prompt_ids, thinking, effort)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
@@ -1122,7 +1174,7 @@ class Handler(BaseHTTPRequestHandler):
         with st.request_context():
             if not stream:
                 for _ in st.generate(prompt_ids, sampling, thinking=thinking, detect_tool_calls=True, vl=vl,
-                                     result=result, tools=tools):
+                                     result=result, tools=tools, user_prompt_ranges=focus.get('ranges')):
                     pass
                 router = result.router
                 message: Dict[str, Any] = {"role": "assistant", "content": router.content}
@@ -1148,7 +1200,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._sse(chunk({"role": "assistant", "content": ""}))
                 for kind, text in st.generate(prompt_ids, sampling, thinking=thinking, vl=vl,
-                                              detect_tool_calls=True, result=result, tools=tools):
+                                              detect_tool_calls=True, result=result, tools=tools,
+                                              user_prompt_ranges=focus.get('ranges')):
                     self._sse(chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text}))
                 if result.tool_calls:
                     self._sse(chunk({"tool_calls": [dict(tc, index=i) for i, tc in enumerate(result.tool_calls)]}))

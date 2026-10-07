@@ -464,7 +464,7 @@ class Model:
         self.vision = None       # engine.vision.VisionTower, set by the engine when enabled
         self.image_mask = self.engram_mask = None
         self._want_counts = self._want_mass = self._miss_tot = None  # DSV41_PRUNE_MISS accumulators
-        self._req_counts = None  # reset/flush are also called when demand logging is disabled
+        self._req_counts = self._req_mass = None  # also accessed when demand logging is disabled
         self._want_phase = self._miss_phase = None   # same, split prefill vs decode
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
@@ -862,8 +862,9 @@ class Model:
             from engine import prune_miss_fused as PMF
             if PMF.supported(logits, scores, keep_mask):
                 self.alloc_prune_miss(logits.size(-1), logits.device)
-                PMF.record(logits, scores, keep_mask, k, self._rec_counts[L], self._want_mass[L],
-                           self._want_phase[d][L], self._miss_tot[L], self._miss_phase[d])
+                PMF.record(logits, scores, keep_mask, k, self._rec_counts[L], self._rec_mass[L],
+                           self._want_phase[d][L], self._miss_tot[L], self._miss_phase[d],
+                           self._miss_mass_tot[L])
                 return
         want = logits.topk(k, dim=-1)[1]                       # [T, k] an unpruned router's picks
         self.alloc_prune_miss(logits.size(-1), logits.device)
@@ -872,7 +873,7 @@ class Model:
         sc = scores.gather(1, want).double().reshape(-1)
         self._rec_counts[L].scatter_add_(0, flat, ones)
         # score mass: being denied a high-scoring expert costs more than a marginal one
-        self._want_mass[L].scatter_add_(0, flat, sc)
+        self._rec_mass[L].scatter_add_(0, flat, sc)
         # Split by phase. The prompt shows the router ~18x more expert choices than the
         # generation does, so a combined history is ~95% prefill -- yet output quality depends on
         # DECODE routing. Whether one predicts the other decides both how to weight this database
@@ -883,6 +884,8 @@ class Model:
         self._miss_tot[L, 1] += miss.numel()
         self._miss_phase[d, 0] += miss.sum()
         self._miss_phase[d, 1] += miss.numel()
+        self._miss_mass_tot[L, 0] += (miss.reshape(-1) * sc).sum()
+        self._miss_mass_tot[L, 1] += sc.sum()
 
     def alloc_prune_miss(self, n_experts: int, device):
         """Allocate the accumulators eagerly. The decode path records inside a captured CUDA
@@ -893,6 +896,7 @@ class Model:
             self._want_counts = z(self.args.n_layers, n_experts)
             self._want_mass = z(self.args.n_layers, n_experts)
             self._miss_tot = z(self.args.n_layers, 2)
+            self._miss_mass_tot = z(self.args.n_layers, 2)
             self._want_phase = [z(self.args.n_layers, n_experts), z(self.args.n_layers, n_experts)]
             self._miss_phase = z(2, 2)
             # Where _record_prune_miss writes. In request mode the live request accumulates here
@@ -900,7 +904,9 @@ class Model:
             # database. The captured decode graph holds the chosen tensor's address, so this is
             # fixed for the process lifetime.
             self._req_counts = z(self.args.n_layers, n_experts)
+            self._req_mass = z(self.args.n_layers, n_experts)
             self._rec_counts = self._req_counts if PRUNE_UNIT_REQUEST else self._want_counts
+            self._rec_mass = self._req_mass if PRUNE_UNIT_REQUEST else self._want_mass
 
     def decay_demand(self, factor: float):
         """Scale recorded demand down, in place, so old evidence fades.
@@ -919,6 +925,7 @@ class Model:
         """Zero the per-request accumulator at request start (request-unit mode)."""
         if PRUNE_UNIT_REQUEST and self._req_counts is not None:
             self._req_counts.zero_()
+            self._req_mass.zero_()
 
     def flush_request_demand(self, halflife_requests: float) -> int:
         """Fold this request in as ONE vote, then age the database by one request.
@@ -935,12 +942,20 @@ class Model:
                  if halflife_requests and halflife_requests > 0 else 1.0)
         self._want_counts.mul_(decay)
         self._want_mass.mul_(decay)
+        # Normalize score votes on device; a Python `if score_total > 0` per layer would add
+        # forty blocking device readbacks at every prefill boundary and request end.
+        score_tot = self._req_mass.sum(dim=1, keepdim=True)
+        self._want_mass.add_(self._req_mass / score_tot.clamp_min(1e-20))
         tot = self._req_counts.sum(dim=1)
         folded = 0
         for L in torch.nonzero(tot > 0).flatten().tolist():
             self._want_counts[L].add_(self._req_counts[L] / tot[L])
+            # Scores need their OWN request accumulator and normalization. Previously raw
+            # scores went straight into history, then flush decayed the new observation too
+            # and never normalized it. That history cannot seed score-based ranking.
             folded += 1
         self._req_counts.zero_()
+        self._req_mass.zero_()
         return folded
 
     def load_demand(self, counts, mass):
@@ -956,6 +971,7 @@ class Model:
         tot = self._miss_tot.cpu()
         counts = self._want_counts.cpu()
         mass = self._want_mass.cpu()
+        score_missed, score_total = self.miss_mass_snapshot()
         missed, slots = float(tot[:, 0].sum()), float(tot[:, 1].sum())
         per_layer = (tot[:, 0] / tot[:, 1].clamp_min(1)).tolist()
         worst = sorted(range(len(per_layer)), key=lambda L: -per_layer[L])[:5]
@@ -977,6 +993,7 @@ class Model:
         return {
             "phase": ph,
             "miss_rate": round(missed / max(slots, 1.0), 4),
+            "score_miss_rate": round(score_missed / max(score_total, 1e-20), 6),
             "missed_slots": int(missed), "total_slots": int(slots),
             "distinct_experts_wanted": int((counts > 0).sum()),
             "worst_layers": [{"layer": L, "miss_rate": round(per_layer[L], 4)} for L in worst],
@@ -1000,6 +1017,12 @@ class Model:
             return None
         return tuple(self._miss_phase[1].tolist())
 
+    def miss_mass_snapshot(self):
+        """Cumulative pre-mask router score denied by pruning / total requested score."""
+        if self._want_counts is None:
+            return None
+        return tuple(self._miss_mass_tot.sum(dim=0).tolist())
+
     def reset_prune_miss(self):
         self._want_counts = self._want_mass = self._miss_tot = None
 
@@ -1020,7 +1043,24 @@ class Model:
         else:
             logits = scores + w.gate_bias
         pm = getattr(self, "prune_mask", None)
+        streaming = n_experts != 128 and L in getattr(self, 'stream_layers', ())
+        focus = getattr(self, 'user_prompt', None)
+        focus_rows = (focus.row_mask(self._moe_start, y.size(0))
+                      if prefill and n_experts != 128 and focus is not None else None)
+        streaming = streaming or focus_rows is not None
+        rescued = []
         if pm is not None and n_experts != 128 and L in pm:
+            focus_keep = (focus.streaming_keep(L, logits, scores, focus_rows, pm[L], k, store)
+                          if focus_rows is not None else None)
+            effective_keep = (torch.where(focus_rows[:, None], focus_keep[None, :], pm[L][None, :])
+                              if focus_rows is not None else
+                              self.stream_keep[L] if streaming else pm[L])
+            critical = getattr(self, 'critical_stream', None)
+            if prefill and critical is not None and critical.enabled:
+                rescued = critical.plan(L, logits, scores, pm[L], k, store.ep)
+                if rescued:
+                    effective_keep = pm[L].clone()
+                    effective_keep[rescued] = True
             # What the router WANTED before pruning masked it. The prune set is ranked from a
             # traced corpus (coding + general), so on traffic unlike that corpus the router keeps
             # asking for experts that are not there -- and nothing downstream can see it, because
@@ -1030,9 +1070,12 @@ class Model:
             # same shape as the coverage histogram the prune set is built from, so a run over real
             # traffic can re-rank it. Off by default: it costs a second topk per layer.
             if PRUNE_MISS:
-                self._record_prune_miss(logits, scores, pm[L], L, k)
+                # In mixed-row streaming, this reports *resident* demand/misses;
+                # the focus collector separately reports the rows served in full.
+                self._record_prune_miss(logits, scores,
+                                        pm[L] if focus_rows is not None else effective_keep, L, k)
             # expert pruning experiment: the router may only pick surviving experts (REAP-style drop)
-            logits = logits.masked_fill(~pm[L], float("-inf"))
+            logits = logits.masked_fill(~effective_keep, float("-inf"))
         indices = logits.topk(k, dim=-1)[1]
         probe = getattr(self, "prefill_replica_counts", None)
         if prefill and n_experts != 128 and probe is not None:
@@ -1040,6 +1083,8 @@ class Model:
             probe[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+        if focus_rows is not None:
+            focus.record(L, indices, weights / a.route_scale, focus_rows)
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
         t0 = time.perf_counter()
         # All-resident configurations carry a device slot table (built by the engine from the
@@ -1053,17 +1098,36 @@ class Model:
         # refuses to build it under expert parallel for exactly that reason; the assert is the
         # backstop, because the failure mode is silent wrong slots, not an error.
         lut = getattr(self, "slot_lut", None)
+        sector_stream = streaming and focus is not None and getattr(focus, 'dynamic', False)
         replica_lut = getattr(self, "prefill_replica_lut", None) if prefill else None
         if replica_lut is not None and n_experts != 128:
             lut = replica_lut
-        if lut is not None and n_experts != 128:
+        if sector_stream:
+            try:
+                from engine.global_residency import streaming_moe
+                routed = streaming_moe(self, y, indices, weights, L, store, arena)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                os._exit(1)  # a failed TP load/plan must not leave its peer serving
+        elif lut is not None and n_experts != 128 and not rescued and not streaming:
             # EP2-safe: build_lut fills non-owned entries with the null slot rather than -1, and
             # validates that once at construction -- checking it here would be a device->host sync
             # per layer per chunk, which is the cost this path exists to remove.
             slots = lut[L][indices]
             self.stats["hits"] = self.stats.get("hits", 0) + indices.numel()
         else:
-            slots = store.resolve(L, indices, prefill)
+            try:
+                # Streaming decode also uses the transient ring. Never evict a resident
+                # whose address is baked into another layer's captured graph.
+                slots = store.resolve(L, indices, prefill or streaming)
+            except Exception:
+                if rescued or streaming:
+                    # After the common plan, a one-rank load failure must stop the pair.
+                    import traceback
+                    traceback.print_exc()
+                    os._exit(1)
+                raise
         # EP2 combine: an ExpertStore with a null slot is by construction an ep-enabled main model
         # store (the DSpark drafter runs on a FixedStore and never has one), and its `routed` holds
         # only THIS rank's owned subset -- zeros everywhere else. One fp32 all-reduce makes both
@@ -1078,12 +1142,20 @@ class Model:
         # remains is purely the REGROUPED fp32 addition engine/dist.py documents.
         ep_work = None
         ep_overlap = False
-        if getattr(store, "null_slot", None) is not None:
+        if getattr(store, "null_slot", None) is not None and not sector_stream:
             route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
+            if streaming:
+                route = None  # static compact IDs do not include nonresident experts
             replica_routes = getattr(self, "prefill_replica_routes", None) if prefill else None
             if replica_routes is not None:
                 route = replica_routes.get(L)
             route_args = {}
+            if rescued:
+                # Static compact IDs omit pruned experts. Rebuild only this call's routing;
+                # the resident LUT, weights and captured decode graphs stay intact.
+                slot_map, inverse = torch.unique(slots, sorted=True, return_inverse=True)
+                route_args.update(routing_ids=inverse, routing_slot_map=slot_map)
+                route = None  # the static route[0][expert_id] lookup does not apply here
             if moe_timer is not None:
                 route_args['stage_mark'] = moe_timer.mark
             if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
@@ -1118,7 +1190,7 @@ class Model:
                 _mark("ep_combine")
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
             self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
-        else:
+        elif not sector_stream:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
@@ -1156,6 +1228,7 @@ class Model:
             # encoder/decoder outputs must outlive staging for replay/prefix caches.
             retain = L in (a.candidate_source_layer, a.n_layers - 1)
             return graphs.run(h, attn_pre, w, L, store, arena, n_experts, retain=retain)
+        self._moe_start = S  # Absolute row position, including bounded decoder replay.
         return self._ffn(h, attn_pre, w, L, prefill, store, arena, n_experts)
 
     def _ffn(self, h, attn_pre, w, L, prefill, store, arena, n_experts):

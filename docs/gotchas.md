@@ -1105,3 +1105,395 @@ previously qualified acceptance-based 3/5 controller for a baseline comparison;
 do not dismiss this scheduling problem as sampling temperature alone. A fix that
 skips an expensive intermediate width must still use only the already-included
 proposal prefix, with exact sampled-distribution tests and a new boot-guard version.
+
+## Router-score history must use the same units as request counts
+
+The original request-unit recorder accumulated raw router scores directly into
+`_want_mass`, then decayed that column at request flush without adding a normalized
+request distribution. Its counts were a request EWMA; its scores were not. Feeding
+that score column into placement would silently give long prompts more influence
+and decay the newest evidence immediately. Do not retrofit score ranking onto an
+old request database by simply reading its `mass` field.
+
+Score-history version 2 records scores into a private request buffer, normalizes
+each layer at demand fold, and then adds the observation to aged history. Graph
+warmup must restore these buffers as well as counts and miss counters; compiler
+warmup is not workload evidence. The fused GPU recorder is checked against the
+torch recorder and CUDA graph replay. Frequency mode preserves legacy request
+counts but discards the incompatible score column; score mode starts fresh.
+
+`DSV41_PRUNE_METRIC=score` measures the raw positive router score of the unmasked
+top-k picks, excluding selection bias. It does not measure expert output norms
+or establish that a rarer expert is essential to a task. Selection misses and
+score-weighted misses are both reported. Retention is still a quality tradeoff;
+neither miss statistic substitutes for held-out answer quality.
+
+### A router miss is not a quality loss; selective rescue needs better evidence
+
+2026-10-05: on identical saved history, frequency and score masks differed by 257
+of 9,400 resident experts. Frequency missed 13.36% of wanted slots; score missed
+13.99%. All 14 held-out MMLU-Pro answer letters were identical (9/14 correct).
+Do not present a lower missing rate as a quality improvement.
+
+A bounded prefill rescue prototype used calibrated gate-weight times expected
+expert-output norm, emphasizing the largest per-token share rather than frequency.
+Its small 0–3-layer profile rescued nine layer/expert events with five NVMe expert
+reads, but the same answers remained 9/14. It stays off. Norm magnitude is not
+causal answer importance; sparse/unseen experts and late-layer sensitivity need
+more evidence. Prefix persistence/caching and prefill graphs are unsupported
+while it is enabled. See [critical-prefill.md](critical-prefill.md).
+
+Confidence depth gave +15.0% code decode throughput with identical outputs in two
+128-token trials, but prose lost 2.4%; do not infer a universal speedup.
+
+The calibration helper previously failed for `engram_rows.py --layers 1` because
+it indexed all configured Engram layers into a subset result dict, and imported
+the HTTP requests library even with local shards. Both are corrected; the pilot
+read local rows with networking disabled and fetched no model files.
+
+## Layer position alone is not a retention score
+
+On the 2026-10-06 frozen 14-question diagnostic, giving the first and last five
+layers 330 experts each at the same 9,400-slot budget recovered a pruning-sensitive
+math answer but broke a previously correct biology answer. Both uniform and this
+edge allocation scored 9/14; unrestricted native routing scored 11/14. The early/
+late hypothesis is worth isolating, but this measured edge allocation is not a
+quality win. See RESULTS.md and `results/expert-tuning-20261005/` for the protocol.
+
+## A zero decode step counter does not prove decode was skipped
+
+The generation loop exits on an emitted stop token before incrementing `steps`.
+An answer-letter request can therefore report `steps=0` after running a complete
+verification graph. Use completion length, decode timing, graph/resolve activity,
+and a multi-token generation when qualifying a new decode path.
+
+## A passing layer subset can miss new pruning-sensitive cases
+
+Streaming 3–7 and 15–19 recovered two selected failures (11/14 versus 9/14), but
+on separate questions it was identical to resident routing (9/14). Full routing
+scored 12/14 on the separate set, recovering three other cases. The subset was
+therefore insufficient outside its selection cases. Do not promote a post-hoc
+layer policy based on those two recoveries, or interpret a harmless individual
+layer ablation as proof that several layers can be pruned together.
+
+The same subset made a short 39-token counting request take 2.184 s versus
+1.219 s resident, medians of two trials after warmup. Immediate loading fixes the
+timing of expert rescue; it does not remove its host synchronization and IO cost.
+All experimental streaming flags remain disabled in the normal service.
+
+## The author's broad topic profiles are not a demonstrated quality default
+
+2026-10-06: the pinned 39-topic database and maxmin ranker were ported exactly,
+with native FP4 TP2, the same 9,400 experts / 235 per layer and 90.1 GB arena.
+Fixed frequency/maxmin changed 3,085 resident IDs versus a frozen current-history
+baseline, gained business and law answers (10/14 versus 8/14), but scored 9/14
+versus 12/14 on separate questions. It lost engineering and health answers and
+ignored the one-letter instruction on chemistry, which counts as a failed
+response. The partial test and remaining-only continuation are retained; no
+question was retried or given a larger token limit. Saliency/maxmin changed
+3,036 IDs and tied the first baseline at 8/14, gaining business but losing biology.
+Do not select a default from the first-set gain or assume saliency is superior.
+
+Frequency/maxmin's first-set raw miss rate was **27.19%**, versus **13.89%** for
+the baseline, despite its two extra correct answers. Lower miss rate and greater
+output magnitude are both incomplete proxies for answer quality. The traces
+measure frequency or accumulated contribution norms, not causal task importance.
+
+`maxmin` returns synthetic admission priorities above 1 for selected experts;
+rejected experts receive scores below 1. Feeding those numbers into the adaptive
+router-score blender or swap planner mixes incompatible units and can destroy
+the topic balance. Fixed profiles therefore reject demand blending and every
+swap trigger, set the adaptive prior to unavailable in memory, and guard the
+source/ranker/topics/database/actual initial expert IDs across TP2 ranks.
+Defaults retain the original adaptive path. See [expert-profiles.md](expert-profiles.md).
+
+Exploratory 128-token timing also did not show a universal gain: frequency/maxmin
+code request median was 3.996 s versus 3.234 s baseline, while prose was 5.894 s
+versus 6.895 s (two measured trials after warmup). Outputs differed and were
+token-limited; these are throughput probes, not passing code-quality tests.
+Evidence: `results/expert-profile-20261006/summary.json` and `RESULTS.md`.
+
+## Mia's 2-bit layer allocation is a clue, not a proven pruning budget
+
+2026-10-06: local EXL3 metadata assigns all 1,152 routed matrices per layer in
+18–22 two bits, with three bits in the other 35 backbone layers. Tested one
+preselected **0.8 priority factor** for those five layers at the same 9,400-slot
+TP2 budget: 193 residents in 18–22 and 241 elsewhere, versus 235 everywhere.
+The existing score-history seed and ranking within each layer stayed identical;
+all swaps and prefix reuse were off. Multiplying layer scores under uniform
+235-per-layer selection would not change any expert IDs, so this was a budget
+redistribution using the existing guarded layer-count mechanism.
+
+The candidate scored **7/14 versus 8/14** on fresh seed 20261010, losing law
+1501. On five prior pruning-sensitive probes it scored **3/5 versus 2/5**,
+recovering history 5003. Both totals were 10/19; every response was valid.
+Engineering 12071 changed between wrong answers. The current-history baseline
+already recovered math and business compared with older snapshots, so old
+baseline scores cannot be reused for this comparison. Retain the uniform default.
+This rejects this particular discount under the predeclared rule, not every
+possible bit-informed allocation. No weights changed, no streaming was enabled,
+and no model data was downloaded. Records: `results/mia-layer-priority-20261006/`.
+
+## Extract the actual last user before chat templating
+
+The checkpoint encoder merges tool results into user-format content blocks and
+treats mid-conversation system messages as user-like for template purposes.
+Searching the rendered prompt for the last User delimiter therefore includes
+inputs that are not the user's typed question. Read the original request's last
+`role=user` instead, before any role normalization or tool merging.
+
+`server/latest_user.py` selects only explicit text in that one message, excludes
+older/system/developer/assistant/tool/reminder/search messages and structured
+attachments, and never falls back to an older question when the latest user
+message is empty or attachment-only. It neither mutates model input nor logs or
+persists user text. Tests cover identity, nontext blocks, native tool-result
+blocks, empty inputs, Unicode/spacing and nonmutation. Plain-text documents
+bundled into the same text field need a client-provided boundary; their origin
+cannot be inferred reliably from message roles alone.
+
+`DSV41_USER_PROMPT_STREAM=1` now carries verified token ranges in the shared TP2
+request payload. Private markers identify the original fields in a temporary
+rendering; removing them must reproduce the actual input exactly. Token offsets
+exclude tokens mixed with template text. Markers never reach the model. The
+conversation remains available for attention, while only those user rows use
+full MoE routing during prefill and contribute to the temporary priority buffer.
+The normal bounded decoder replay remains enabled: upper-layer evidence covers
+only the retained sliding-window tail on a prompt longer than that window.
+
+At prefill completion rank 0 broadcasts an unconditional admission plan on both
+ranks, including empty/no-user requests. Normalized gate-score mass ranks used
+experts ahead of historical demand. Admissions preserve every layer quota;
+overflow is resolved by score with expert ID as a deterministic tie break.
+Admitted experts are protected from all adaptive eviction paths through the
+response and idle maintenance, until the next request replaces the protection.
+The temporary scores are not inserted into the persistent demand database.
+Decode uses the existing resident graphs and LUTs; no decode streaming is added.
+Admission must also precede the state used to sample the first answer. Version
+1 admitted after prefill logits had already been computed: its first token did
+not benefit from the selected residents. It scored 10/14 on the small paired
+set versus 11/14 for both frozen controls. Refreshing only the upper decoder
+tail would leave encoder KV and the assistant cue computed under the old mask.
+Version 2 therefore rebuilds the prompt once in resident mode after admission,
+with priority collection and ordinary demand recording paused. This applies
+the new keep set throughout the first-answer computation. It costs an extra
+resident prefill and requires bounded replay; it does not stream decode or
+count the request twice. `first_logits_refreshed` and `refresh_s` expose it.
+Regular history/miss telemetry covers discovery and decode; the resident
+rebuild does not add another vote. Mixed-row discovery reports resident
+coverage, so a reported miss is not necessarily a dropped user prefill
+contribution. See the separate `user_prompt` scope/row counters.
+
+This prototype requires text-only inputs, concurrency 1, native FP4 output TP,
+resident LUTs, `PRUNE_MISS=1`, no replicas/calibrated rescue/layer streaming,
+and prefix/cache-response/prefill graphs disabled. The transient ring must fit
+all cold experts in one layer, including a long prompt selecting every expert.
+At the same 9,400 resident budget, the 5% discount allocates 225 to layers 18–22,
+237 to layers 0–14 and 236 to the other layers. A 160-slot ring fits inside the
+90.1 GB arena (9,423 resident-capable slots). Boot guards cover the flag and
+policy version. Streaming, cold NVMe reads and resident promotions add latency;
+quality and latency measurements belong to the paired trial, not the helper.
+
+The 2026-10-06 light paired trial (seed 20261011, 14 direct-letter MMLU-Pro
+questions, same immutable score-history seed and 90.1 GB arena) scored 11/14
+with uniform quotas, 11/14 with the 5% discount alone (identical answers), and
+12/14 with version 2 prompt admission plus discount. The final policy recovered
+business q671 and psychology q2367, but lost engineering q11754. All responses
+were valid. Version 1's 10/14 result and the benchmark's initial incorrect
+all-layers/all-tokens scope assertion are retained alongside the corrected
+window-aware check; no question was retried to replace an answer.
+
+This is a small net gain, not proof of general quality improvement. Mean short
+question wall times were 1.53 s baseline and 8.66 s final policy, including one
+cold graph warmup per arm. A separate three-run counting workload (one warmup,
+two measured) averaged 1.47 s baseline vs 2.89 s final; prefill averaged 0.408
+vs 1.869 s, decode 0.985 vs 0.952 s. Japanese conversion, counting, seven Python
+RLE cases, and exact no-admission rebuild logits at 6 and 426 tokens passed.
+The feature stays an explicit pilot: it trades prompt latency for retention,
+turns prefix/response caching off, and does not guarantee that prefill score
+mass identifies the most important experts for every later decode token.
+Protocol, all responses, rejected version, timings and launch settings are in
+`results/user-prompt-priority-20261006/`.
+
+## Fixed layer quotas constrain an otherwise shared expert arena
+
+The store already has sectors (`arena` slots) and directories (`lru`,
+`slot_key`, and the GPU LUT). Each TP2 sector stores a 9,400,320-byte half
+expert. Fixed quotas came from selection and the within-layer swap planner,
+not a separate physical arena per layer. Compact prefill maps also assumed
+unchanging per-layer cardinalities: updating only the decode LUT cannot safely
+grow a layer's resident set. Cross-layer transfers rebuild those eager prefill
+maps and update the decode LUT and masks in place. Total occupancy is preserved.
+
+`DSV41_DYNAMIC_EXPERTS=1` uses global normalized demand for startup and global
+normalized latest-user score for admission. Ordinary adaptation can also trade
+sectors across layers. There are no fixed layer counts or discounts; only the
+router's top-k minimum of six residents per layer. The 9,400 resident budget is
+fixed, not the expert identities. A 100-load request budget covers every resident
+transfer, including prefill/decode/end/idle adaptation. Protection resets only
+at the next request. Transient discovery reads are uncapped and counted
+separately; the cap cannot promise at most 100 total weight reads.
+
+The old full-layer transient-capacity check would have imposed a 224-resident
+minimum with a 160-slot ring, undermining dynamic allocation. Streaming now
+batches complete token rows so each batch's unique cold experts fit the ring.
+Rank 0 broadcasts spans on both ranks unconditionally, including a single-batch
+call. Token rows keep every top-k contribution and its sum order. Splitting
+the expert sum instead would add rounding points. A six-token real-weight TP2
+gate with six residents, eight transients and three batches reproduced an
+all-resident MoE exactly on both ranks (max absolute delta 0), leaving the
+resident directory untouched. This validates the tested kernel/shape; it is not
+a quality guarantee for global score-based placement.
+
+The same 14-question exploratory set scored 12/14 with uncapped fixed prompt
+admission, 11/14 with fixed quotas and 100 admissions, and 10/14 with dynamic
+allocation and 100 admissions. Dynamic also removes the 5% discount, so these
+are whole-policy comparisons. Mean times were 8.659 / 6.338 / 6.998 s, including
+cold graph warmup. The cap lost psychology q2367; dynamic additionally lost
+math q8468. Every answer was valid. Dynamic counting, Japanese conversion,
+seven Python RLE cases and no-admission exact rebuild checks passed. Global
+normalized router mass does not measure an expert's causal importance across
+layers. Preserve these negative results rather than assuming flexibility
+automatically improves quality. The user explicitly requested keeping dynamic
+mode enabled despite the regression; it remains a pilot, not a proven upgrade.
+
+The isolated gate could not initialize another CUDA context alongside the live
+90.1 GB arena (OOM at `torch.cuda.set_device`). It passed during the scheduled
+restart with the serving pair stopped. Do not infer that the apparent free pool
+can accommodate another PyTorch/CUDA process. Artifacts, including that failed
+coexistence attempt, are in `results/dynamic-experts-20261006/`; fixed-cap data
+are in `results/user-prompt-cap-100-20261006/`.
+
+## A resident replacement cap does not bound full discovery
+
+The 2026-10-06 custom-harness incident selected 9,847 latest-user tokens from
+15,434 total tokens and remained in discovery after more than 113 seconds.
+The role selector had not selected the entire conversation. However, a chunk
+containing any selected rows entered the host streaming helper, and cold reads
+for discovery were uncapped. A cap of 100 resident promotions did not cap that
+work. Preserve this failure rather than interpreting the cap as an I/O budget.
+Only aggregate incident metadata was saved.
+
+Prompt streaming is now off by the user's explicit request. Dynamic sector
+allocation is independent of that flag. `UserPrompt.remaining_loads` applies
+the nonzero resident budget even with its streaming/priority feature disabled,
+so normal prefill/decode/end/idle adaptation stays bounded. There is no discovery
+or extra resident priority rebuild in this mode. Two synthetic counting checks
+passed with zero discovery/resolves and 100 total resident replacements each;
+10,014 tokens took 40.465 s of prefill and 41.326 s wall time. The cold 38-token
+check included graph warmup, so its timing is not steady throughput. Ordinary
+routed pruning misses still exist and differ from I/O miss counters. Results
+and settings are in `results/dynamic-resident-20261006/`.
+
+## Dynamic allocation does not require RAM prefix caching off
+
+The blanket dynamic-mode restriction was inherited from latest-user streaming,
+which requires fresh discovery and a post-admission rebuild. With streaming off,
+RAM prefix snapshots contain encoder tensors rather than arena slot pointers.
+Cross-layer compact-map replacement does not invalidate their storage. Dynamic
+policy version 4 permits `DSV41_PREFIX_CACHE=1` in resident mode. Streaming still
+requires it off; disk/response caching and prefill graphs remain disabled in
+this prototype.
+
+This reuses historical KV across expert selection changes, just as the original
+adaptive policy does. It does not recompute old tokens under today's keep mask
+or guarantee equality with a fresh prefill. A snapshot restore must not restore
+old sector directories. The two-rank CPU test checks that property after a
+cross-layer transfer. Live synthetic requests reused 2,289/2,289 tokens and
+2,289/2,329 tokens while generation advanced on every request. Exact-repeat
+prefill was 0.381 s; the initial 13.548 s prefill included graph warmup. All
+returned the expected count and used at most 100 replacements, with streaming
+off and total residency still 9,400. Results are in
+`results/dynamic-prefix-20261006/`.
+
+The live arena directory itself is in memory on each node, not a map file copied
+between hosts. Rank 0 broadcasts startup demand and replacement plans. Both TP2
+ranks build/update matching logical maps and load their half weights locally.
+Only rank 0 writes the demand database; startup broadcasts its ranking and
+history, so a stale or absent peer database is not a separate authority.
+
+## The 100-load limit belongs to streaming, not ordinary adaptation
+
+The user corrected the meaning of the requested limit: at most 100 temporary
+streaming cold expert loads, not 100 resident replacements. Versions 3–5 of
+the prompt policy incorrectly clamped `plan_swaps` and both swap executors with
+a request-wide resident budget. Prefill could consume it completely, leaving
+urgent decode adaptation with an empty plan even when its miss trigger fired.
+The earlier capped-resident measurements remain historical results of that
+wrong policy, not validation of the intended streaming cap.
+
+Prompt policy version 6 removes that coupling. Generic prefill/decode/urgent/
+end/idle adaptation uses its original thresholds and per-pass limits. Only
+latest-user streaming consumes `DSV41_USER_PROMPT_MAX_LOADS`; it is inactive
+with `USER_PROMPT_STREAM=0`. A CPU regression applies 101 real directory
+transfers after exhausting the stream budget, and a controlled urgent decode
+test still produces and applies a nonempty plan.
+
+For bounded streaming, rank 0 selects cold experts by score mass among the
+current user rows' original top-k. Both ranks exchange transient inventories;
+only a hit present on both ranks is free. Each selected cold set fits the ring,
+so it cannot be evicted and re-read within the same call. The plan and logical
+cold-load count are broadcast, and the same budget is consumed on both ranks.
+After exhaustion, later calls return to resident routing without store resolves.
+This is an online budget, so early layers may spend it; it does not forecast
+importance over later layers. The CPU model-plus-real-resolver test verifies
+one actual cold load per rank at cap1 followed by resident-only routing.
+
+Prompt streaming remains off in production. RAM prefix caching and fully
+dynamic allocation remain enabled. `resident_loads_used` is telemetry only;
+`resident_load_cap` is null. The streaming limit and counters have distinct
+`stream_load_*` fields. Urgent loading still requires its normal rolling miss
+threshold and cooldown, so lack of an urgent log by itself is not a failure.
+
+
+### TTS startup beside the native TP2 expert arena
+
+On 2026-10-06, starting Qwen3-TTS after the 88.7 GB native arena was resident
+failed while initializing CUDA (`cudaMemGetInfo` out of memory), even with
+roughly 12–13 GiB MemAvailable. Reclaimable host memory did not guarantee that
+a fresh CUDA context could start. Starting/warming TTS first, then the TP2 pair,
+worked with TTS max-seq-len 3072, arena 88.7 GB and 32 transient slots. All 9,400
+resident experts were retained; a concurrent short text/audio smoke check
+passed. Use that order when restarting both. Do not infer that the reported
+available memory guarantees arbitrary simultaneous long requests. See
+`results/tts-headroom-20261006/` for the failed startup and successful check.
+
+
+### Short TTS coexistence smoke did not establish long-session headroom
+
+The 2026-10-06 88.7 GB/9,400-resident engine plus TTS max-seq-len 3072 passed
+short simultaneous requests, but rank 0 later exited via the memory watchdog:
+22:32:16 UTC, MemAvailable 2.4 GB below the 2.5 GB floor for three seconds.
+The active request had 20,855 prompt tokens. A prior 20,637-token turn had fully
+prefilled after the one-question math probe replaced the conversational prefix
+cache; this is an observed cache side effect, not proof of the allocation that
+caused the watchdog exit. Rank 1 remained waiting and TTS remained live.
+Do not present startup order or this small arena reduction as a validated fix
+for sustained long-context coexistence. No change to the watchdog floor was
+made. Failure logs: `results/memory-watchdog-20261006/`.
+
+
+The follow-up reduced prefill chunks to 1024 without reducing resident experts.
+A copied-history test of 20,775-token full prefill plus a cached 20,801-token
+extension/319-token decode and concurrent TTS passed, with main-node
+MemAvailable at least 6.948 GB (0.25 s sampling). This is bounded text-only
+evidence, not a guarantee for larger or multimodal sessions. Production history
+was preserved. See `results/memory-chunk-20261006/`.
+
+### Predictive prefill needs a contextual bank, and long prompts need signed features
+
+The aggregate expert-demand DB cannot tell which prompt caused which routing
+pattern. It cannot initialize a prompt-to-demand predictor; shadow collection must
+pair new prompt features with prefill observations. A lexical match is only a
+heuristic and must be evaluated against actual promotions before enabling apply.
+
+An unsigned token-hash histogram becomes close to uniform on long diverse prompts:
+unrelated 200k contexts can look similar. The predictor uses signed hashing and
+separate full-context/suffix/bigram blocks; a regression test covers disjoint long
+vocabularies. Do not replace this with positive bag counts without rechecking that
+failure. Repeated identical prompts replace their bank entries rather than adding
+spurious independent neighbors.
+
+Prediction validation must run after `self.ep` exists. The first live test failed
+at boot when the TP2 requirement check was placed alongside predictor construction,
+before distributed initialization. The check now sits with the dynamic-residency
+validation, while all control fields still join the normal configuration guard.

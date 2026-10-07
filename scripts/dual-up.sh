@@ -255,7 +255,10 @@ for _ in $(seq 1 "$HEALTH_TIMEOUT_S"); do
     fi
     if curl -sf -o /dev/null "http://${BIND_HOST/0.0.0.0/127.0.0.1}:$PORT/health"; then
         echo "OK"
-        curl -s "http://127.0.0.1:$PORT/health" | head -c 400; echo
+        # Drain the response before truncating: pipefail otherwise reports curl's
+        # broken-pipe exit 23 after a healthy launch when /health grows.
+        _health_display=$(curl -sf "http://${BIND_HOST/0.0.0.0/127.0.0.1}:$PORT/health")
+        printf '%s\n' "${_health_display:0:400}"
         info "EP2 pair serving on http://$BIND_HOST:$PORT/v1"
         exit 0
     fi

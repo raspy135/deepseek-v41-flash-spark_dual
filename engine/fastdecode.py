@@ -206,6 +206,7 @@ class FastDecoder:
         self.W = model.W
         self.c = model.c
         self.use_graphs = use_graphs
+        self.stream_layers = getattr(model, 'stream_layers', frozenset())
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
         # DSV41_L2PF_MB: prefetch the next layer's weights during the MoE all-gather (engine/l2pf.py)
         self.l2pf_side = torch.cuda.Stream(device=self.dev) if l2pf.enabled() else None
@@ -662,6 +663,8 @@ class FastDecoder:
         # deeper in, which is what made the graphed path disagree with the reference at all.
         pm = getattr(self.m, "prune_mask", None)
         keep = pm[L] if pm is not None and L in pm else None
+        if L in self.stream_layers:
+            keep = self.m.stream_keep[L]
         if self.lean is not None and self.lean.usable_router(y, w.gate_w):
             # the same router with its elementwise work fused (engine/decode_lean.py); the gate
             # GEMM, topk and the k-way sum stay torch ops on the same shapes
@@ -836,7 +839,7 @@ class FastDecoder:
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
-        if self._moe_merged_ok(w):
+        if L not in self.stream_layers and self._moe_merged_ok(w):
             self._moe_merged(L, w)
             self.pre_mix.copy_(self.ffn_pre)
             return
@@ -1091,6 +1094,16 @@ class FastDecoder:
         key = (S_parity, index_bucket, self.width)
         if key in self.graphs:
             return
+        # Compiler warmup is not traffic. Preserve the request's counts AND score evidence,
+        # in place, so graph capture cannot bias placement or inflate the reported misses.
+        counters = {}
+        for name in ('_want_counts', '_want_mass', '_req_counts', '_req_mass',
+                     '_miss_tot', '_miss_mass_tot', '_miss_phase', '_want_phase'):
+            value = getattr(self.m, name, None)
+            for tensor in value if isinstance(value, list) else [value]:
+                if tensor is not None:
+                    counters[id(tensor)] = tensor
+        saved_counters = [(tensor, tensor.clone()) for tensor in counters.values()]
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
         st = {"parity": S_parity, "index_bucket": index_bucket,
@@ -1116,6 +1129,8 @@ class FastDecoder:
             self._capture_layers(key, st)
         finally:
             self._memo = None
+            for tensor, saved in saved_counters:
+                tensor.copy_(saved)
 
     def _capture_layers(self, key, st):
         if self.lut is not None and GRAPH_SEGMENTS:
@@ -1124,24 +1139,38 @@ class FastDecoder:
             # boundaries as single graphs -- 41 replays per step become 3 -- and keep the overlap:
             # a segment is queued asynchronously, so the host blocks on the next boundary's NVMe
             # reads while the GPU is still running the segment before it.
-            bounds = sorted({0, self.a.n_layers} | {L for L in self.a.engram_layer_ids if 0 < L < self.a.n_layers})
+            from engine.layer_stream import graph_bounds
+            bounds = graph_bounds(self.a.n_layers, self.a.engram_layer_ids, self.stream_layers)
             segs = []
             for i in range(len(bounds) - 1):
                 lo, hi = bounds[i], bounds[i + 1]
+                if lo in self.stream_layers:
+                    # Router/attention first, then host loads current picks, then MoE.
+                    # Both ranks split at these guarded static boundaries unconditionally.
+                    gA = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(gA, pool=self.pool):
+                        self._layer_a(lo, st)
+                    gB = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(gB, pool=self.pool):
+                        self._layer_b(lo)
+                        if hi == self.a.n_layers:
+                            self._final()
+                    segs.append((lo, gA, gB))
+                    continue
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=self.pool):
                     for L in range(lo, hi):
                         self._layer_ab(L, st)
                     if hi == self.a.n_layers:
                         self._final()  # the head + drafter seeding ride in the last segment
-                segs.append((lo, g))
+                segs.append((lo, g, None))
             gD = self._capture_draft_graphs()
             self.graphs[key] = (None, None, None, gD, segs)
             torch.cuda.synchronize()
             return
         gA, gB = [], []
         for L in range(self.a.n_layers):
-            if self.lut is not None:
+            if self.lut is not None and L not in self.stream_layers:
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=self.pool):
                     self._layer_ab(L, st)
@@ -1166,7 +1195,14 @@ class FastDecoder:
     def _resolve(self, L):
         # host: expert ids -> arena slots (loads misses from NVMe)
         idx = self.route_idx
-        slots = self.m.store.resolve(L, idx, False)
+        try:
+            slots = self.m.store.resolve(L, idx, L in self.stream_layers)
+        except Exception:
+            if L in self.stream_layers:
+                import traceback
+                traceback.print_exc()
+                os._exit(1)  # never let a half-loaded pair continue with different slots
+            raise
         self.slots.copy_(slots)
 
     def step(self, block_ids: torch.Tensor, S: int, engram_rows: dict):
@@ -1217,7 +1253,7 @@ class FastDecoder:
         if self.use_graphs:
             gA, gB, gF, gD, segs = self.graphs[graph_key]
             if segs is not None:
-                for lo, g in segs:
+                for lo, g, gB in segs:
                     if futs is not None and lo in futs:
                         # this boundary's rows were read while the previous segment ran on the GPU
                         t0r = time.perf_counter()
@@ -1229,6 +1265,9 @@ class FastDecoder:
                     # therefore the exposed GPU-idle/H2D gap rather than assumed kernel work.
                     _ev_segment = self._ev_begin("segments")
                     g.replay()
+                    if gB is not None:
+                        self._resolve(lo)
+                        gB.replay()
                     if _ev_segment is not None:
                         _ev_segment.record()
             else:
@@ -1249,7 +1288,7 @@ class FastDecoder:
                 gF.replay()
             if self.lut is not None:
                 # bookkeeping the host resolve would have done: LRU touch is irrelevant while resident
-                self.m.store.stats["hits"] += int(a.n_layers * self.route_idx.numel())
+                self.m.store.stats["hits"] += int((a.n_layers - len(self.stream_layers)) * self.route_idx.numel())
         else:
             if futs is not None:
                 for LL, (f, finish) in futs.items():

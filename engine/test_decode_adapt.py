@@ -25,8 +25,10 @@ E, L = 16, 2
 
 def fake_engine(db, req, keep):
     model = types.SimpleNamespace(
-        prune_miss_report=lambda: ({}, torch.tensor(db, dtype=torch.float64), None),
-        _req_counts=torch.tensor(req, dtype=torch.float64))
+        prune_miss_report=lambda: ({}, torch.tensor(db, dtype=torch.float64),
+                                  torch.tensor(db, dtype=torch.float64)),
+        _req_counts=torch.tensor(req, dtype=torch.float64),
+        _req_mass=torch.tensor(req, dtype=torch.float64))
     return types.SimpleNamespace(
         _prune_trace={l: np.ones(E) for l in range(L)}, model=model,
         model_prune_mask={l: torch.tensor(keep) for l in range(L)},
@@ -119,6 +121,25 @@ class DecodeAdaptTest(unittest.TestCase):
         self.assertEqual(V.V41Engine.maintain_decode(eng, 31), 0)
         self.assertEqual(calls,[{'max_swaps':64,'pending_request':True}])
         self.assertEqual(eng._decode_adapt_passes[0]['reason'],'urgent')
+
+    def test_urgent_planner_ignores_exhausted_streaming_budget(self):
+        from engine.user_prompt import UserPrompt
+        keep=[True]*8+[False]*8
+        db=np.zeros((L,E));db[:,:8]=.05
+        req=np.zeros((L,E));req[:,12]=500.;req[:,0]=1.
+        eng=fake_engine(db,req,keep)
+        eng.user_prompt=UserPrompt(True,L,E,'cpu',100)
+        eng.user_prompt.consume(100)
+        eng.ep.control_flag=2
+        eng.ep.broadcast_obj=lambda p:p
+        eng.plan_swaps=lambda **kw:V.V41Engine.plan_swaps(eng,**kw)
+        applied=[]
+        eng.apply_swaps=lambda p:applied.extend(p) or len(p)
+        eng._decode_adapt_passes=[];eng._decode_adapt_window=30
+        self.assertGreater(V.V41Engine.maintain_decode(eng,31),0)
+        self.assertTrue(any(s[2]==12 for s in applied))
+        self.assertEqual(eng._decode_adapt_passes[0]['reason'],'urgent')
+        self.assertEqual(eng.user_prompt.remaining_loads,0)
 
     def test_eager_uses_aggregate_delta_not_unused_decode_counter(self):
         eng=types.SimpleNamespace(fast=None,
