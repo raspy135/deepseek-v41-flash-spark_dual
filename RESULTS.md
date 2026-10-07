@@ -1768,3 +1768,19 @@ with GPUs hidden to avoid interfering with live serving. This comprises 117
 focused unit tests, 30 persistence/response tests, four prefix-cache function
 tests, and 17 mock-API tests. Shell syntax, relative documentation links and diff
 whitespace checks passed. No new live quality benchmark was run for this commit.
+
+
+### 2026-10-06 — Separate engine-only and TTS example budgets
+
+The live 9,574-resident / 90.2 GB setup reserves room for TTS. The portable
+engine-only example now proposes 9,800 residents and 92.3 GB per node, while
+documenting the existing setup as the TTS coexistence profile. Live `.env` and
+services were not changed. This is a capacity calculation, not a new memory
+stress or answer-quality result.
+
+At 9,400,320 bytes per TP expert shard, 92.3 GB provides 9,818 sectors:
+9,800 residents + 8 transient + 1 null + 9 spare. The extra 226 resident shards
+occupy 2,124,472,320 bytes per node; the total arena grows by 2.1 decimal GB
+(its spare capacity decreases). Both nodes need headroom, regardless of which
+node hosts TTS. The larger configuration has not been launched or validated
+under sustained long-context load.

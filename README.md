@@ -5,7 +5,7 @@ with **two-node tensor parallelism (TP2)** and adaptive expert loading. Routed
 experts keep the checkpoint's native MXFP4 weights. The OpenAI-compatible API
 supports streaming responses, thinking, tool calls and images.
 
-The model does not fit fully in memory. The current profile keeps **9,574 of
+The model does not fit fully in memory. The engine-only example selects **9,800 of
 15,360 routed experts**, sharing their memory across layers as demand changes.
 Adaptation improves coverage; it does not guarantee full-model quality.
 
@@ -39,7 +39,7 @@ combination with a persistent, observable, globally adaptive expert working set.
 
 The main difference is **where the memory saving comes from**:
 
-| | This engine's current profile | A fully resident EXL3 configuration |
+| | This engine's example profile | A fully resident EXL3 configuration |
 | --- | --- | --- |
 | Expert weights | Original MXFP4; only a selected subset stays resident | Additional compression, such as the tested 2.9 bpw pack |
 | Routing coverage | Missing experts can affect answers, even after adaptation | All routed experts available when the compressed set fits |
@@ -103,20 +103,26 @@ in `.env.example`.
 
 See the [API reference](server/README.md) for requests, thinking and tool calls.
 
-## Current profile
+## Example profiles
 
-[.env.example](.env.example) contains the portable serving settings:
+[.env.example](.env.example) targets running the engine on its own:
 
 | Setting | Profile |
 | --- | --- |
 | Context allocation | 524,288 tokens, including the answer |
-| Expert memory | 90.2 GB/node; 9,574 residents; 8 transient slots |
+| Expert memory | 92.3 GB/node; 9,800 residents; 8 transient slots |
 | Expert selection | Global dynamic allocation, router-score ranking, high sensitivity, prior 4 |
 | Adaptation | After prefill, during long answers, on urgent misses, and between requests |
 | Vision | Tower on the second node; embeddings shared with both ranks |
 | Engram row cache | 256 MiB on the head, 1,024 MiB on the worker |
 | Prompt cache | RAM reuse enabled; disk and post-response caching disabled |
 | Generation | Speculative depth 3/5; thinking off by default, effort 75 when enabled |
+
+For **TTS alongside the engine**, use `ARENA_GB=90.2` and
+`DSV41_RESIDENT_EXPERTS=9574`, as on the development pair. The engine-only
+example adds 226 residents and about 2.1 GB per node. Its slot capacity is checked,
+but sustained peak-memory headroom has not yet been validated. Both TP nodes
+need room for the increase, even when TTS runs on only one.
 
 There are no fixed per-layer quotas beyond the routing minimum. Fresh installs
 use the bundled learned expert seed; existing local demand history takes priority.

@@ -129,7 +129,7 @@ router-score history. Defaults preserve the existing adaptive trace path.
 
 ## Learned fresh-start distribution
 
-The example configuration uses a 9,574-resident budget and seeds demand from
+The engine-only example uses a 9,800-resident budget and seeds demand from
 `profiles/learned-experts-v1.npz`, captured from the live TP2 working set on
 2026-10-06. It includes the exact expert IDs per layer and aggregate request
 counts/router-score mass, without prompts, responses, KV state or weights.
