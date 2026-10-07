@@ -144,6 +144,55 @@ Memory headroom depends on other services. Lower the resident budget and arena,
 or context allocation, if needed. Full-length 512K quality is not established.
 Keep demand databases, predictor banks and prompt caches private and out of Git.
 
+## Basic knobs
+
+Edit `.env` on the head, then restart the pair with `scripts/dual-down.sh` and
+`scripts/dual-up.sh`. The launcher sends the settings to both ranks. Values below
+refer to the example profile, not every engine fallback default.
+
+| Setting | What it controls |
+| --- | --- |
+| `DSV41_RESIDENT_EXPERTS=9800` + `ARENA_GB=92.3` | Expert count and allocated GB **per node**. Change together; a lower count alone does not shrink the arena. The exact count overrides `PRUNE_KEEP`. Use `9574` / `90.2` for the TTS profile. |
+| `MAX_SEQ=524288` | Context allocation including generated tokens. Lower it to reduce cache memory needs. |
+| `DSV41_ADAPT_SENSITIVITY=high` | How quickly new traffic changes expert ranking: `low`, `medium`, `high`, `max`; `off` freezes adaptation. Higher follows changes faster but can displace useful experts sooner. |
+| `DSV41_ADAPT_PRIOR=4` | Weight of the shipped routing trace. Lower values let your observed traffic dominate sooner. |
+| `DSV41_ADAPT_DECODE_TOKENS=600` / `DSV41_ADAPT_URGENT=1` | Periodic and urgent adaptation during an answer. Setting the interval to `0` disables both decode triggers; post-prefill adaptation remains. |
+| `DSV41_PREFILL_CHUNK=1024` | Tokens processed per prefill chunk. Smaller chunks reduce temporary memory and give finer prefix-cache boundaries. |
+| `DSV41_ENGRAM_CACHE_MB=256` / `DSV41_ENGRAM_CACHE_MB_PEER=1024` | Engram row-cache budgets in MiB on the head and worker. Separate from expert residency and prompt caching. |
+| `DSV41_VISION=1` / `DSV41_VISION_MODE=peer` | Enable images and put the vision tower on rank 1. Set vision to `0` for text-only serving. |
+| `DSV41_PREFIX_CACHE=1` | Reuse matching prompt state in RAM. Keep `DSV41_PREFIX_DISK=0` and `DSV41_PREFIX_RESPONSE=0` with dynamic allocation. |
+| `SPEC=1` | Enable DSpark speculative decoding; `0` disables drafting. Speed depends on draft acceptance. |
+| `DEFAULT_THINKING=off` / `DEFAULT_EFFORT=75` | Defaults when the client does not specify thinking. Effort is 1–100 and applies when thinking is enabled; clients can override it per request. |
+
+The two `ADAPT_*` ranking knobs derive the normal swap thresholds; copying old
+`DSV41_PRUNE_*` threshold overrides is unnecessary. `DSV41_USER_PROMPT_MAX_LOADS`
+only caps experimental streaming loads, **not normal adaptive expert swaps**.
+See [adaptation details](docs/adaptive-experts.md) for advanced settings.
+
+## Optional abliterated weights
+
+Set `DSV41_ABLIT_WOB` to a compatible native
+`wo_b_l10_35.safetensors` overlay (about 1.1 GB), as supported by
+[the overlay loader](engine/ablit.py). It replaces the attention output projections
+in layers 10–35 at load time. Experts and other checkpoint tensors retain their
+original weights; no second full checkpoint or modification of the original files
+is needed. This intentionally changes model behavior.
+
+Place the **same overlay file on both nodes** inside the host models directory.
+For example, if the checkpoint is `/srv/models/DeepSeek-V4.1-Flash`, place it at
+`/srv/models/dsv41-wo-b-ablit/wo_b_l10_35.safetensors`. For the Docker launcher,
+use the corresponding **container path** in `.env`:
+
+```dotenv
+DSV41_ABLIT_WOB=/models/dsv41-wo-b-ablit/wo_b_l10_35.safetensors
+```
+
+Restart both ranks and check `engine_config.ablate_wob` in `/health`. The boot
+guard checks that the overlay contents agree across nodes. For a native launch,
+use the host's absolute path instead. To return to stock weights, remove or empty
+`DSV41_ABLIT_WOB` and restart. The overlay substitutes weights rather than adding
+another model, so disabling it does not free an extra expert arena.
+
 ## Details and measurements
 
 - [Adaptive expert loading and learned seed](docs/adaptive-experts.md)
