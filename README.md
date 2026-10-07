@@ -9,6 +9,56 @@ The model does not fit fully in memory. The current profile keeps **9,574 of
 15,360 routed experts**, sharing their memory across layers as demand changes.
 Adaptation improves coverage; it does not guarantee full-model quality.
 
+## Why use this engine?
+
+- **Keep the original expert weights.** Routed experts use native MXFP4 from the
+  checkpoint, with no additional EXL3 conversion or separate quantized weight pack.
+  The default also keeps dense layers at their checkpoint precision.
+- **Let your workload shape memory allocation.** Router-score history learns which
+  experts to keep, and persists across restarts. This changes residency, not model
+  weights. A bundled learned seed gives fresh installs a starting distribution.
+- **Move capacity between layers.** One shared arena replaces fixed per-layer
+  quotas: a less-used layer can give its slots to a busier one. The total memory
+  budget stays fixed, with only the routing minimum reserved in each layer.
+- **Adapt while answering.** Normal adaptation runs after prefill and during long
+  answers. An urgent trigger can replace experts when recent decode misses rise;
+  it does not require streaming every missing expert from disk.
+- **See what the engine is doing.** The live expert map shows loading, residency
+  and arena ownership. Request statistics expose both routing-count and
+  router-score-weighted misses, making selection changes inspectable.
+- **Budget memory around other services.** Tune the exact resident count, context
+  allocation and each node's Engram cache. Peer-only vision freed **0.97 GB** on
+  the head in our tests, leaving more room for experts or a companion service such
+  as TTS. See [measurements and limitations](RESULTS.md).
+
+TP2 output sharding, native FP4 kernels, RoCE communication, speculative decoding
+and RAM prefix reuse support this design. The distinctive feature is their
+combination with a persistent, observable, globally adaptive expert working set.
+
+## Compared with an EXL3 recipe
+
+The main difference is **where the memory saving comes from**:
+
+| | This engine's current profile | A fully resident EXL3 configuration |
+| --- | --- | --- |
+| Expert weights | Original MXFP4; only a selected subset stays resident | Additional compression, such as the tested 2.9 bpw pack |
+| Routing coverage | Missing experts can affect answers, even after adaptation | All routed experts available when the compressed set fits |
+| Workload adaptation | Changes which experts occupy the fixed memory budget | Weight quantization stays fixed; memory policy depends on the runtime |
+| Main tradeoff | Preserve stored expert precision while accepting residency misses | Accept requantization error to fit more expert weights |
+
+Choose this engine when you want to retain checkpoint expert precision, tailor
+residency to your own traffic, and control how memory is shared with other
+services. It is especially useful for experimenting with expert selection and
+seeing the effect directly in the map and routing statistics.
+
+EXL3 remains a strong alternative: fitting all experts avoids this engine's
+residency misses, and lower-bit compression can be less damaging than missing an
+important expert. Our tests do **not** establish general quality superiority over
+Mia's recipe or the official API. Speed, context capacity, vision and concurrent
+serving depend on the particular EXL3 runtime; this profile serves one request at
+a time. See [recorded experiments](RESULTS.md) rather than treating native weight
+precision or a lower miss rate as an answer-quality guarantee.
+
 ## Setup
 
 You need two DGX Sparks, Docker with NVIDIA GPU support, a working RoCE link,
