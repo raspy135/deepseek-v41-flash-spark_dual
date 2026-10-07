@@ -11,18 +11,11 @@ Adaptation improves coverage; it does not guarantee full-model quality.
 
 ## Why use this engine?
 
-- **Vision support.** Send images and text through the same chat API. The vision
-  tower can run on the second node and share image embeddings with both ranks;
-  this freed **0.97 GB** on the head in our tests while preserving image support.
-- **Flexible memory configuration, including room for TTS.** Adjust the resident
+- **Vision support.** Send images and text through the same chat API. 
+- **Flexible memory configuration, including room for other small services.** Adjust the resident
   expert count, context allocation and each node's Engram cache to fit your setup.
-  The development pair runs this engine alongside TTS using the smaller expert
-  budget documented below. You can trade some expert capacity for another service
-  without downloading or converting a different weight pack. See the
-  [coexistence checks and memory limitations](RESULTS.md).
 - **Keep the original expert weights.** Routed experts use native MXFP4 from the
   checkpoint, with no additional EXL3 conversion or separate quantized weight pack.
-  The default also keeps dense layers at their checkpoint precision.
 - **Let your workload shape memory allocation.** Router-score history learns which
   experts to keep, and persists across restarts. This changes residency, not model
   weights. A bundled learned seed gives fresh installs a starting distribution.
