@@ -515,9 +515,17 @@ class V41Engine:
         from engine.tensor_parallel import tp_draft_head_enabled
         from engine.native_head import validate_config, head_kernel, HEAD_KERNEL_VERSION
         self.draft_bypass_enabled = draft_bypass.enabled()
-        if (expert_format or "fp4").lower() == "exl3" and self.draft_bypass_enabled:
-            # draft bypass needs a captured root verification graph; exl3 runs eager
-            log("EXL3: DSV41_DRAFT_BYPASS needs CUDA graphs; disabled for the reference arm")
+        # Whether the EXL3 JIT decode kernel is usable. Decided here, not later, because the
+        # graph-gated features below need it; cuda_available() triggers the one nvcc build.
+        self.exl3_cuda = False
+        if (expert_format or "fp4").lower() == "exl3":
+            try:
+                import exl3_moe as _X3
+                self.exl3_cuda = _X3.cuda_available()
+            except Exception:  # noqa: BLE001
+                self.exl3_cuda = False
+        if (expert_format or "fp4").lower() == "exl3" and not self.exl3_cuda and self.draft_bypass_enabled:
+            log("EXL3: DSV41_DRAFT_BYPASS needs a capturable MoE; disabled with the reference")
             self.draft_bypass_enabled = False
         tp_draft_head_enabled()  # validate even on the unsharded path
         validate_config()
@@ -707,7 +715,6 @@ class V41Engine:
 
         exl3_cls = None
         exl3_moe_fn = None
-        self.exl3_cuda = False
         if self.expert_format == "exl3":
             import exl3_moe as X3
             assert not sim_bits, "--sim-bits simulates a low-bit format inside an FP4 arena; it is " \
@@ -715,7 +722,6 @@ class V41Engine:
             assert not self.moe_fallback, "DSV41_MOE_FALLBACK dequantizes native FP4; it does not apply to exl3"
             exl3_cls = X3.Exl3Arena
             exl3_moe_fn = X3.moe_forward_exl3
-            self.exl3_cuda = X3.cuda_available()
             self.kernel = "exl3-cuda" if self.exl3_cuda else "exl3-ref"
             log("EXL3 routed experts: " + ("JIT CUDA decode kernel + reference prefill"
                                             if self.exl3_cuda else "torch reference (no JIT kernel)"))
@@ -1492,7 +1498,7 @@ class V41Engine:
         self._blk, self._vout, self._vhost = self._vbufs[_TV]
         self.depth_policy = None
         self.confidence_depth_policy = None
-        if (DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS) and exl3_cls is None:
+        if (DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS) and (exl3_cls is None or self.exl3_cuda):
             # Scope: the single-request greedy/sampled graphed path. Two-request serving
             # (engine/batch2.py) and the eager path stack or verify T_VERIFY rows unconditionally.
             if not (self.spec and self.fast is not None and self.fast.use_graphs):
@@ -1507,7 +1513,7 @@ class V41Engine:
                     "(sampled requests use prefix decisions)")
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
-        if (LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled) and exl3_cls is None:
+        if (LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled) and (exl3_cls is None or self.exl3_cuda):
             if not (self.spec and self.fast is not None and self.fast.use_graphs
                     and int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 1):
                 raise ValueError('draft experiments require single-request graphed speculation')
