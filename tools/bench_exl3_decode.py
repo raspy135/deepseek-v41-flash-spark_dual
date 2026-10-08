@@ -75,7 +75,8 @@ def main():
         w = torch.rand(T, TOPK, device=dev)
         x = (torch.randn(T, X3.DIM, dtype=torch.float32, device=dev) * 0.1).to(torch.bfloat16)
         fp4 = timed(lambda: F4.moe_forward(x, slots, w, f4, 10.0))
-        cu = timed(lambda: XC.moe_forward(x, slots, w, x3, 10.0)) if XC is not None else float("nan")
+        cu = (timed(lambda: X3.moe_forward_exl3(x, slots, w, x3, 10.0, out_dtype=torch.float32))
+              if XC is not None else float("nan"))
         ref = timed(lambda: X3.moe_forward_exl3_ref(x, slots, w, x3, 10.0, out_dtype=torch.bfloat16),
                     iters=2)
         print(f"{T:>3} {P:>4} | {fp4:>9.3f} {cu:>10.3f} {cu / fp4:>6.2f}x {ref:>12.2f}")

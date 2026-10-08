@@ -214,6 +214,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int mat = blockIdx.z / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
+    if (e < 0) return;                    // prefill routing pads unused blocks with -1
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
     const int k2 = mat ? K2_1[e] : K2_0[e];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;

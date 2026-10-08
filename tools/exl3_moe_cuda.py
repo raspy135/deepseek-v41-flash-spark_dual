@@ -103,27 +103,20 @@ def warm(arena) -> None:
 
 
 @torch.no_grad()
-def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
-                swiglu_limit: float = 10.0) -> torch.Tensor:
-    """x bf16 [T, DIM], slot ids int32 [T, 6], weights fp32 [T, 6] -> fp32 [T, DIM].
+def _run_pipeline(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, swiglu_limit,
+                  nt=NT, warps=WARPS, pf=PF):
+    """The five kernels over a prebuilt grouping. Shared by decode (P<=64) and prefill (P>64).
 
-    Every routed slot must be loaded (all-resident / LUT path).  Under TP-output each rank owns half
-    the intermediate columns and half the hidden outputs; the intermediate is all-gathered before the
-    down projection and the per-token totals after it, at the same points fp4_moe does.
-
-    Decode-shaped only: TF's group_kernel caps at 16 members a slot, so P must be <= 16 per slot.
+    `pick` is the arena slot per pair, in [T, K] order; uids/members say which pairs belong to which
+    slot.  Under TP-output each rank owns half the intermediate columns and half the hidden outputs;
+    the intermediate is all-gathered before down and the per-token totals after, where fp4_moe does.
     """
     T, K = slots.shape
     P = T * K
     dim, inter, down_n = arena.shapes["suh1"][0], arena.inter, arena.down_n
     world = arena.tp_world
-    assert x.shape == (T, dim) and x.dtype == torch.bfloat16
     dev = x.device
     p = _ptrs(arena)
-    if slots.numel() > 64:
-        raise ValueError("exl3_moe_cuda is decode-shaped (P<=64); use the prefill kernel")
-    # no torch.unique/.tolist() or any device->host sync here: this runs inside graph capture.
-
     group = None
     if world > 1:
         from engine.collective_rails import group as _g
@@ -136,30 +129,23 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
     zd = torch.empty((1, P, down_n), dtype=torch.float32, device=dev)
     y = torch.empty((P, down_n), dtype=torch.float32, device=dev)
     local = torch.empty((T, down_n), dtype=torch.float32, device=dev)
-    uids = torch.empty((P,), dtype=torch.int32, device=dev)
-    ucount = torch.empty((1,), dtype=torch.int32, device=dev)
-    members = torch.empty((P, 16), dtype=torch.int32, device=dev)
     pick = slots.reshape(-1).to(torch.int32).contiguous()
 
     lib = _lib()
     st = _stream()
-    lib.exl3m_group(ctypes.c_void_p(pick.data_ptr()), ctypes.c_void_p(uids.data_ptr()),
-                    ctypes.c_void_p(ucount.data_ptr()), ctypes.c_void_p(members.data_ptr()),
-                    int(T), int(K), int(arena.slots), 16, st)
     lib.exl3m_rot_in(ctypes.c_void_p(x.data_ptr()), int(x.stride(0)), ctypes.c_void_p(pick.data_ptr()),
                      ctypes.c_void_p(arena.suh1.data_ptr()), ctypes.c_void_p(arena.suh3.data_ptr()),
                      ctypes.c_void_p(xh0.data_ptr()), ctypes.c_void_p(xh1.data_ptr()),
                      int(T), int(dim), int(K), int(arena.slots), 1, st)
+    suh2_stride = int(arena.shapes["suh2"][0])
+    suh2_base = arena.suh2.data_ptr() + arena.tp_rank * inter * 2
     lib.exl3m_grouped(ctypes.c_void_p(xh0.data_ptr()), ctypes.c_void_p(xh1.data_ptr()),
                       ctypes.c_void_p(p["t1p"].data_ptr()), ctypes.c_void_p(p["t3p"].data_ptr()),
                       ctypes.c_void_p(p["k2"].data_ptr()), ctypes.c_void_p(p["k2"].data_ptr()),
                       ctypes.c_void_p(uids.data_ptr()), ctypes.c_void_p(ucount.data_ptr()),
                       ctypes.c_void_p(members.data_ptr()), ctypes.c_void_p(z.data_ptr()),
-                      int(dim), int(inter), int(P), 1, 16, int(K), int(P), 2, NT, WARPS, PF, 2, 10, CB_MUL1, st)
-    # suh2 is over the FULL down K (2304); this rank's gate/up columns are [rank*inter, +inter), so
-    # hand the kernel that slice and the full stride.  Without this the scale is wrong under TP2.
-    suh2_stride = int(arena.shapes["suh2"][0])
-    suh2_base = arena.suh2.data_ptr() + arena.tp_rank * inter * 2
+                      int(dim), int(inter), int(P), 1, int(maxm), int(K), int(nexp_max), 2, nt, warps, pf, 2, 10,
+                      CB_MUL1, st)
     lib.exl3m_gateup(ctypes.c_void_p(z.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
                      ctypes.c_void_p(arena.svh1.data_ptr()), ctypes.c_void_p(arena.svh3.data_ptr()),
                      ctypes.c_void_p(suh2_base), ctypes.c_void_p(xd.data_ptr()),
@@ -175,7 +161,8 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
                       ctypes.c_void_p(p["k2"].data_ptr()), ctypes.c_void_p(p["k2"].data_ptr()),
                       ctypes.c_void_p(uids.data_ptr()), ctypes.c_void_p(ucount.data_ptr()),
                       ctypes.c_void_p(members.data_ptr()), ctypes.c_void_p(zd.data_ptr()),
-                      int(down_k), int(down_n), int(P), 1, 16, int(K), int(P), 1, NT, WARPS, PF, 2, 10, CB_MUL1, st)
+                      int(down_k), int(down_n), int(P), 1, int(maxm), int(K), int(nexp_max), 1, nt, warps, pf, 2, 10,
+                      CB_MUL1, st)
     lib.exl3m_down_combine(ctypes.c_void_p(zd.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
                            ctypes.c_void_p(arena.svh2.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                            ctypes.c_void_p(weights.reshape(-1).float().contiguous().data_ptr()),
@@ -186,3 +173,44 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
     out = torch.empty((world * T, down_n), dtype=torch.float32, device=dev)
     torch.distributed.all_gather_into_tensor(out, local, group=group)
     return out.view(world, T, down_n).transpose(0, 1).reshape(T, dim)
+
+
+@torch.no_grad()
+def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
+                swiglu_limit: float = 10.0) -> torch.Tensor:
+    """Decode-sized (P<=64): group the picks with the O(P^2) kernel, then the pipeline."""
+    T, K = slots.shape
+    P = T * K
+    if P > 64:
+        raise ValueError("exl3_moe_cuda.moe_forward is decode-shaped (P<=64); use moe_forward_prefill")
+    uids = torch.empty((P,), dtype=torch.int32, device=slots.device)
+    ucount = torch.empty((1,), dtype=torch.int32, device=slots.device)
+    members = torch.empty((P, 16), dtype=torch.int32, device=slots.device)
+    s = torch.cuda.current_stream()
+    lib = _lib()
+    lib.exl3m_group(ctypes.c_void_p(slots.reshape(-1).to(torch.int32).contiguous().data_ptr()),
+                    ctypes.c_void_p(uids.data_ptr()), ctypes.c_void_p(ucount.data_ptr()),
+                    ctypes.c_void_p(members.data_ptr()), int(T), int(K), int(arena.slots), 16, _stream())
+    del s
+    return _run_pipeline(x, slots, weights, arena, uids, ucount, members, 16, P, swiglu_limit,
+                         nt=8, warps=4, pf=1)
+
+
+@torch.no_grad()
+def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
+                        swiglu_limit: float = 10.0, block_m: int = 64) -> torch.Tensor:
+    """Prefill: group with the engine's build_routing (BM blocks, one expert each), then the pipeline.
+
+    build_routing's pair ids are flat (row*K + k); the grouped kernel decodes members as
+    row*32 + k, so encode them and leave -1 padding negative (the kernel skips it).
+    """
+    import fp4_moe as F4
+    T, K = slots.shape
+    block_slot, block_pair, NB = F4.build_routing(slots, arena.slots, block_m)
+    pair = block_pair.view(NB, block_m)
+    members = torch.where(pair >= 0, (pair // K) * 32 + (pair % K), pair).to(torch.int32).contiguous()
+    uids = block_slot.to(torch.int32).contiguous()
+    ucount = torch.full((1,), NB, dtype=torch.int32, device=slots.device)
+    # pf=2 is the prefill winner (58 vs 86 ms at T=2048); decode keeps the sweep-tuned pf=1.
+    return _run_pipeline(x, slots, weights, arena, uids, ucount, members, block_m, NB, swiglu_limit,
+                         nt=8, warps=4, pf=2)

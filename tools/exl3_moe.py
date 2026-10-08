@@ -160,9 +160,11 @@ def moe_forward_exl3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor
     reference covers prefill until the P4 kernel lands. The reference is NOT graph-capturable, so
     prefill must stay eager (it is).
     """
-    if cuda_available() and slots.numel() <= 64:
+    if cuda_available():
         import exl3_moe_cuda as XC
-        return XC.moe_forward(x, slots, weights, arena, swiglu_limit).to(out_dtype)
+        if slots.numel() <= 64:
+            return XC.moe_forward(x, slots, weights, arena, swiglu_limit).to(out_dtype)
+        return XC.moe_forward_prefill(x, slots, weights, arena, swiglu_limit).to(out_dtype)
     return moe_forward_exl3_ref(x, slots, weights, arena, swiglu_limit, out_dtype=out_dtype)
 
 

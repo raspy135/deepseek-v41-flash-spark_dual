@@ -52,6 +52,16 @@ def main():
         rel = float((got - ref).norm() / ref.norm())
         ok(rel < 2e-2, f"T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
 
+    # prefill shapes go through build_routing + the same pipeline
+    for T in (128, 512):
+        x = (torch.randn(T, X3.DIM, dtype=torch.float32, device="cuda") * 0.1).to(torch.bfloat16)
+        slots = torch.randint(0, E, (T, 6), dtype=torch.int32, device="cuda")
+        w = torch.rand(T, 6, device="cuda")
+        ref = X3.moe_forward_exl3_ref(x, slots, w, arena, 10.0, out_dtype=torch.float32)
+        got = XC.moe_forward_prefill(x, slots, w, arena, 10.0)
+        rel = float((got - ref).norm() / ref.norm())
+        ok(rel < 2e-2, f"prefill T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
+
     print(f"\n{'FAIL: ' + str(len(fails)) if fails else 'all checks passed'}")
     return 1 if fails else 0
 
