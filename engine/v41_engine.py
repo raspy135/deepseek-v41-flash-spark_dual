@@ -515,6 +515,10 @@ class V41Engine:
         from engine.tensor_parallel import tp_draft_head_enabled
         from engine.native_head import validate_config, head_kernel, HEAD_KERNEL_VERSION
         self.draft_bypass_enabled = draft_bypass.enabled()
+        if (expert_format or "fp4").lower() == "exl3" and self.draft_bypass_enabled:
+            # draft bypass needs a captured root verification graph; exl3 runs eager
+            log("EXL3: DSV41_DRAFT_BYPASS needs CUDA graphs; disabled for the reference arm")
+            self.draft_bypass_enabled = False
         tp_draft_head_enabled()  # validate even on the unsharded path
         validate_config()
         if os.environ.get("DSV41_LOOKUP_DRAFT_ENABLED", "0") not in ("0", "1"):
@@ -1494,7 +1498,7 @@ class V41Engine:
         self._blk, self._vout, self._vhost = self._vbufs[_TV]
         self.depth_policy = None
         self.confidence_depth_policy = None
-        if DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS:
+        if (DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS) and exl3_cls is None:
             # Scope: the single-request greedy/sampled graphed path. Two-request serving
             # (engine/batch2.py) and the eager path stack or verify T_VERIFY rows unconditionally.
             if not (self.spec and self.fast is not None and self.fast.use_graphs):
@@ -1509,7 +1513,7 @@ class V41Engine:
                     "(sampled requests use prefix decisions)")
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
-        if LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled:
+        if (LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled) and exl3_cls is None:
             if not (self.spec and self.fast is not None and self.fast.use_graphs
                     and int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 1):
                 raise ValueError('draft experiments require single-request graphed speculation')
