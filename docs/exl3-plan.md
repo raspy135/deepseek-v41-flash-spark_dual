@@ -4,6 +4,21 @@ Status: plan only (2026-10-08). Nothing here is implemented. Written for an agen
 repository; read `CLAUDE.md`, `docs/gotchas.md` (especially the 2026-10-07/08 entries) and the
 last `RESULTS.md` sections first.
 
+## Progress (2026-10-08)
+
+- **P0 packs**: built on node 0, `~/models/exl3-packs/exl3-experts-r{0,1}of2.bin`, 98.24 GB each,
+  source manifest sha256 `464d2dc4d3edbc48`; rank 1 copied to `spark2`. Header sha is per rank.
+- **P1 done** (commit `EXL3 P1`): `tools/exl3_format.py` (vendored oracle), `tools/exl3_ref.py`,
+  `tools/pack_exl3_experts.py`, `tools/test_exl3_ref.py`. unpack is bit-exact vs the oracle on
+  layers 0/18/39; rank slices exact; pack round-trips.
+- **P2 core done**: `tools/exl3_moe.py` (`Exl3Arena` + reference MoE, TP gather path) and
+  `tools/exl3_store.py` (pack reader behind `ExpertStore`'s own LRU/ring/lease), with
+  `tools/test_exl3_moe.py` and `tools/test_exl3_store.py`. Engine wiring is in and default-off:
+  `EXPERT_FORMAT=exl3`, boot-guard pack sha, health, argparse, `.env.example`.
+- **Pending, needs serving stopped + both nodes**: the two-node boot gate, then the reference-MoE
+  end-to-end check, then P3/P4 kernels and the A/B measurements. `tools/generation_gate.py` is a
+  floor test only; do not record a speed number before the paired drivers run.
+
 ## Goal
 
 Add `EXPERT_FORMAT=exl3`: the **routed experts** (MoE layers 0–39, 384 each) come from the local

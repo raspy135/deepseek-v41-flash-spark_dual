@@ -192,6 +192,15 @@ def host_available_bytes():
     return None
 
 
+def exl3_pack_path(model_dir: str, rank: int, world: int) -> str:
+    """The per-rank EXL3 pack. `DSV41_EXL3_PACK` overrides; the default sits beside the model."""
+    env = os.environ.get("DSV41_EXL3_PACK")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.abspath(model_dir)), "exl3-packs",
+                        f"exl3-experts-r{rank}of{world}.bin")
+
+
 class FixedStore:
     """DSpark experts: 3 x 128, all resident, slot = k * 128 + e."""
 
@@ -624,7 +633,7 @@ class V41Engine:
         self.act_quant = act_quant
         self.trace_stats = trace_stats
         self.expert_format = (expert_format or "fp4").lower()
-        assert self.expert_format in ("fp4", "cb3"), self.expert_format
+        assert self.expert_format in ("fp4", "cb3", "exl3"), self.expert_format
         self.sim_cb2_frac = float(sim_cb2_frac or 0.0)
         assert 0.0 <= self.sim_cb2_frac <= 1.0, self.sim_cb2_frac
         self.moe_fallback = os.environ.get("DSV41_MOE_FALLBACK", "0") == "1"
@@ -692,6 +701,18 @@ class V41Engine:
             self.kernel = "triton-cb3"
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
+        exl3_cls = None
+        exl3_moe_fn = None
+        if self.expert_format == "exl3":
+            import exl3_moe as X3
+            assert not sim_bits, "--sim-bits simulates a low-bit format inside an FP4 arena; it is " \
+                                 "meaningless with --expert-format exl3"
+            assert not self.moe_fallback, "DSV41_MOE_FALLBACK dequantizes native FP4; it does not apply to exl3"
+            exl3_cls = X3.Exl3Arena
+            exl3_moe_fn = X3.moe_forward_exl3_ref
+            self.kernel = "exl3-ref"
+            log("using the EXL3 reference MoE (torch) for the routed experts; the packed kernels are P3/P4")
+
         def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
                    null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None,
                    prefill=False):
@@ -701,6 +722,8 @@ class V41Engine:
 
             `out_dtype` is the EP2 hook (engine/model.py::moe): fp32 keeps this rank's HALF of
             the k-sum unrounded until after the all-reduce. Both arena formats take it now."""
+            if exl3_cls is not None and isinstance(arena, exl3_cls):
+                return exl3_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype)
             if cb3_cls is not None and isinstance(arena, cb3_cls):
                 # out_dtype/slots_repeat are the EP2 hooks, same meaning as the FP4 path below.
                 # null_slot is not passed: the CB3 kernels have no skip, so a pair routed at the
@@ -721,6 +744,10 @@ class V41Engine:
         arena_cls = fp4_arena_cls
 
         def make_expert_arena(n_slots):
+            if exl3_cls is not None:
+                if self.ep.tensor_parallel:
+                    return exl3_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
+                return exl3_cls(n_slots, device)
             if cb3_cls is None:
                 if self.ep.tensor_parallel:
                     return fp4_arena_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
@@ -738,17 +765,28 @@ class V41Engine:
         # the same unified pool, and an arena sized around a not-yet-created PG overcounts what
         # is left (the keep_free floor then quietly eats itself).
         self.ep = DT.EPDistributed(rank, world_size)
+        if exl3_cls is not None:
+            # one rank's slice; the pack is per rank, so the bytes are the world=1 record halved
+            import exl3_ref as _XR
+            _tw = self.ep.world if self.ep.tensor_parallel else 1
+            _tr = self.ep.rank if self.ep.tensor_parallel else 0
+            self.expert_bytes = _XR.record_nbytes(3.0, _tr, _tw)
         self.tp_draft_experts = os.environ.get('DSV41_TP_DRAFT_EXPERTS', '0') == '1'
         if self.tp_draft_experts and (not self.ep.tensor_parallel
                 or self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
                 or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
             raise ValueError('draft TP requires native FP4 TP2 with output layout')
         if self.ep.tensor_parallel:
-            if (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
+            if exl3_cls is not None:
+                if (os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
+                        or float(os.environ.get('DSV41_PREFILL_REPLICA_GB', '0'))):
+                    raise ValueError('EXL3 expert TP forbids EP overlap and prefill replicas')
+            elif (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
                     or os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
                     or float(os.environ.get('DSV41_PREFILL_REPLICA_GB', '0'))):
                 raise ValueError('expert TP requires native FP4, no replicas, no EP overlap')
-            self.expert_bytes //= self.ep.world
+            if exl3_cls is None:
+                self.expert_bytes //= self.ep.world
         replica_gb = float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0"))
         self.replica_budget_ms = float(os.environ.get("DSV41_PREFILL_REPLICA_BUDGET_MS", "500"))
         if not np.isfinite(replica_gb) or not 0 <= replica_gb <= 1:
@@ -761,7 +799,7 @@ class V41Engine:
                                    or self.fp4_dot_scaled or self.fp4_prefill_dot_scaled):
             raise ValueError('prefill replicas currently require EP2 software-FP4')
         if self.ep.active:
-            assert expert_format in ("", "fp4", "cb3"), expert_format
+            assert expert_format in ("", "fp4", "cb3", "exl3"), expert_format
             self.ep.init(device)
             from engine import comm as _comm
             _comm.init(device)   # DSV41_COMM_BACKEND=roce: build the one-shot RoCE runtime or stay on NCCL
@@ -845,12 +883,26 @@ class V41Engine:
         self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
                                            log=log).start()
         self.arena = make_expert_arena(slots + self.replica_slots)
-        self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
-                                    io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
+        if exl3_cls is not None:
+            import exl3_store as _XS
+            self.store = _XS.Exl3ExpertStore(
+                exl3_pack_path(model_dir, self.ep.rank if self.ep.tensor_parallel else 0,
+                               self.ep.world if self.ep.tensor_parallel else 1),
+                self.arena, self.args.n_layers, transient_slots=transient_slots, io_threads=io_threads,
+                ep=self.ep, replica_slots=self.replica_slots)
+            # the DSpark drafter stays native FP4 and reads its 3x128 experts from the checkpoint
+            self.dspark_reader = EX.ExpertStore(model_dir, index, self.W.dspark_arena, self.args.n_layers,
+                                                transient_slots=16, io_threads=2, read_threads=4)
+            log(f"EXL3 pack rank {self.store.pack.rank}/{self.store.pack.world}, header "
+                f"{self.store.pack.header_sha256()[:16]}, {self.expert_bytes / 1e6:.2f} MB/slot")
+        else:
+            self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
+                                        io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
+            self.dspark_reader = self.store
         # load the DSpark experts (all 3 x 128 resident in their own arena)
         for k in range(3):
             for e in range(128):
-                w1, s1, w2, s2, w3, s3 = self.store.read_expert(40 + k, e, prefix=f"mtp.{k}.ffn.experts.{e}.")
+                w1, s1, w2, s2, w3, s3 = self.dspark_reader.read_expert(40 + k, e, prefix=f"mtp.{k}.ffn.experts.{e}.")
                 self.W.dspark_arena.load_slot(k * 128 + e, w1.view(*EX.W13_SHAPE), s1.view(*EX.S13_SHAPE),
                                               w2.view(*EX.W2_SHAPE), s2.view(*EX.S2_SHAPE), w3.view(*EX.W13_SHAPE),
                                               s3.view(*EX.S13_SHAPE))
@@ -1116,6 +1168,9 @@ class V41Engine:
                 "prefill_budget_version": 1,
                 "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
+                "expert_pack_sha256": (self.store.pack.header_sha256() if hasattr(self.store, "pack") else ""),
+                "expert_pack_rank": (f"{self.store.pack.rank}/{self.store.pack.world}"
+                                     if hasattr(self.store, "pack") else ""),
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
                 "tp_experts": self.ep.tensor_parallel,
                 "tp_experts_version": 1,
@@ -3234,6 +3289,7 @@ class V41Engine:
             "trace_stats": self.trace_stats,
             "kernel": self.kernel,
             "expert_format": self.expert_format,
+            "expert_pack_sha256": (self.store.pack.header_sha256() if hasattr(self.store, "pack") else ""),
             "expert_mb": round(self.expert_bytes / 1e6, 2),
             "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
             # Which parallelization is actually live. EP2 is what ships (dense TP measured
@@ -3525,10 +3581,11 @@ if __name__ == "__main__":
     ap.add_argument("--transient-slots", type=int, default=None,
                     help="prefill-miss ring slots (default 400 = a whole layer; 16 is enough when every kept expert is resident)")
     ap.add_argument("--keep-free-gb", type=float, default=None, help="host memory to leave free when auto-sizing the arena (default 20)")
-    ap.add_argument("--expert-format", default=os.environ.get("EXPERT_FORMAT") or "fp4", choices=["fp4", "cb3"],
+    ap.add_argument("--expert-format", default=os.environ.get("EXPERT_FORMAT") or "fp4", choices=["fp4", "cb3", "exl3"],
                     help="routed-expert arena format: fp4 = the checkpoint's packed FP4 (18.80 MB/expert); "
                          "cb3 = the 3-bit per-row codebook format (14.45 MB/expert, 0.769x), packed at warm "
-                         "start, which fits ~40.8%% of all routed experts in 90.5 GB instead of 31.3%%")
+                         "start, which fits ~40.8%% of all routed experts in 90.5 GB instead of 31.3%%; "
+                         "exl3 = the EXL3 trellis slices from DSV41_EXL3_PACK (6.67 MB/expert at TP2, 3 bits)")
     ap.add_argument("--sim-bits", type=int, default=None, help="simulate a 2/3-bit per-row codebook expert format (quality only)")
     ap.add_argument("--sim-cold-frac", type=float, default=1.0, help="fraction of the kept experts (coldest first) that get --sim-bits")
     ap.add_argument("--sim-cb2-frac", type=float, default=float(os.environ.get("SIM_CB2_FRAC") or 0.0),

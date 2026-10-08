@@ -319,30 +319,40 @@ class ExpertStore:
 
         def sink(v):
             t0 = time.perf_counter()
-            w1, s1, w2, s2, w3, s3 = v
-            # per-expert codebook width for a codebook arena (engine/codebook_sim.py): a key with an
-            # entry in `cb_bits` is packed with that width's CodebookSim instead of the arena's own.
-            kw = {}
-            cb = getattr(self, "cb_bits", None)
-            if cb is not None:
-                b = cb.get(key)
-                if b:
-                    kw["sim"] = self.cb_sims[b]
-            with torch.cuda.stream(stream):
-                stream.wait_stream(compute)
-                self.arena.load_slot(slot, w1.view(*W13_SHAPE), s1.view(*S13_SHAPE), w2.view(*W2_SHAPE),
-                                     s2.view(*S2_SHAPE), w3.view(*W13_SHAPE), s3.view(*S13_SHAPE),
-                                     non_blocking=True, **kw)
-                sim = getattr(self, "requant", None)  # simulated low-bit format (engine/codebook_sim.py)
-                if sim is not None:
-                    bits = sim.get(key)
-                    if bits:
-                        self.requant_sims[bits].requant_slot(self.arena, slot)
+            # The staging-buffer views are format-specific; this is the FP4 copy. The EXL3 store
+            # overrides `_copy_into_slot` (tools/exl3_store.py) and leaves everything else alone.
+            self._copy_into_slot(slot, key, v, stream, compute)
             stream.synchronize()  # the staging buffer is leased to another expert right after
             self.stats["h2d_s"] += time.perf_counter() - t0
             return slot
 
         return self._read_leased(key[0], key[1], prefix, sink)
+
+    def _copy_into_slot(self, slot, key, views, stream, compute) -> None:
+        """Copy the 6 packed-FP4 views of one expert (w1,s1,w2,s2,w3,s3) into its arena slot.
+
+        Split out of `_load_slot_data` so a format with a different tensor set and load signature
+        can reuse the lease/stream/stat machinery instead of forking the store. The body is the
+        original FP4 sink, unchanged."""
+        w1, s1, w2, s2, w3, s3 = views
+        # per-expert codebook width for a codebook arena (engine/codebook_sim.py): a key with an
+        # entry in `cb_bits` is packed with that width's CodebookSim instead of the arena's own.
+        kw = {}
+        cb = getattr(self, "cb_bits", None)
+        if cb is not None:
+            b = cb.get(key)
+            if b:
+                kw["sim"] = self.cb_sims[b]
+        with torch.cuda.stream(stream):
+            stream.wait_stream(compute)
+            self.arena.load_slot(slot, w1.view(*W13_SHAPE), s1.view(*S13_SHAPE), w2.view(*W2_SHAPE),
+                                 s2.view(*S2_SHAPE), w3.view(*W13_SHAPE), s3.view(*S13_SHAPE),
+                                 non_blocking=True, **kw)
+            sim = getattr(self, "requant", None)  # simulated low-bit format (engine/codebook_sim.py)
+            if sim is not None:
+                bits = sim.get(key)
+                if bits:
+                    self.requant_sims[bits].requant_slot(self.arena, slot)
 
     # ------------------------------------------------------------------ cache policy
     def _lru_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
