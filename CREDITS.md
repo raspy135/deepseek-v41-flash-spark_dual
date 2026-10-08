@@ -53,6 +53,22 @@ all-gathers: on this pair a captured NCCL all-gather costs 44-70 us whatever the
 12.7-19.9 us with identical bits (`tools/bench_roce_gather.py`). The full notice is in
 `tools/roce/NOTICE`; the only changes are the `GLM53_TF_*` -> `DSV41_*` knobs and the engine integration.
 
+## EXL3 routed experts
+
+`tools/exl3_format.py` is vendored, unmodified, from **TensorFold**'s
+`src/tensorfold/cuda/exl3/format.py` (Apache-2.0, the TensorFold contributors), which is the
+MIT-licensed **ExLlamaV3** trellis format (Copyright (c) 2025 Turboderp). It is the bit-exact
+numpy oracle for `tools/test_exl3_ref.py` and is not on the serving path. The torch decoder
+(`tools/exl3_ref.py`), the pack format and `tools/pack_exl3_experts.py` are this repo's.
+
+Future CUDA expert kernels are intended as a port of TensorFold's ExLlamaV3-derived
+`decode.cuh` and `experts_grouped.cuh` (same licences). TensorFold's DeepSeek-V4.1 fast load
+path (`x3ld.cu`/`loads.py`, "our GLM patch 0580") is deliberately **not** ported: its lineage is
+the Mia's AI Lab GLM kit after 2026-09-07 (AGPL-3.0), which this repo takes no code from.
+
+TensorFold's prepared EXL3 packs are for its "dsv41-uncensored-2.9bpw" model; we build our own
+pack from the base `DeepSeek-V4.1-Flash-EXL3-2.9bpw` checkpoint.
+
 ## The platform and the tools
 
 **NVIDIA** — the DGX Spark / GB10, the CUDA 13 container images, and PyTorch's cu130

@@ -2132,3 +2132,21 @@ Expert arenas are populated by loader threads, and inference tensors allocated i
 thread cannot be mutated by those threads outside that context. Generation/model methods
 already enter inference mode where appropriate. Also disable the shadow predictor when
 freezing swaps; its validation intentionally requires request-unit adaptation.
+
+## TensorFold's EXL3 packs are its "uncensored" model, and its fast loader is AGPL-risky (2026-10-08)
+
+`~/models/dsv41-tensorfold/prepared/model/*/rank{0,1}/data.bin` (101.8 GB each, `X3Stack`
+`trellis`/`mul1`, exactly the per-rank layout an EXL3 engine wants, and present on **both**
+nodes) are TensorFold's preparation of `dsv41-uncensored-2.9bpw`, not of the base
+`DeepSeek-V4.1-Flash-EXL3-2.9bpw`. The manifest's source key is the sha256 of the base
+`config.json`, which the uncensored overlay reuses because it changes attention only -- so a
+matching config hash does **not** mean the routed experts match. TF's own
+`engine/kernels/exl3/experts.py` docstring names the checkpoint. Build our own pack; do not read
+these. Measured: the base pack is 98.24 GB per rank (header 0.87 MB), 6.670 MB per 3-bit expert
+and 4.458 MB per 2-bit expert at the TP-output slice.
+
+Porting boundary: TF DSV41's `x3ld.cu` and `loads.py` are "our GLM patch 0580" -- Mia's AI Lab
+GLM-kit lineage, AGPL-3.0 after 2026-09-07 -- and the `experts.py` that front-runs them. Do not
+copy. The math (`decode.cuh`, `experts_grouped.cuh`, `experts.cu`) is ExLlamaV3/TensorFold,
+permissive; `format.py` is vendored as the oracle. Their fast load path is the one file we cannot
+port, so it is the known performance risk versus TensorFold.
