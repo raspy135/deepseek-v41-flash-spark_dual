@@ -16,9 +16,18 @@ last `RESULTS.md` sections first.
   `tools/exl3_store.py` (pack reader behind `ExpertStore`'s own LRU/ring/lease), with
   `tools/test_exl3_moe.py` and `tools/test_exl3_store.py`. Engine wiring is in and default-off:
   `EXPERT_FORMAT=exl3`, boot-guard pack sha, health, argparse, `.env.example`.
-- **Pending, needs serving stopped + both nodes**: the two-node boot gate, then the reference-MoE
-  end-to-end check, then P3/P4 kernels and the A/B measurements. `tools/generation_gate.py` is a
-  floor test only; do not record a speed number before the paired drivers run.
+- **P2 proven end to end (2026-10-08)**: the pair booted with `EXPERT_FORMAT=exl3` (packs on both
+  nodes), warm-started **9,400 experts / 60.1 GB read in 12 s (~5 GB/s)** into 13,522 slots (88 %
+  of all routed experts), and served a 2-token completion. The reference MoE is the serving path,
+  so that request took ~76 s -- a correctness arm, not a speed one.
+- **Not supported on the exl3 arm yet** (FP4-only today; forced off, rank-invariant, in the boot
+  guard): adaptive residency (`DSV41_DYNAMIC_EXPERTS`, `DSV41_RESIDENT_EXPERTS`), predictive
+  prefill, the swap maintainer, CUDA graphs (the reference host-syncs per layer), variable
+  speculative depth, lookup-draft/draft-bypass, critical prefill and layer streaming. They return
+  with the packed kernels (P3/P4) or a format-agnostic integration; the FP4 arm is unchanged.
+- **Pending, needs serving stopped + both nodes**: nothing for P2. P3/P4 kernels and the paired
+  A/B measurements remain. Measure kernels with the `tools/bench_*` microbenchmarks, not by
+  rebooting the engine; `tools/generation_gate.py` is a floor test only.
 
 ## Goal
 
