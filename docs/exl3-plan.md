@@ -112,6 +112,24 @@ half of the 5,120 outputs. EXL3's Hadamard rotations act on **blocks of 128** al
 TensorFold uses the *intermediate* layout instead (w2 split on K, fp32 partials summed); its
 `engine/kernels/exl3/experts.py` docstring states the split rule and its test checks it.
 
+## P3/P4 targets (measured 2026-10-08, serving image)
+
+`tools/bench_exl3_decode.py`, one layer, TP-world-1 shapes, real EXL3 experts, synthetic routing:
+
+| T | P | FP4 Triton kernel | EXL3 reference |
+| --- | --- | ---: | ---: |
+| 1 | 6 | **0.444 ms** | 584.24 ms |
+| 6 | 36 | 1.101 ms | 932.83 ms |
+| 128 | 768 | 1.962 ms | 950.10 ms |
+| 512 | 3072 | 6.747 ms | 943.76 ms |
+| 2048 | 12288 | **38.340 ms** | 986.78 ms |
+
+An EXL3 slot is 0.708x an FP4 slot at world 1 (13.32 vs 18.80 MB). The reference is flat ~950 ms
+because it materializes full fp64 weight matrices (`dequant_slot` = 115 ms/expert), which the
+fused kernel must not do. Bandwidth-scaled, prefill should land near **~27 ms** at T=2048; decode
+near the FP4 **0.44 ms** at T=1. Those are the P3/P4 bars. Re-run these probes and the engine's
+own `DSV41_PREFILL_MOE_TIMING` up/down envelopes once the kernel exists.
+
 ## Reference material and licenses
 
 - **Bit-exact numpy reference:** `~/git/deepseek-v41-tensorfold-spark/vendor/TensorFold/src/tensorfold/cuda/exl3/format.py`
