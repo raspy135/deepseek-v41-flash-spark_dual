@@ -27,10 +27,18 @@ last `RESULTS.md` sections first.
   swap path needed a TP fix (there is no EP null slot, so a swapped-out expert gets a -1
   placeholder it can never be routed to) and the earlier auto-disable had to be removed. Its
   *speed* is still unmeasurable on the reference MoE; the feature is present and correct now.
-- **Still held back on the exl3 arm** (all captured-graph or FP4-fusion dependent): CUDA graphs,
-  variable speculative depth, lookup-draft/draft-bypass, the `_moe_merged` fusions, critical
-  prefill and layer streaming. They return with the packed kernels (P3/P4) or a format-agnostic
-  port; the FP4 arm is unchanged.
+- **P3 done and serving (2026-10-08)**: JIT CUDA decode kernel (`tools/exl3_moe_cuda.{cu,py}`),
+  ported from TF's ExLlamaV3-derived kernels. vs the FP4 Triton kernel: 0.97x at T=1, 0.57-0.87x
+  above it; vs the fp64 reference 575-931 ms. TP2, mixed 3-bit/2-bit slots, CUDA-graph capturable.
+- **P4 done (2026-10-08)**: same kernels with `build_routing` grouping (BM=64, slots compacted
+  first -- without compaction a 2,530-token prefill took 62 s; compacted it is 6.8 s). Prefill 866
+  tok/s vs FP4's ~1,423 (0.61x); T=2048 is 58 ms/layer against FP4's 34.6. A dedicated prefill GEMM
+  is owed for parity.
+- **Decode is at FP4 parity and not MoE-bound.** Same prompts, same harness: prose 23.83 (EXL3) vs
+  23.78 (FP4); the step accounting is moe_compute 4.7%, engram 25%, engram_wait 27%, attn 1.2%,
+  unaccounted 40%. The 35 tok/s prose goal is an engine-wide Engram/draft target, not an EXL3 one.
+- **Re-enabled on exl3 (graphs are back)**: variable spec depth, predictive prefill, adaptive
+  residency. Still FP4-only: critical prefill, layer streaming, the `_moe_merged` fusions.
 - **Pending, needs serving stopped + both nodes**: nothing for P2. P3/P4 kernels and the paired
   A/B measurements remain. Measure kernels with the `tools/bench_*` microbenchmarks, not by
   rebooting the engine; `tools/generation_gate.py` is a floor test only.
