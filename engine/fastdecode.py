@@ -234,6 +234,15 @@ class FastDecoder:
         self.attn_prefetch_mb = int(os.environ.get("DSV41_L2PF_ATTN_MB", "0"))
         if not 0 <= self.attn_prefetch_mb <= 12:
             raise ValueError("DSV41_L2PF_ATTN_MB must be in 0..12")
+        # Cold FP8 decode projections are latency-bound: wq_b 166 us cold vs 46 us from L2 on GB10
+        # (8.8/20 MiB wq_a+wkv/wq_b, 11 MiB shared w13). DSV41_L2PF_QKV_MB prefetches this layer's
+        # wq_a+wkv then wq_b while HC mixes run; DSV41_L2PF_SH_MB prefetches the shared expert while
+        # the FFN HC mixes and router run. Loads only -- outputs are bit-identical.
+        self.qkv_prefetch_mb = int(os.environ.get("DSV41_L2PF_QKV_MB", "0"))
+        self.sh_prefetch_mb = int(os.environ.get("DSV41_L2PF_SH_MB", "0"))
+        if not (0 <= self.qkv_prefetch_mb <= 24 and 0 <= self.sh_prefetch_mb <= 24):
+            raise ValueError("DSV41_L2PF_QKV_MB and DSV41_L2PF_SH_MB must be in 0..24")
+        self._pf_ev = {}
         # Before any capture: graphs bake in weight addresses.
         self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
                             if MERGED_PROJ else 0)
@@ -290,6 +299,20 @@ class FastDecoder:
         self.draft_markov_topk = int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0'))
         if self.draft_markov_topk not in (0, 64, 128, 256, 512):
             raise ValueError('DSV41_DRAFT_MARKOV_TOPK must be 0, 64, 128, 256 or 512')
+        # TensorFold/vLLM-style candidates: each rank's top-(K/world) of its own vocabulary shard,
+        # gathered, instead of gathering the full fp32 logits and taking a global top-K. Greedy
+        # drafting only; proposals change, the verified output does not.
+        self.draft_markov_local = os.environ.get('DSV41_DRAFT_MARKOV_LOCAL', '0') == '1'
+        # Exact-equivalent split of the full Markov chain (greedy): each rank scores its own
+        # vocabulary half, so the five 66 MB Markov GEMVs read 33 MB each and the 2.6 MB logits
+        # gather becomes five 8-byte gathers. Proposals match the full chain up to GEMV rounding.
+        self.draft_markov_tp = os.environ.get('DSV41_DRAFT_MARKOV_TP', '0') == '1'
+        self._markov_rank = 0
+        if hasattr(self.draft_head, 'world'):
+            # The same rank model.py used to pick this head's vocabulary shard.
+            self._markov_rank = int(os.environ.get('RANK', '0'))
+            rows = self.draft_head.local.shape[0]
+            self.markov_head_local = self.markov_head_bf16[self._markov_rank * rows:(self._markov_rank + 1) * rows]
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
         self._index_cpos = torch.arange(self._n_cache(1), device=dev)
         self.graphs = OrderedDict()
@@ -467,6 +490,7 @@ class FastDecoder:
               else freqs[pos])
         both = getattr(w, "_wqkv_a", None) if MERGED_PROJ else None
         if both is not None:
+            self._pf_wait("qkv")
             qkv = R.qlinear(x, both)
             # contiguous: the norms' reductions then see exactly the tensors the split path makes
             q_lin, kv_lin = qkv[:, :w.wq_a.N], qkv[:, w.wq_a.N:]
@@ -478,6 +502,8 @@ class FastDecoder:
         if (lean_step and LEAN_ATTN and not FUSED_ATTN and LEAN_ROPE and LEAN_SOFTMAX and ring.is_contiguous()
                 and fq.dtype == torch.complex64):
             return self._attention_lean(x, qr, kv_lin, w, L, ring, fq, pos, sh_state)
+        self._pf_wait("qkv")
+        self._pf_wait("wq_b")
         q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
         kv = self._rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
@@ -560,6 +586,8 @@ class FastDecoder:
         a = self.a
         T = x.size(0)
         rd = a.rope_head_dim
+        self._pf_wait("qkv")
+        self._pf_wait("wq_b")
         qf = self.lean.rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim),
                             fq, rd, out_f32=True)
         kv = self.lean.rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq, rd)
@@ -718,12 +746,38 @@ class FastDecoder:
         if f is not None:
             f(name, L, t)
 
+    def _prefetch(self, groups):
+        """Touch each (key, tensors, budget_bytes) group on the L2 side stream in order, recording
+        one event per group for its consumer to wait on."""
+        side = self.l2pf_side
+        side.wait_stream(torch.cuda.current_stream())
+        for key, tensors, budget in groups:
+            if budget > 0 and l2pf.touch(side, tensors, budget):
+                ev = torch.cuda.Event()
+                ev.record(side)
+                self._pf_ev[key] = ev
+
+    def _pf_wait(self, key, stream=None):
+        ev = self._pf_ev.pop(key, None)
+        if ev is not None:
+            (stream or torch.cuda.current_stream()).wait_event(ev)
+
+    def _pf_join(self):
+        """Wait for every outstanding prefetch: graph capture must rejoin the side stream."""
+        for key in list(self._pf_ev):
+            self._pf_wait(key)
+
     def _layer_a(self, L, sh_state):
         """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
         a = self.a
         w = self.W.layers[L]
         h = self.h
         self._tap('h_in', L, h)
+        if self.qkv_prefetch_mb and self.l2pf_side is not None and self.lean is not None:
+            mb = self.qkv_prefetch_mb * 1024 ** 2
+            qkv = [w._wqkv_a] if getattr(w, "_wqkv_a", None) is not None else [w.wq_a, w.wkv]
+            first = min(mb, sum(l2pf.raw(t).numel() * l2pf.raw(t).element_size() for t in qkv))
+            self._prefetch([("qkv", qkv, first), ("wq_b", [w.wq_b], mb - first)])
         if L in self.W.engram:
             h = R.engram_forward(h, self.eg_rows[L], self.W.engram[L], a)
         if L in a.dspark_target_layer_ids:
@@ -739,6 +793,8 @@ class FastDecoder:
         self._tap('attn_x', L, y)
         y = self._attention(y, w, L, self.c.win[L], self.m.freqs_c if w.ratio else self.m.freqs_w, self.pos, sh_state)
         self._tap('attn_out', L, y)
+        if self.sh_prefetch_mb and self.l2pf_side is not None and getattr(w, "_sh_w13", None) is not None:
+            self._prefetch([("shared", [w._sh_w13, w.sh_w2], self.sh_prefetch_mb * 1024 ** 2)])
         if self.lean is not None:
             # written in place: hc_post reads a tile's residual streams before it stores the tile
             h = _hc_post_fused(y, residual, attn_post, attn_comb, out=self.h)
@@ -885,8 +941,11 @@ class FastDecoder:
 
         if side is not None:
             side.wait_stream(main)
+            self._pf_wait("shared", side)  # only the shared FFN waits; routed experts start now
             with torch.cuda.stream(side):
                 shared_up()
+        else:
+            self._pf_wait("shared")
         route = self.lean.route_prep(self.route_idx, self.lut[L], self.slots, null)
         block_slot, block_pair, block_route, NB = CUDA.build_routing_small(route, 16, k)
         self.lean.block_null(block_slot, null)
@@ -939,6 +998,7 @@ class FastDecoder:
             self._moe_merged(L, w)
             self.pre_mix.copy_(self.ffn_pre)
             return
+        self._pf_join()
         lean = self.lean is not None
         if self.shared_stream is None:
             out = self._routed_experts()
@@ -1028,9 +1088,22 @@ class FastDecoder:
         # The confidence head reads the UN-normed hc_pre output (as Model.dspark_draft does).
         x_pre = R.hc_pre(h, pre_mix)
         x = self._rmsnorm(x_pre, w.norm, a.norm_eps)
-        logits = R.head_logits(x, self.draft_head)  # [T_DRAFT, V]
-        shortlist = greedy and self.draft_markov_topk > 0 and not TREE_PROBE
-        if shortlist:
+        split = (greedy and self.draft_markov_tp and not TREE_PROBE and self.draft_markov_topk == 0
+                 and hasattr(self.draft_head, 'tp_markov_greedy'))
+        shortlist = split or (greedy and self.draft_markov_topk > 0 and not TREE_PROBE)
+        local = shortlist and not split and self.draft_markov_local and hasattr(self.draft_head, 'tp_candidates')
+        logits = None if (local or split) else R.head_logits(x, self.draft_head)  # [T_DRAFT, V]
+        if split:
+            proposals, embeds = self.draft_head.tp_markov_greedy(x, self.markov_embed_bf16, self.markov_head_local,
+                                                                 self.d_tok[0], _lin, self._markov_rank)
+            self.d_out.copy_(proposals)
+        elif local:
+            from engine.draft_markov import chain_greedy
+            ids, values = self.draft_head.tp_candidates(x, self.draft_markov_topk // self.draft_head.world)
+            proposals, embeds = chain_greedy(ids, values, self.markov_embed_bf16,
+                                             self.markov_head_bf16, self.d_tok[0], _lin)
+            self.d_out.copy_(proposals)
+        elif shortlist:
             from engine.draft_markov import shortlist_greedy
             proposals, embeds = shortlist_greedy(logits, self.markov_embed_bf16,
                                                 self.markov_head_bf16, self.d_tok[0],

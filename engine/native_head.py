@@ -29,8 +29,14 @@ def validate_config():
         from v41_ref import head_fmt, draft_head_fmt
         if head_fmt() != 'bf16' or os.environ.get('DSV41_HEAD_FP32', '0') == '1':
             raise ValueError('packed head requires native BF16 (HEAD_FMT=bf16, HEAD_FP32=0)')
-        if draft_head_fmt() not in ('off', 'bf16'):
-            raise ValueError('packed head requires DSV41_DRAFT_HEAD_FMT=off or bf16')
+        from engine.tensor_parallel import tp_draft_head_enabled
+        # A separate TP draft shard (DSV41_TP_DRAFT_HEAD=1) is built from the BF16 shard before
+        # packing, so a quantized draft format is fine there; without it the drafter would have
+        # to quantize the packed verifier head, which has no tensor to quantize.
+        allowed = ('off', 'bf16', 'fp8', 'fp4') if tp_draft_head_enabled() else ('off', 'bf16')
+        if draft_head_fmt() not in allowed:
+            raise ValueError('packed head requires DSV41_DRAFT_HEAD_FMT=off or bf16 '
+                             '(fp8/fp4 only with DSV41_TP_DRAFT_HEAD=1)')
     return mode
 
 

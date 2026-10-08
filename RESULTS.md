@@ -2766,3 +2766,125 @@ source and PTX snapshots. Reproduce with
 `tools/bench_fp4_sparse_tc.py` retains a gated cold driver for future qualified
 full-K candidates, but it was not run for this rejected prototype.
 
+### 2026-10-08 — Three existing arithmetic switches: −7.3 ms/step, acceptance unchanged over 22 prompts
+
+Before this, `DSV41_HC_KERNEL`, `DSV41_ATTN_STAGED` and `DSV41_ROUTER_BF16` were each turned
+down after a single-prompt A/B in which acceptance moved. Rounding changes reshuffle greedy
+near-ties, so one prompt's acceptance length moves in a random direction. This run measures
+step time and acceptance separately, paired over many prompts.
+
+**Per-operation cost (CUPTI, one loaded TP2 process).** Frozen 9,574-resident map, fixed depth 3,
+code prompt, 8 profiled rounds per configuration, graphs released between configurations, both
+ranks switched identically. Critical-path ms per four-row verify forward, attention blocks L1–39:
+
+| | base | base repeat | staged2 | router (BF16 + tail) | hc | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| attention core | 5.31 | 5.15 | 1.99 | 5.11 | 5.05 | 2.08 |
+| router | 3.18 | 3.26 | 3.11 | 1.53 | 3.21 | 1.53 |
+| mHC (incl. split-K kernel) | 8.93 | 8.86 | 8.70 | 9.00 | 6.96 | 6.69 |
+| attention blocks | 39.81 | 40.97 | 36.16 | 37.85 | 38.58 | 33.23 |
+| L0 up → L39 down | 73.85 | 76.06 | 70.44 | 72.28 | 72.79 | 67.60 |
+
+The two baseline runs emitted identical tokens and still differ by 3.1 ms of MoE time, so
+whole-forward spans carry about ±2 ms of run-to-run noise. The component rows are stable.
+
+**Throughput and acceptance (paired, 24 prompts).** Same frozen map and depth. Prompts cover
+code, prose, math, JSON/YAML, Japanese, French and HTML. Each prompt ran greedy to EOS or 160
+tokens in both arms, with arm order alternating per prompt. Two prompts finished in fewer than
+8 steps and were excluded. Ranks agreed on every output; 4 of 24 outputs were identical.
+
+| | base | all | paired Δ ± SE (n = 22) |
+| --- | ---: | ---: | ---: |
+| ms per decode step | 88.91 | 81.61 | −7.30 ± 0.50 |
+| mean accepted length | 2.711 | 2.714 | +0.003 ± 0.026 |
+| decode tok/s | 30.25 | 32.97 | +2.72 ± 0.35 (+9.0%) |
+
+Per-prompt acceptance moved both ways, by up to ±0.3, and averaged to zero. No output in either
+arm repeated any 8-gram. The math, JSON and YAML answers are equivalent. The Japanese answer
+contains U+FFFD in both arms, so it is not caused by these switches; it is unexamined (it may be
+the driver's whole-sequence decode).
+
+Caveats: "base" ran with `DSV41_ROUTER_FUSED_TAIL=0`, whereas serving uses 1 (a bit-exact
+fusion). Its share of the difference is ≤0.2 ms/forward from the trace. `DSV41_ROUTER_BF16=1`
+adds about 150 MiB per rank. This is a 160-token greedy screen on one image
+(`api-pair-recovery-v1`). It does not establish long-context, sampled-decoding or tool-call
+quality, and `engine/test_spec_lossless.py` was not run.
+
+**Enabled in `.env` and `.env.example`** (`DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`,
+`DSV41_HC_KERNEL=1`; `.env.example` also moves to `DSV41_HEAD_KERNEL=packed`, which serving
+already used). The live HTTP benchmark used the Oct 7 TensorFold-comparison driver unchanged
+(`results/bench-switches-20261008/run.py`): 512 forced tokens, greedy, seed 42, one warmup and
+two measured runs per workload. Serving used dynamic depth and live adaptation, image
+`api-pair-recovery-v1`, and each arm ran right after a pair restart:
+
+| Workload | tok/s before → after | ms/step before → after | accepted before → after | TF / ours |
+| --- | ---: | ---: | ---: | ---: |
+| Prose | 21.93 → 23.09 (+5.3%) | 86.1 → 80.3 | 1.92 → 1.88 | 2.14x → 1.86x |
+| Angry Birds HTML | 43.30 → 50.26 (+16.1%) | 104.7 → 91.9 | 4.63 → 4.79 | 2.22x → 1.70x |
+| Python code | 32.26 → 37.37 (+15.8%) | 93.3 → 90.5 | 3.06 → 3.46 | 2.11x → 1.66x |
+
+The TensorFold column uses its Oct 7 numbers; TF was not re-run. Step time improved on every
+workload, most on HTML, where dynamic depth picks wider verify blocks. The extra HTML and code
+gain is acceptance on these particular trajectories (outputs differ between arms). Plan on the
+paired +9%. The base code runs alone ranged 86.9–99.7 ms/step. No post-change base re-run was
+made, so adaptation drift between the arms is not excluded.
+
+Same session: `DSV41_ENGRAM_PINNED=1` re-measured with no gain (see `docs/gotchas.md`).
+
+Artifacts: `results/attn-block-20261008/` (per-config traces, both ranks),
+`results/accept-ab-20261008/base-vs-all/` (per-prompt rows with text),
+`results/engram-pinned-20261008/`. Drivers: `tools/bench_attn_block_tp.py`,
+`tools/bench_accept_ab_tp.py`, `tools/bench_engram_pinned_tp.py`.
+
+### 2026-10-08 — Draft pass: FP8 draft head + split Markov chain (+2.3%); L2 prefetch and shortlists rejected
+
+Same method as above: one loaded TP2 process, frozen map, fixed depth 3, 24 prompts, paired.
+Draft-only changes leave the target output untouched, so every arm below produced identical
+tokens on all 24 prompts and both ranks. The acceptance deltas measure proposal quality alone.
+
+| Draft change | ms/step Δ ± SE | accepted Δ ± SE | tok/s Δ ± SE |
+| --- | ---: | ---: | ---: |
+| Global top-128 Markov shortlist (`DRAFT_MARKOV_TOPK=128`) | −0.33 ± 0.56 | −0.101 ± 0.027 | −1.19 ± 0.36 |
+| Per-rank top-256 candidates (`DRAFT_MARKOV_LOCAL=1`, K=512) | −1.79 ± 0.43 | −0.044 ± 0.014 | +0.22 ± 0.30 |
+| **FP8 draft-only shard + split Markov chain** (deployed) | **−1.79 ± 0.43** | **+0.004 ± 0.005** | **+0.81 ± 0.21** |
+
+Baselines: 81.18 ms/step for the shortlist row and 77.81 for the deployed row. The deployed row
+ran on `draft-l2pf-v1`, which is `api-pair-recovery-v1` plus this session's engine files; the
+first two ran from a source snapshot. The FP8 draft shard is +331,280,000 bytes per rank. It is
+built from the BF16 vocabulary shard before packing; the verifier keeps the packed BF16 head. The
+split chain gives each rank its 64,640 vocabulary rows of the Markov head and exchanges one
+(max, global id) pair per position instead of 2.6 MB of logits. A two-rank CPU simulation matched
+the full-vocabulary chain token for token. The first shortlist run had a post-switch warmup
+artifact (~1.9 ms/step on the run after each switch), which alternating arm order cancels; the
+driver now warms up on the measured prompt.
+
+Draft pass traced with the FP8 draft head: 8.72 ms full Markov, 6.48 ms with per-rank candidates
+(K=128). The FP8 head kernel takes ~230 µs per call, so it is not bandwidth-bound yet.
+
+**L2 prefetch (rejected, switches default 0).** Cold FP8 projections are latency-bound on GB10:
+wq_b 166 µs cold vs 46 µs L2-warm. New prefetch sites for this layer's wq_a+wkv / wq_b
+(`DSV41_L2PF_QKV_MB`) and the shared expert (`DSV41_L2PF_SH_MB`) cut dense time by up to
+3.1 ms per forward. None improved the forward: 66.4 / 68.3 ms off (two runs), 69.4–73.1 ms
+`touch`, 70.6 ms `touchn`, 66.8–67.9 ms `bulk`. Details in `docs/gotchas.md`.
+
+**Deployed live benchmark** (driver `results/bench-switches-20261008/run.py`, 512 forced tokens,
+greedy, median of two; TensorFold from Oct 7):
+
+| Workload | Before | Switches | + Draft | TF / ours |
+| --- | ---: | ---: | ---: | ---: |
+| Prose | 21.93 | 23.09 | 25.43 | 1.68x |
+| Angry Birds HTML | 43.30 | 50.26 | 52.68 | 1.63x |
+| Python code | 32.26 | 37.37 | 38.38 | 1.61x |
+
+ms/step before → deployed: 86.1 → 75.6, 104.7 → 85.5, 93.3 → 80.9. Accepted length 1.92 → 1.95,
+4.63 → 4.72, 3.06 → 3.18. Paired estimates predict about +11–12%. The extra live gain includes
+acceptance on these particular trajectories and drift between restarts.
+
+Not run: `engine/test_spec_lossless.py`, which builds a single-node engine and would not exercise
+the TP2 draft paths; the 24/24 identical outputs cover draft-only changes. Sampled decoding still
+uses the full Markov path with the FP8 draft head; its acceptance was not measured.
+
+Artifacts: `results/accept-ab-20261008/{all-vs-mk128,fp8-full-vs-local512,serving-vs-draft}/`,
+`results/draft-trace-20261008/`, `results/l2pf-trace-20261008/`, `results/l2pf-bulk-20261008/`,
+`results/bench-switches-20261008/final/`. Image `deepseek-v41-flash-spark:draft-l2pf-v1`
+(sha256:83da4557…) on both nodes.

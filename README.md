@@ -79,10 +79,22 @@ time to first token. These are short throughput checks, not answer-quality tests
 or measurements of the larger 9,800-expert example. Prompt content, draft acceptance,
 expert history and cache reuse affect speed. See [full results](RESULTS.md).
 
+**2026-10-08** — `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`, then
+FP8 draft head + split Markov chain (`DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`,
+`DSV41_DRAFT_MARKOV_TP=1`), all in `.env.example`. 512-token greedy runs, median of two:
+
+| Workload | Before | Switches | + Draft |
+| --- | ---: | ---: | ---: |
+| Coastal-ecosystem essay | 21.9 tok/s | 23.1 tok/s | **25.4 tok/s** |
+| Angry Birds HTML | 43.3 tok/s | 50.3 tok/s | **52.7 tok/s** |
+| Python LRU cache with TTL | 32.3 tok/s | 37.4 tok/s | **38.4 tok/s** |
+
+Paired 22-prompt averages: **+9%** and **+2.3%** ([RESULTS.md](RESULTS.md)).
+
 Optional `DSV41_HEAD_KERNEL=packed` losslessly packs the native BF16 vocabulary
 head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
 decode round speed about **2%**, with identical tested tokens and acceptance.
-It requires `DSV41_DRAFT_HEAD_FMT=off` (or `bf16`); the example leaves it off.
+It requires `DSV41_DRAFT_HEAD_FMT=off` (or `bf16`); the example now enables it.
 
 Reproduce an individual workload against a running server:
 

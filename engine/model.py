@@ -271,8 +271,10 @@ class Weights:
             rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
             if world != 2 or head.shape[0] % world:
                 raise ValueError('vocabulary TP requires two equal shards')
-            self.head = VocabParallelHead(R.make_head(head.chunk(world, dim=0)[rank].to(device)), world)
-            self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp)
+            shard = head.chunk(world, dim=0)[rank].to(device)
+            self.head = VocabParallelHead(R.make_head(shard), world)
+            self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp, source=shard)
+            del shard
         else:
             self.head = R.make_head(head.to(device))
             # DSV41_DRAFT_HEAD_FMT: the verifier keeps `head`; only the drafter reads the cheaper

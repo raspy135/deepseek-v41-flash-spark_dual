@@ -96,6 +96,8 @@ class EngramTable:
         # synchronises the stream and absorbs the queued graph work) but it does NOT make the run
         # faster -- measured 12.04-13.57 s of decode against 12.03-12.14 s pageable, i.e. the host
         # simply blocks somewhere else instead. Kept behind the switch rather than deleted.
+        # Re-measured 2026-10-08 (ABBA, bit-identical output): 85.4 -> 85.0 ms/step prose,
+        # 86.0 -> 86.1 code -- still no gain; see docs/gotchas.md.
         self.pinned = os.environ.get("DSV41_ENGRAM_PINNED", "0") == "1"
         self._stage = [None, None]
         self._inv_stage = [None, None]

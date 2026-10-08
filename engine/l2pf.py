@@ -20,8 +20,8 @@ import triton.language as tl
 MB = int(os.environ.get("DSV41_L2PF_MB", "2"))
 MODE = os.environ.get("DSV41_L2PF_MODE", "touch")
 PACE_GBPS = int(os.environ.get("DSV41_L2PF_PACE_GBPS", "0"))
-if MODE not in ("touch", "bulk") or PACE_GBPS < 0:
-    raise ValueError("L2 prefetch mode must be touch/bulk and pace >= 0")
+if MODE not in ("touch", "touchn", "bulk") or PACE_GBPS < 0:
+    raise ValueError("L2 prefetch mode must be touch/touchn/bulk and pace >= 0")
 VERSION = 3  # Raw-byte loads: FP8 storage must not enter Triton's masked-load casts.
 _SINK = None
 
@@ -31,6 +31,17 @@ def _touch(P, SINK, N, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     i = pid * BLOCK + tl.arange(0, BLOCK)
     v = tl.load(P + i, mask=i < N, other=0, eviction_policy="evict_last")
+    tl.store(SINK + pid, tl.sum(v.to(tl.float32), 0))
+
+
+@triton.jit
+def _touch_normal(P, SINK, N, BLOCK: tl.constexpr):
+    # As _touch with the default eviction priority. evict_last lines are sticky: prefetching
+    # 12 MiB of the 24 MiB L2 that way slowed the following MoE and draft kernels (+3.4 / +2.2 ms
+    # per forward/pass, results/l2pf-trace-20261008), so large budgets use this one.
+    pid = tl.program_id(0)
+    i = pid * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(P + i, mask=i < N, other=0)
     tl.store(SINK + pid, tl.sum(v.to(tl.float32), 0))
 
 
@@ -102,6 +113,8 @@ def touch(stream, tensors, budget: int, *, mode=None, pace=None):
             blocks = min(triton.cdiv(take, 4096), _SINK.numel())
             if mode == "bulk" and flat.data_ptr() % 16 == 0 and take % 16 == 0:
                 _bulk_prefetch[(2,)](flat, take, pace, 32768, num_warps=1)
+            elif mode == "touchn":
+                _touch_normal[(blocks,)](flat[:take], _SINK[:blocks], take, BLOCK=4096, num_warps=4)
             else:
                 _touch[(blocks,)](flat[:take], _SINK[:blocks], take, BLOCK=4096, num_warps=4)
     return budget - left

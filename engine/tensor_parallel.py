@@ -22,7 +22,7 @@ def tp_draft_head_enabled():
     return value == '1'
 
 
-def make_tp_draft_head(head, *, load_mtp=True):
+def make_tp_draft_head(head, *, load_mtp=True, source=None):
     """Quantize this rank's draft-only vocab shard; retain the verifier and gather layout.
 
     The separate opt-in preserves the old TP behavior when DRAFT_HEAD_FMT is left
@@ -36,7 +36,13 @@ def make_tp_draft_head(head, *, load_mtp=True):
     if not isinstance(head, VocabParallelHead):
         raise TypeError('TP draft head requires a VocabParallelHead verifier')
     import v41_ref as R
-    local = R.make_draft_head(head.local)
+    if source is not None and not isinstance(head.local, torch.Tensor):
+        # The verifier shard is packed (DSV41_HEAD_KERNEL=packed) and has no tensor to quantize;
+        # build the draft copy from the BF16 shard it was packed from.
+        fmt = R.draft_head_fmt()
+        local = R._head_in_format(source, fmt) if fmt in ('fp8', 'fp4') else None
+    else:
+        local = R.make_draft_head(head.local)
     return None if local is None else VocabParallelHead(local, head.world)
 
 
@@ -199,3 +205,49 @@ class VocabParallelHead:
         comm.all_gather_fast(gathered, flat, group=collective_group())
         return gathered.view(self.world, flat.shape[0], flat.shape[1]).transpose(0, 1).reshape(
             *x.shape[:-1], self.shape[0])
+
+    def tp_markov_greedy(self, x, embed, head_local, anchor, linear, rank):
+        """Greedy DSpark Markov chain without gathering logits: each rank biases its own vocabulary
+        half (head_local = this rank's rows of the Markov head) and only (max, global id) pairs cross
+        the network, one tiny all-gather per draft position. Ties resolve to the lower global id,
+        as a full-vocabulary argmax does. Returns (proposals [T] int64, previous-token embeddings)."""
+        import v41_ref as R
+        local = R.head_logits(x, self.local).reshape(-1, self.local.shape[0])
+        offset = rank * self.local.shape[0]
+        prev = anchor.reshape(1)
+        proposals, embeddings = [], []
+        for i in range(local.shape[0]):
+            e = embed[prev]
+            embeddings.append(e)
+            lg = local[i] + linear(e, head_local).float()[0]
+            best = lg.argmax().view(1)
+            packed = torch.cat([lg.gather(0, best),
+                                (best.to(torch.int32) + offset).view(torch.float32)]).contiguous()
+            gathered = torch.empty(self.world * 2, dtype=torch.float32, device=lg.device)
+            comm.all_gather_fast(gathered, packed, group=collective_group())
+            pairs = gathered.view(self.world, 2)
+            winner = pairs[:, 0].argmax().view(1)
+            prev = pairs[:, 1].contiguous().view(torch.int32).gather(0, winner).to(torch.int64)
+            proposals.append(prev)
+        return torch.cat(proposals), embeddings
+
+    def tp_candidates(self, x, k_local):
+        """Each rank's top-k_local logits per row, gathered: (global ids int64 [rows, world*k],
+        values fp32 [rows, world*k]), ids ascending per row so ties resolve to the lower id like a
+        full-vocabulary argmax. Only the candidates cross the network (rows*world*k*8 bytes)
+        instead of the full fp32 logits. Both ranks receive identical tensors."""
+        import v41_ref as R
+        local = R.head_logits(x, self.local).reshape(-1, self.local.shape[0])
+        rows = local.shape[0]
+        values, ids = local.topk(k_local, dim=-1)
+        packed = torch.cat([values, ids.to(torch.int32).view(torch.float32)], dim=-1).contiguous()
+        gathered = torch.empty((self.world * rows, 2 * k_local), dtype=torch.float32, device=local.device)
+        comm.all_gather_fast(gathered, packed, group=collective_group())
+        g = gathered.view(self.world, rows, 2 * k_local)
+        offset = (torch.arange(self.world, device=local.device, dtype=torch.int64)
+                  * self.local.shape[0]).view(self.world, 1, 1)
+        gids = g[..., k_local:].contiguous().view(torch.int32).to(torch.int64) + offset
+        gids = gids.permute(1, 0, 2).reshape(rows, self.world * k_local)
+        gvals = g[..., :k_local].permute(1, 0, 2).reshape(rows, self.world * k_local)
+        gids, order = gids.sort(dim=-1)
+        return gids, gvals.gather(1, order)

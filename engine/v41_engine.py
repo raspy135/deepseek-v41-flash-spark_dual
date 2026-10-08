@@ -1114,6 +1114,8 @@ class V41Engine:
                 "tp_attention": os.environ.get('DSV41_TP_ATTN', '0'),
                 "tp_draft_attention": os.environ.get('DSV41_TP_DRAFT_ATTN', '0'),
                 "draft_markov_topk": int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0')),
+                "draft_markov_local": os.environ.get('DSV41_DRAFT_MARKOV_LOCAL', '0'),
+                "draft_markov_tp": os.environ.get('DSV41_DRAFT_MARKOV_TP', '0'),
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
                 "tp_embed": os.environ.get('DSV41_TP_EMBED', '0'),
                 "tp_draft_experts": self.tp_draft_experts,
@@ -1199,6 +1201,8 @@ class V41Engine:
                 "l2pf_version": l2pf.VERSION,
                 "l2pf_mode": l2pf.MODE,
                 "l2pf_attn_mb": int(os.environ.get("DSV41_L2PF_ATTN_MB", "0")),
+                "l2pf_qkv_mb": int(os.environ.get("DSV41_L2PF_QKV_MB", "0")),
+                "l2pf_sh_mb": int(os.environ.get("DSV41_L2PF_SH_MB", "0")),
                 "l2pf_pace_gbps": l2pf.PACE_GBPS,
                 # Which verify widths exist (buffers, graphs). The depth each step uses is
                 # decided on rank 0 and broadcast with the control flag, so the other
@@ -3191,6 +3195,7 @@ class V41Engine:
             "tp_experts": self.ep.tensor_parallel,
             "tp_draft_attention": os.environ.get('DSV41_TP_DRAFT_ATTN', '0') == '1',
             "draft_markov_topk": int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0')),
+            "draft_markov_local": os.environ.get('DSV41_DRAFT_MARKOV_LOCAL', '0') == '1',
             "prefill_dual_rail": self.ep.prefill_dual_rail,
             "collective_rails_version": DT.collective_rails.VERSION,
             "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),

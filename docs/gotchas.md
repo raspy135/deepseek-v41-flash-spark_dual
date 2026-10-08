@@ -427,6 +427,13 @@ What did NOT help, both measured rather than reasoned about:
   instead. Its original note said exactly this, and it is still true for a new reason — once the
   gather is fixed, the GPU is genuinely the bottleneck (`layers_ms_per_step` ≈ 150 of a ~167 ms
   step). Leave `DSV41_ENGRAM_PINNED` off unless something changes upstream of it.
+  Re-measured 2026-10-08 after a CUPTI trace showed 0.8–1.5 ms GPU gaps at both Engram graph
+  boundaries: same loaded TP2 process, frozen map, fixed depth 3, ABBA ×2, 192 tokens, outputs
+  bit-identical on both ranks. Prose 85.41 → 84.99 ms/step, code 85.99 → 86.14 ms/step; run
+  ranges overlap. The traced gaps were mostly profiler cost: CUPTI made each segment's
+  `cudaGraphLaunch` take 0.55–1.05 ms of host time, and the traced round ran 3.5 ms slower
+  than unprofiled steps from the same run. Do not size host gaps from a kernel trace.
+  (`results/engram-pinned-20261008/`, `tools/bench_engram_pinned_tp.py`.)
 
 The residual utilization dip is therefore real but small. Anything further has to come from the
 GPU side: fewer bytes per step, or more accepted tokens per step (`accept_len` is ~2.5 of 6).
@@ -1905,3 +1912,86 @@ Before making such claims, qualify instrumentation with a small serial/fork-join
 calibration and collect warmed repeated samples with their spread. Its 16 MiB
 flush is controlled cache pressure, not a guarantee of fully cold DRAM weights.
 
+## A desktop session on one node stalls the pair (2026-10-07)
+
+Symptom: the decode probe compares nodes and one random cheap kernel (`rope`,
+`lean.rmsnorm`, `residual`, `attention.softmax`, a 0.1 ms projection) takes
+0.5-1.5 ms on node 0. The peer then shows the same amount in its next
+collective. Example: L23 `projection#2` measured 1.256 ms on node 0 vs 0.126 ms on node 1, and
+node 1 waited 1.130 ms in the following `wo_b` all-reduce. Across the three
+saved reports in `results/decode-probe-20261008/`, 29 of 32 leaf-op gaps
+larger than 0.3 ms were on node 0, and the affected op changed between runs.
+
+The probe's events are recorded inside the CUDA graph, so this is GPU-side.
+Host launch gaps and the GIL cannot appear between two in-graph events. Node 0
+runs a logged-in GNOME desktop on the same GB10: Xorg, gnome-shell, Chromium
+(which was rendering the decode dashboard itself) and an Electron app's GPU
+process. Node 1 has no display connected, and its only graphical clients are
+the GDM greeter's Xorg and gnome-shell (18 + 6 MiB). Those clients cost nothing
+measurable without a display. Graphics work is time-sliced against the engine's
+compute context.
+
+`tools/gpu_timeslice_gaps.cu`, engine idle, 5 s windows:
+
+| node | gaps > 50 us | gaps > 0.5 ms | max | GPU time lost |
+|---|---|---|---|---|
+| 0, desktop busy | 52-59/s | 73-74 per 5 s | 1.29 ms | 2.4-2.6% |
+| 0, desktop quieter | 8-12/s | 5 per 3-5 s | 1.21-1.49 ms | 0.24-0.48% |
+| 1, no display, greeter only | 0-0.2/s | 0 | 0.19 ms | 0.00% |
+
+The lost share depends on what is on screen. The ~1.0-1.5 ms gap length did
+not change. Under TP2 lockstep every stall on one node is paid by both. No
+engine-side setting addresses this: stream priority does not cross contexts,
+and MPS does not cover graphics. Run the serving nodes with no logged-in
+graphical session and view the dashboards from another machine. Rerun the gap
+probe on both nodes before attributing a cross-node imbalance to the engine.
+
+## One prompt cannot reject an arithmetic change on acceptance (2026-10-08)
+
+Any rounding change reshuffles greedy near-ties. The text diverges after a few tokens, and that
+prompt's accepted length moves by up to ±0.3 in either direction. `DSV41_HC_KERNEL` was rejected
+for a 0.07–0.10 drop on one prompt, and `DSV41_ATTN_STAGED` / `DSV41_ROUTER_BF16` were screened the
+same way. Paired over 22 prompts, the three switches together measured −7.30 ± 0.50 ms/step,
+acceptance +0.003 ± 0.026 and +9.0% tok/s (RESULTS.md 2026-10-08). Measure step time per operation
+(token-independent) and acceptance as a paired mean over many prompts with its standard error:
+`tools/bench_accept_ab_tp.py`.
+
+## Cold FP8 projections are latency-bound, and L2 prefetch did not recover it (2026-10-08)
+
+On GB10 (24 MiB L2), the FP8 decode projections run far below DRAM bandwidth when their weights
+are cold. With four rows, after a 256 MiB flush: wq_b 166 µs cold vs 46 µs from L2, wq_a+wkv
+87 vs 35, wo_b 171 vs 91, shared w13 103 vs 40. The routed expert kernels reach ~220 GB/s.
+`DSV41_L2PF_QKV_MB` (this layer's wq_a+wkv then wq_b, issued while the HC mixes run) and
+`DSV41_L2PF_SH_MB` (the shared expert, issued while the FFN mixes and router run) test whether
+TensorFold-style prefetch recovers it. Outputs were identical in every configuration
+(`results/l2pf-trace-20261008/`, `results/l2pf-bulk-20261008/`):
+
+* `touch` (`evict_last`) with consumer waits made it worse: 66.8 → 69.4–73.1 ms per verify
+  forward. Dense time fell by up to 3.1 ms, but projections waited up to 5.5 ms for the touch
+  kernels. The sticky lines also slowed the MoE and the draft (+3.4 / +2.2 ms at 12 MiB).
+* `touchn` (normal eviction, waited): 70.6 ms.
+* `bulk` hints, not waited: dense time fell 1.1–1.9 ms, but the forward stayed at 66.8–67.9 ms
+  against 66.4 / 68.3 ms for two unprefetched runs. The ~60 µs windows cannot land 12–24 MiB, and
+  the rest competes with the projections and MoE for DRAM.
+
+Both switches stay at 0. The headroom is in the cold FP8 kernel itself (memory-level
+parallelism), not in prefetch scheduling.
+
+## Markov candidate shortlists cost acceptance on this drafter (2026-10-08)
+
+Greedy DSpark with the Markov bias applied only to a candidate shortlist, as TensorFold and
+vLLM do. Draft-only changes leave the target output untouched; all 24 outputs were identical
+in every arm, so these paired acceptance numbers are exact:
+
+* global top-128 (`DSV41_DRAFT_MARKOV_TOPK=128`): −0.10 ± 0.03 accepted, −0.3 ms/step, −1.2 tok/s.
+* per-rank top-256 with only candidates gathered (`DSV41_DRAFT_MARKOV_LOCAL=1`, K=512):
+  −1.79 ± 0.43 ms/step and −0.044 ± 0.014 accepted, net +0.2 ± 0.3 tok/s.
+
+`DSV41_DRAFT_MARKOV_TP=1` keeps the full chain and splits it by vocabulary half instead: each rank
+biases its own 64,640 rows and exchanges one (max, id) pair per position. Proposals match the
+full-vocabulary chain (the CPU check is in RESULTS.md 2026-10-08).
+
+Measurement note: re-capturing graphs after a runtime configuration switch, with a 24-token
+warmup on another prompt, left the first measured run ~1.9 ms/step slower. Alternating arm order
+cancels this in the mean but inflates the error. `tools/bench_accept_ab_tp.py` now warms up on
+the prompt about to be measured.

@@ -468,6 +468,9 @@ if HC_MM_TILE not in (16, 32):
 # tok/s is a wash (explain went backwards) and every workload's tokens change. That is a numerics
 # change (~1e-6), not a speedup, and it is why b79092a removed the earlier wiring. Do not flip this
 # without the pair A/B and the quality probes.
+# 2026-10-08: that one-prompt acceptance drop was noise. Paired over 22 prompts, together with
+# staged attention and the BF16 router: -7.30 +- 0.50 ms/step, acceptance +0.003 +- 0.026
+# (RESULTS.md 2026-10-08). Judge acceptance over many prompts, never one.
 # DSV41_HC_PREC picks the tl.dot input precision: "ieee" is true fp32 (19.6 us cold), "tf32x3" is
 # the 3-pass tensor-core emulation (13.4 us, ~2.5e-6 vs cuBLAS). See tools/bench_fp32_skinny.py.
 HC_KERNEL = os.environ.get("DSV41_HC_KERNEL", "0") == "1"
