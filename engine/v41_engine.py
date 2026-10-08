@@ -548,6 +548,18 @@ class V41Engine:
         if self.user_prompt_max_loads < 0:
             raise ValueError('DSV41_USER_PROMPT_MAX_LOADS must be nonnegative (0 is unlimited)')
         self.dynamic_experts = os.environ.get('DSV41_DYNAMIC_EXPERTS', '0') == '1'
+        if (expert_format or "fp4").lower() == "exl3":
+            # Adaptive residency (global swaps, request-unit adaptation, the predictive shadow) is
+            # native-FP4 only right now: it drives store.resolve() and the sector streams, which are
+            # not wired to the EXL3 pack yet. Serve the static pruned set instead. Rank-invariant
+            # (both ranks see expert_format=exl3) and recorded in the boot guard. The features stay
+            # on for fp4 and return for exl3 with the P3/P4 kernels.
+            if self.dynamic_experts:
+                log("EXL3: DSV41_DYNAMIC_EXPERTS is native-FP4 only; booting static pruned residency")
+                self.dynamic_experts = False
+            for _k in ("DSV41_RESIDENT_EXPERTS",):
+                if os.environ.pop(_k, None):
+                    log(f"EXL3: ignoring {_k} (it is a dynamic-residency budget)")
         from engine.expert_budget import resident_budget
         self.resident_budget = resident_budget(os.environ.get('DSV41_RESIDENT_EXPERTS', ''),
             dynamic=self.dynamic_experts, layers=self.args.n_layers,
@@ -620,6 +632,9 @@ class V41Engine:
         self.prefill_budget_last = {}
         from engine.predictive_prefill import PredictivePrefill
         self.predictive = PredictivePrefill(self.args.n_layers, self.args.n_routed_experts)
+        if (expert_format or "fp4").lower() == "exl3" and self.predictive.mode != 'off':
+            # predictive prefill requires dynamic_experts, which exl3 does not support yet
+            self.predictive.mode = 'off'
         # Serving preference, independent of the checkpoint's reference value (512).
         # Wider attention is experimental: no measured hallucination reduction is claimed.
         self.args.index_topk = int(os.environ.get("DSV41_INDEX_TOPK", "1024"))
@@ -730,12 +745,16 @@ class V41Engine:
                 # null slot computes zeros instead of being skipped -- correct, just not free.
                 return cb3_moe_fn(x, slots, weights, arena, limit,
                                   out_dtype=out_dtype, slots_repeat=slots_repeat)
-            extra = {"null_slot": null_slot} if null_slot >= 0 and self.kernel == "triton-fp4" else {}
-            if self.kernel == "triton-fp4":
+            # The FP4 path serves both the main arena under fp4 and the DSpark draft arena under
+            # ANY main format (the draft stays FP4). Gate its hooks on the FP4 kernel being real,
+            # not on the main kernel name -- otherwise the draft silently loses routing/prefill.
+            fp4_native = self.kernel != "dequant-fallback"
+            extra = {"null_slot": null_slot} if null_slot >= 0 and fp4_native else {}
+            if fp4_native:
                 extra['prefill'] = prefill
-            if routing_ids is not None and self.kernel == "triton-fp4":
+            if routing_ids is not None and fp4_native:
                 extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
-            if stage_mark is not None and self.kernel == "triton-fp4":
+            if stage_mark is not None and fp4_native:
                 extra['stage_mark'] = stage_mark
             return fp4_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
                               slots_repeat=slots_repeat, **extra)
@@ -772,8 +791,12 @@ class V41Engine:
             _tr = self.ep.rank if self.ep.tensor_parallel else 0
             self.expert_bytes = _XR.record_nbytes(3.0, _tr, _tw)
         self.tp_draft_experts = os.environ.get('DSV41_TP_DRAFT_EXPERTS', '0') == '1'
+        # The DSpark draft arena is always fp4_arena_cls (line below), so draft TP needs native FP4
+        # for the *draft* -- not for the main routed experts. Under exl3 the main kernel is
+        # 'exl3-ref' and the draft still runs the FP4 TP path, which is the intended combination.
         if self.tp_draft_experts and (not self.ep.tensor_parallel
-                or self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
+                or (self.kernel != 'triton-fp4' and exl3_cls is None)
+                or cb3_cls is not None or sim_bits
                 or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
             raise ValueError('draft TP requires native FP4 TP2 with output layout')
         if self.ep.tensor_parallel:
@@ -1407,7 +1430,12 @@ class V41Engine:
             # layer-B graph (engine/fastdecode.py::_layer_b), so the pair gets the same graphed
             # decode as one box. DSV41_FAST=0 is the escape hatch back to eager.
             from engine.fastdecode import FastDecoder
-            self.fast = FastDecoder(self.model, self, use_graphs=os.environ.get("DSV41_GRAPHS", "1") == "1")
+            # The reference MoE does a host sync per layer (torch.unique(...).tolist()); a captured
+            # graph cannot contain one, so EXL3 runs the eager step until the packed kernels land.
+            self.fast = FastDecoder(self.model, self, use_graphs=(
+                os.environ.get("DSV41_GRAPHS", "1") == "1" and exl3_cls is None))
+            if exl3_cls is not None:
+                log("EXL3: CUDA graphs disabled (the reference MoE is not capturable); eager step")
             # Resident (device slot LUT) mode: every routable expert is in the arena, so routing
             # is a device gather and the whole layer captures as one graph.
             #
@@ -2038,6 +2066,8 @@ class V41Engine:
 
         Returns [(layer, expert_out, expert_in, gain), ...], best gain first.
         """
+        if getattr(self, "expert_format", "") == "exl3":
+            return []
         import numpy as np
         focus = getattr(self, 'user_prompt', None)
         if self._prune_trace is None or not getattr(self, "model_prune_mask", None):
@@ -2216,7 +2246,7 @@ class V41Engine:
         st = self.store
         world, rank = ((1, 0) if getattr(self.ep, 'tensor_parallel', False)
                        else (max(1, self.ep.world), self.ep.rank))
-        null = int(getattr(st, "null_slot", -1))
+        null = int(getattr(st, "null_slot", -1) or -1)
 
         # Validate before touching anything: a plan that is wrong is wrong before the first load,
         # and stopping here leaves the arena exactly as it was.
@@ -2347,6 +2377,10 @@ class V41Engine:
         be captured too; once per idle tick is often enough for a half-life measured in millions
         of slots, and it keeps the hot path untouched.
         """
+        if getattr(self, "expert_format", "") == "exl3":
+            # EXL3 runs the static pruned set; the swap machinery is native-FP4 (null/sector
+            # semantics, FP4 kernels) and is not wired to the pack yet. Rank-invariant.
+            return False
         if not ADAPT.swap:
             return False
         rep = self.model.prune_miss_report()

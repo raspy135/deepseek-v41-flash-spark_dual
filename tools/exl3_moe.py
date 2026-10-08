@@ -57,7 +57,14 @@ class Exl3Arena:
         self.svh1 = torch.empty((slots, *self.shapes["svh1"]), **f16)
         self.svh3 = torch.empty((slots, *self.shapes["svh3"]), **f16)
         self.svh2 = torch.empty((slots, *self.shapes["svh2"]), **f16)
-        self.bits = torch.zeros(slots, dtype=torch.int16, device=dev)
+        # Every slot is a ZERO expert until loaded: zero the scales so an unloaded slot decodes to
+        # exactly 0 (the plan's null slot), not to the codebook value of a garbage trellis. This is
+        # what makes fastdecode's discarded warm-up pass safe -- it runs _layer_b before _layer_ab
+        # fills self.slots, so the table is still zeros -- and it matches the FP4 arena's null slot.
+        for _n in ("suh1", "suh3", "suh2", "svh1", "svh3", "svh2"):
+            getattr(self, _n).zero_()
+        self.bits = [int(self.slot_bits)] * self.slots
+        self._loaded = set()
         self._tensors = ("t1", "t3", "t2", "suh1", "suh3", "suh2", "svh1", "svh3", "svh2")
 
     @property
@@ -88,10 +95,17 @@ class Exl3Arena:
             else:
                 dst.copy_(src.to(dst.dtype), non_blocking=non_blocking)
         self.bits[slot] = int(bits)
+        self._loaded.add(int(slot))
 
     def read_slot(self, slot: int) -> dict[str, torch.Tensor]:
         """The stored tensors of one slot, trellis cut back to its real width (for the reference)."""
-        w = R.tile_words(int(self.bits[slot].item()))
+        if slot < 0:
+            raise IndexError(f"EXL3 slot {slot}: a routed pair reached an unmapped (-1) table entry")
+        b = int(self.bits[slot])
+        if b <= 0:
+            raise IndexError(f"EXL3 slot {slot} was never loaded (bits={b}, loaded={slot in self._loaded}); "
+                             f"arena has {self.slots} slots, {len(self._loaded)} loaded")
+        w = R.tile_words(b)
         out = {}
         for name in self._tensors:
             t = getattr(self, name)[slot]
@@ -106,7 +120,7 @@ class Exl3Arena:
         [INTER, down_n] (down, full intermediate -> this rank's hidden outputs) -- the true weight
         matrices the kernels multiply into, so a caller uses ``x @ w1`` not ``x @ w1.T``."""
         rec = self.read_slot(slot)
-        bits = float(self.bits[slot].item())
+        bits = float(self.bits[slot])
         w1 = R.dequantize(rec["t1"], rec["suh1"], rec["svh1"], bits, self.codebook).to(torch.float32)
         w3 = R.dequantize(rec["t3"], rec["suh3"], rec["svh3"], bits, self.codebook).to(torch.float32)
         w2 = R.dequantize(rec["t2"], rec["suh2"], rec["svh2"], bits, self.codebook).to(torch.float32)
