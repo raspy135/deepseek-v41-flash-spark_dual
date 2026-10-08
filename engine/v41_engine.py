@@ -1168,9 +1168,11 @@ class V41Engine:
                 "prefill_budget_version": 1,
                 "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
-                "expert_pack_sha256": (self.store.pack.header_sha256() if hasattr(self.store, "pack") else ""),
-                "expert_pack_rank": (f"{self.store.pack.rank}/{self.store.pack.world}"
-                                     if hasattr(self.store, "pack") else ""),
+                # Rank-invariant: both ranks must have been built from the same source manifest.
+                # The pack HEADER sha is per rank (it carries rank/world), so it belongs in health,
+                # not here -- putting it in the guard is a silent pair disagreement.
+                "expert_pack_source": (self.store.pack.header.get("source_sha256", "")
+                                       if hasattr(self.store, "pack") else ""),
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
                 "tp_experts": self.ep.tensor_parallel,
                 "tp_experts_version": 1,
@@ -3290,6 +3292,8 @@ class V41Engine:
             "kernel": self.kernel,
             "expert_format": self.expert_format,
             "expert_pack_sha256": (self.store.pack.header_sha256() if hasattr(self.store, "pack") else ""),
+            "expert_pack_source": (self.store.pack.header.get("source_sha256", "")
+                                   if hasattr(self.store, "pack") else ""),
             "expert_mb": round(self.expert_bytes / 1e6, 2),
             "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
             # Which parallelization is actually live. EP2 is what ships (dense TP measured
