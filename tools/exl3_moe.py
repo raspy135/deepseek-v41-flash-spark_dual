@@ -65,6 +65,10 @@ class Exl3Arena:
             getattr(self, _n).zero_()
         self.bits = [int(self.slot_bits)] * self.slots
         self._loaded = set()
+        # K2 per slot for the CUDA kernel: 2*bits (3-bit -> 6, 2-bit -> 4). A device tensor, updated
+        # by load_slot, because a slot's width CHANGES when a swap loads a different expert -- a
+        # host-side array snapshotted at boot would decode every 2-bit expert at the wrong stride.
+        self.bits_gpu = torch.full((slots,), 2 * int(self.slot_bits), dtype=torch.int32, device=dev)
         self._tensors = ("t1", "t3", "t2", "suh1", "suh3", "suh2", "svh1", "svh3", "svh2")
 
     @property
@@ -98,6 +102,7 @@ class Exl3Arena:
                 dst.copy_(src.to(dst.dtype), non_blocking=non_blocking)
         self.bits[slot] = int(bits)
         self._loaded.add(int(slot))
+        self.bits_gpu[slot] = 2 * int(bits)
 
     def read_slot(self, slot: int) -> dict[str, torch.Tensor]:
         """The stored tensors of one slot, trellis cut back to its real width (for the reference)."""

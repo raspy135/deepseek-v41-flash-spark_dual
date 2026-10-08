@@ -354,7 +354,7 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
-                                       int E, float limit, int act_mode) {
+                                       int E, int suh_d_stride, float limit, int act_mode) {
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = pick[p];
     if (e < 0) return;
@@ -387,7 +387,8 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
             float uu = fminf(fmaxf(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), -limit), limit);
             act = gg / (1.f + expf(-gg)) * uu;
         }
-        v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
+        v[j] = act * __half2float(suh_d[(size_t)e * suh_d_stride + n + j]);   // rank slice: caller offsets
+                                                                              // suh_d and passes the full K
     }
     fwht128(v, lane);
     half* o = xd + (size_t)p * N + n;
@@ -442,6 +443,7 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
 }
 
 // Grouping in one block: distinct arena slots (< E) in id order, members = row * 32 + k, -1 after the last.
+// Only used for small E; the decode path uses group_small_kernel below.
 constexpr int GROUP_THREADS = 1024;
 constexpr int GROUP_PER_THREAD = 4;
 
@@ -499,6 +501,31 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
 }
 
+// Decode grouping: distinct arena slots in first-occurrence order, O(P^2) and FIXED SHAPE, so it
+// is graph-capturable.  The arena can have >10k slots but a decode call routes at most ~64 picks,
+// so scanning the picks (not every slot) is both cheap and independent of the arena size.  Thread 0
+// does it serially; P<=64 makes that a few hundred iterations.
+__global__ void group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+                                   int* __restrict__ ucount, int* __restrict__ members, int P, int slots,
+                                   int maxm) {
+    if (threadIdx.x != 0) return;
+    int n = 0;
+    for (int i = 0; i < P; ++i) {
+        const int e = pick[i];
+        bool first = true;
+        for (int j = 0; j < i; ++j)
+            if (pick[j] == e) { first = false; break; }
+        if (!first) continue;
+        uids[n] = e;
+        int m = 0;
+        for (int j = i; j < P && m < maxm; ++j)
+            if (pick[j] == e) members[n * maxm + m++] = (j / slots) * 32 + (j % slots);
+        for (; m < maxm; ++m) members[n * maxm + m] = -1;
+        ++n;
+    }
+    ucount[0] = n;
+}
+
 }  // namespace exl3
 
 // ---------------------------------------------------------------- C ABI (ctypes; no torch/libtorch)
@@ -507,10 +534,10 @@ extern "C" {
 
 void exl3m_group(const int* pick, int* uids, int* ucount, int* members, int R, int slots, int E, int maxm,
                  cudaStream_t s) {
-    EXL3_CHECK(E <= exl3::GROUP_THREADS * exl3::GROUP_PER_THREAD, "too many experts for the grouping kernel");
-    EXL3_CHECK(slots <= 32, "at most 32 slots a row");
-    const size_t smem = (size_t)R * slots * sizeof(int);
-    exl3::group_kernel<<<1, exl3::GROUP_THREADS, smem, s>>>(pick, uids, ucount, members, R, slots, E, maxm);
+    // decode-sized: group the picks, not the arena.  E is unused here (kept for ABI stability).
+    (void)E;
+    const int P = R * slots;
+    exl3::group_small_kernel<<<1, 32, 0, s>>>(pick, uids, ucount, members, P, slots, maxm);
 }
 
 void exl3m_rot_in(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
@@ -538,11 +565,12 @@ void exl3m_grouped(const void* X0, const void* X1, const int64_t* tp0, const int
 }
 
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,
-                  void* xd, int rows, int P, int N, int SK, int slots, int E, float limit, int act_mode,
-                  cudaStream_t s) {
+                  void* xd, int rows, int P, int N, int SK, int slots, int E, int suh_d_stride, float limit,
+                  int act_mode, cudaStream_t s) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
     exl3::gateup_epilogue_kernel<<<grid, 32, 0, s>>>(Z, pick, (const half*)svh_g, (const half*)svh_u,
-                                                     (const half*)suh_d, (half*)xd, P, N, SK, E, limit, act_mode);
+                                                     (const half*)suh_d, (half*)xd, P, N, SK, E, suh_d_stride,
+                                                     limit, act_mode);
 }
 
 void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, float* y, const float* wts, float* out,

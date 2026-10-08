@@ -58,7 +58,7 @@ def _library():
     lib.exl3m_rot_in.argtypes = [ptr, i32, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_grouped.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                                   i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
-    lib.exl3m_gateup.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, f32, i32, ptr]
+    lib.exl3m_gateup.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, f32, i32, ptr]
     lib.exl3m_down_combine.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr]
     return lib
 
@@ -91,7 +91,7 @@ def _ptrs(arena):
         stride = tens[0].numel() * tens.element_size()
         base = tens.data_ptr()
         out[name] = torch.tensor([base + i * stride for i in range(s)], dtype=torch.int64, device=dev)
-    out["k2"] = torch.tensor([2 * int(b) for b in arena.bits], dtype=torch.int32, device=dev)
+    out["k2"] = arena.bits_gpu   # device tensor, updated by load_slot (widths change on swaps)
     arena._cuda_ptrs = out
     return out
 
@@ -156,10 +156,15 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
                       ctypes.c_void_p(uids.data_ptr()), ctypes.c_void_p(ucount.data_ptr()),
                       ctypes.c_void_p(members.data_ptr()), ctypes.c_void_p(z.data_ptr()),
                       int(dim), int(inter), int(P), 1, 16, int(K), int(P), 2, NT, WARPS, PF, 2, 10, CB_MUL1, st)
+    # suh2 is over the FULL down K (2304); this rank's gate/up columns are [rank*inter, +inter), so
+    # hand the kernel that slice and the full stride.  Without this the scale is wrong under TP2.
+    suh2_stride = int(arena.shapes["suh2"][0])
+    suh2_base = arena.suh2.data_ptr() + arena.tp_rank * inter * 2
     lib.exl3m_gateup(ctypes.c_void_p(z.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
                      ctypes.c_void_p(arena.svh1.data_ptr()), ctypes.c_void_p(arena.svh3.data_ptr()),
-                     ctypes.c_void_p(arena.suh2.data_ptr()), ctypes.c_void_p(xd.data_ptr()),
-                     int(T), int(P), int(inter), 1, int(K), int(arena.slots), float(swiglu_limit), 1, st)
+                     ctypes.c_void_p(suh2_base), ctypes.c_void_p(xd.data_ptr()),
+                     int(T), int(P), int(inter), 1, int(K), int(arena.slots), suh2_stride,
+                     float(swiglu_limit), 1, st)
     if world > 1:
         gathered = torch.empty((world * P, inter), dtype=torch.float16, device=dev)
         torch.distributed.all_gather_into_tensor(gathered, xd, group=group)
