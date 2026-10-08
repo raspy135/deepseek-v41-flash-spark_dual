@@ -1995,3 +1995,15 @@ Measurement note: re-capturing graphs after a runtime configuration switch, with
 warmup on another prompt, left the first measured run ~1.9 ms/step slower. Alternating arm order
 cancels this in the mean but inflates the error. `tools/bench_accept_ab_tp.py` now warms up on
 the prompt about to be measured.
+
+## A wider K tile is not split-K; BF16 input is not FP32 input (2026-10-08)
+
+`_fp8_linear_kernel` passes its accumulator into every `tl.dot`, so the MMA k-steps run in the
+same order whether the K tile is 128 or 256. Every tile, warp, stage and K-tile combination swept
+on the decode shapes was bit-identical, and `BLOCK_N=32`/`BLOCK_K=256` saved 8–15 µs per
+projection on cold weights. Ordered split-K across programs is different: it changes the bits
+(see October 7 above).
+
+The reverse surprise: feeding the split-K HC projection BF16 activations instead of their exact
+FP32 upcast changed its output at ~1e-7. The values are identical, but the compiled MMA lowering
+is not. Treat a dtype change at a `tl.dot` operand as a numerics change and measure it.

@@ -2888,3 +2888,44 @@ Artifacts: `results/accept-ab-20261008/{all-vs-mk128,fp8-full-vs-local512,servin
 `results/draft-trace-20261008/`, `results/l2pf-trace-20261008/`, `results/l2pf-bulk-20261008/`,
 `results/bench-switches-20261008/final/`. Image `deepseek-v41-flash-spark:draft-l2pf-v1`
 (sha256:83da4557…) on both nodes.
+
+### 2026-10-08 — TP draft attention, exact FP8 decode schedule, RMSNorm/HC launch fusions
+
+Same paired method: one loaded TP2 process per A/B, frozen map, fixed depth 3, 24 prompts.
+
+| Change | Outputs identical | ms/step Δ ± SE | accepted Δ ± SE | tok/s Δ ± SE |
+| --- | ---: | ---: | ---: | ---: |
+| `DSV41_TP_DRAFT_ATTN=1` (two processes, paired by prompt) | 24/24 | −1.67 ± 0.33 | 0 (2.718 both) | +0.70 ± 0.14 (+2.1%) |
+| FP8 decode `BLOCK_N=32`, `BLOCK_K=256` | 24/24 | −1.47 ± 0.56 | 0 | +0.63 ± 0.29 (+1.8%) |
+| One-pass RMSNorm + HC mean(x²) in the split-K pass | 8/24 | −2.11 ± 0.63 | +0.023 ± 0.016 | +1.45 ± 0.42 (+4.0%) |
+
+The `TP_DRAFT_ATTN` comparison crosses processes; repeating a prompt within one process moved
+ms/step by 1.5 ms on average. Draft attention can only change proposals, and acceptance was
+identical on every prompt.
+
+FP8 schedule. Cold weights (12 rotating copies, 4 rows) under the current schedule:
+`wq_a+wkv` 66 µs, `wq_b` 115, `wo_a` 99, `wo_b` 119, shared `w13` 74, shared `w2` 48. Under
+`BLOCK_N=32`, `BLOCK_K=256`: 58 / 106 / 91 / 104 / 65 / 40 µs. Every swept tile, warp, stage and
+K-tile combination produced bit-identical outputs. `tl.dot` chains the accumulator through the
+same K steps whatever the tile, so a 256-wide K tile is not split-K. `BLOCK_K` is a new switch,
+default 128.
+
+Fusions (GB10, graph replay). RMSNorm 10.3 → 4.1 µs (q_norm, strided), 8.2 → 4.1 (kv_norm),
+14.3 → 4.9 (D=5120). q/kv norm outputs were bit-identical in the screen; at D=5120, 0.005% of
+elements differ. HC mixes 20.5 → 13.4 µs. The split-K projection is *not* bit-identical when fed
+BF16 instead of the FP32 pad (the MMA lowering changes): pre/post/comb differ by ≤2.4e-7, with
+error against FP64 matching the old path. No fused-arm output repeated an 8-gram; math, JSON and
+YAML answers were equivalent.
+
+**Live benchmark on `fused-v1`** (the same driver; `api-pair-recovery-v1` plus this session's
+engine files; TTS not loaded):
+
+| Workload | Start of session | Switches | + Draft | + Kernels | TF / ours (Oct 7 TF) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose | 21.93 | 23.09 | 25.43 | 26.44 | 2.14x → 1.62x |
+| Angry Birds HTML | 43.30 | 50.26 | 52.68 | 53.41 | 2.22x → 1.60x |
+| Python code | 32.26 | 37.37 | 38.38 | 40.38 | 2.11x → 1.53x |
+
+ms/step start → now: 86.1 → 72.4, 104.7 → 86.9, 93.3 → 77.2. Paired estimates sum to about
++19%; the live runs show +20–25%. Artifacts: `results/accept-ab-20261008/{tpattn-off,tpattn-on,
+live-vs-fp8sched,fp8sched-vs-fused}/`, `results/bench-switches-20261008/fused/`.

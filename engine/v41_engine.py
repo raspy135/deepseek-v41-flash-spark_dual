@@ -1116,6 +1116,8 @@ class V41Engine:
                 "draft_markov_topk": int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0')),
                 "draft_markov_local": os.environ.get('DSV41_DRAFT_MARKOV_LOCAL', '0'),
                 "draft_markov_tp": os.environ.get('DSV41_DRAFT_MARKOV_TP', '0'),
+                "lean_rms_fused": os.environ.get('DSV41_LEAN_RMS_FUSED', '0'),
+                "hc_front_fused": os.environ.get('DSV41_HC_FRONT_FUSED', '0'),
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
                 "tp_embed": os.environ.get('DSV41_TP_EMBED', '0'),
                 "tp_draft_experts": self.tp_draft_experts,
@@ -1217,6 +1219,7 @@ class V41Engine:
                 # the defaults, but that is a measured property of this GPU and compiler, not a
                 # guarantee; a pair split across them must refuse to start.
                 "fp8_decode_block_n": os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto"),
+                "fp8_decode_block_k": os.environ.get("DSV41_FP8_DECODE_BLOCK_K", "128"),
                 "fp8_decode_warps": os.environ.get("DSV41_FP8_DECODE_WARPS", "4"),
                 "fp8_decode_pipeline": os.environ.get("DSV41_FP8_DECODE_PIPELINE", "0") == "1",
                 "decode_merged_proj": os.environ.get("DSV41_DECODE_MERGED_PROJ", "1") == "1",

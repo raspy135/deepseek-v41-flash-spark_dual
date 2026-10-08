@@ -131,3 +131,81 @@ def skinny_linear(x: torch.Tensor, w: torch.Tensor, block_k: int | None = None,
                          sk, SPLIT_P=1 << (sk - 1).bit_length(), BLOCK_M=block_mp, BLOCK_N=nb,
                          num_warps=reduce_warps, num_stages=1)
     return y
+
+
+@triton.jit
+def _skinny_meansq_kernel(X, W, Y, SQ, M, N, K,
+                          stride_xm, stride_wn, stride_ys, stride_ym, stride_qs,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                          SPLIT_K: tl.constexpr, PREC: tl.constexpr = "ieee"):
+    """_skinny_kernel plus each program's partial sum of x^2 over its K chunk, from the same loads.
+    The HC mixes need mean(x^2) of the same row; computing it here removes the fp32 pad copy and the
+    separate square/mean kernels. Same tiles and K order as _skinny_kernel, but a bf16 X compiles to a
+    different MMA lowering than an fp32 one: results differ from skinny_linear at ~1e-7."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rm = tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = rm < M
+    n_mask = rn < N
+    k_per = tl.cdiv(tl.cdiv(K, BLOCK_K), SPLIT_K) * BLOCK_K
+    k_lo = pid_k * k_per
+    k_hi = tl.minimum(k_lo + k_per, K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    sq = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for k0 in range(k_lo, k_hi, BLOCK_K):
+        kk = k0 + tl.arange(0, BLOCK_K)
+        km = kk < k_hi
+        x = tl.load(X + rm[:, None] * stride_xm + kk[None, :],
+                    mask=m_mask[:, None] & km[None, :], other=0.0).to(tl.float32)
+        w = tl.load(W + rn[:, None] * stride_wn + kk[None, :],
+                    mask=n_mask[:, None] & km[None, :], other=0.0)
+        acc += tl.dot(x, tl.trans(w), input_precision=PREC, out_dtype=tl.float32)
+        sq += x * x
+    tl.store(Y + pid_k * stride_ys + rm[:, None] * stride_ym + rn[None, :], acc,
+             mask=m_mask[:, None] & n_mask[None, :])
+    if pid_n == 0:
+        tl.store(SQ + pid_k * stride_qs + rm, tl.sum(sq, 1), mask=m_mask)
+
+
+@triton.jit
+def _skinny_meansq_reduce(P, Q, Y, MEAN, M, N, K, stride_ps, stride_pm, stride_ym, stride_qs,
+                          SPLIT_K, SPLIT_P: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """_skinny_reduce for the projection, and mean(x^2) = sum of the partial sums / K."""
+    si = tl.arange(0, SPLIT_P)
+    rm = tl.arange(0, BLOCK_M)
+    rn = tl.arange(0, BLOCK_N)
+    msk = (si[:, None, None] < SPLIT_K) & (rm[None, :, None] < M) & (rn[None, None, :] < N)
+    v = tl.load(P + si[:, None, None] * stride_ps + rm[None, :, None] * stride_pm + rn[None, None, :],
+                mask=msk, other=0.0)
+    o = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(Y + rm[:, None] * stride_ym + rn[None, :], tl.sum(v, 0), mask=o)
+    q = tl.load(Q + si[:, None] * stride_qs + rm[None, :], mask=(si[:, None] < SPLIT_K) & (rm[None, :] < M),
+                other=0.0)
+    tl.store(MEAN + rm, tl.sum(q, 0) / K, mask=rm < M)
+
+
+def skinny_linear_meansq(x: torch.Tensor, w: torch.Tensor, prec: str = "ieee",
+                         num_warps: int = 4, num_stages: int = 3, reduce_warps: int = 8):
+    """(skinny_linear(x, w), mean(x.float()^2, -1, keepdim=True)) from one pass over x.
+    fp32 throughout; neither output is bit-identical to the pad/skinny_linear/torch-mean spelling
+    (differences ~1e-7). x [M, K] bf16/fp32 with unit last stride."""
+    assert w.dtype == torch.float32 and w.dim() == 2 and x.dim() == 2
+    assert x.stride(1) == 1 and w.stride(1) == 1
+    M, K = x.shape
+    N = w.size(0)
+    assert w.size(1) == K and M <= BLOCK_MP
+    bn, sk = _plan(N, K, BLOCK_K, TARGET_CTAS)
+    nb = bn * triton.cdiv(N, bn)
+    y = torch.empty(M, N, dtype=torch.float32, device=x.device)
+    mean = torch.empty(M, 1, dtype=torch.float32, device=x.device)
+    p = torch.empty(sk, BLOCK_MP, nb, dtype=torch.float32, device=x.device)
+    q = torch.empty(sk, BLOCK_M, dtype=torch.float32, device=x.device)
+    _skinny_meansq_kernel[(triton.cdiv(N, bn), sk)](
+        x, w, p, q, M, N, K, x.stride(0), w.stride(0), p.stride(0), p.stride(1), q.stride(0),
+        BLOCK_M=BLOCK_M, BLOCK_N=bn, BLOCK_K=BLOCK_K, SPLIT_K=sk, PREC=prec,
+        num_warps=num_warps, num_stages=num_stages)
+    _skinny_meansq_reduce[(1,)](p, q, y, mean, M, N, K, p.stride(0), p.stride(1), y.stride(0), q.stride(0),
+                                sk, SPLIT_P=1 << max(sk - 1, 1).bit_length(), BLOCK_M=BLOCK_MP, BLOCK_N=nb,
+                                num_warps=reduce_warps, num_stages=1)
+    return y, mean

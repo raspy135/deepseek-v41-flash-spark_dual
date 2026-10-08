@@ -43,6 +43,11 @@ for _k in (64, 128, 256, 512):
 CONFIGS['serving'] = dict(CONFIGS['all'], draft_head='main', markov_tp=False, qkv_mb=0, sh_mb=0, attn_mb=4)
 CONFIGS['draft_fp8'] = dict(CONFIGS['serving'], draft_head='fp8')
 CONFIGS['draft_fp8_split'] = dict(CONFIGS['draft_fp8'], markov_tp=True)
+# Live 2026-10-08 configuration (load with DSV41_TP_DRAFT_ATTN=1 too), then the exact FP8 decode
+# schedule (BLOCK_N 32, BLOCK_K 256: outputs must not change), then the fp32-rounding launch fusions.
+CONFIGS['live'] = dict(CONFIGS['draft_fp8_split'], fp8_bn='auto', fp8_bk=128, rms_fused=False, hc_front_fused=False)
+CONFIGS['fp8sched'] = dict(CONFIGS['live'], fp8_bn='32', fp8_bk=256)
+CONFIGS['fused'] = dict(CONFIGS['fp8sched'], rms_fused=True, hc_front_fused=True)
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -84,6 +89,10 @@ def set_config(e, cfg):
     v41_ref.HC_KERNEL = cfg['hc_kernel']
     fd.draft_markov_topk = cfg.get('markov_topk', 0)
     fd.draft_markov_tp = cfg.get('markov_tp', False)
+    if 'fp8_bk' in cfg:
+        import fp8_linear as _fp8
+        _fp8.DECODE_BLOCK_N, _fp8.DECODE_BLOCK_K = cfg['fp8_bn'], cfg['fp8_bk']  # read at call time
+        lean.rms_fused, lean.hc_front_fused = cfg['rms_fused'], cfg['hc_front_fused']
     if 'draft_head' in cfg:
         alt = getattr(e.W, 'draft_head', None)
         assert cfg['draft_head'] == 'main' or alt is not None, 'load with DSV41_TP_DRAFT_HEAD=1 DSV41_DRAFT_HEAD_FMT=fp8'
@@ -171,7 +180,10 @@ def main():
     rows = report['runs']
     by = {(r['prompt'], r['arm']): r for r in rows}
     usable = [i for i in range(len(ids)) if by[(i, args.a)]['steps'] >= 8 and by[(i, args.b)]['steps'] >= 8]
-    draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in CONFIGS['base'])
+    # Target arithmetic keys; draft-only and exact-schedule (fp8_bn/fp8_bk) differences must leave
+    # greedy outputs bit-identical, so those A/Bs assert it.
+    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused']
+    draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in target_keys)
     report['summary'] = {
         'draft_only': draft_only,
         'prompts_used': len(usable),

@@ -31,6 +31,13 @@ DECODE_WARPS = int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4"))
 # Native-weight decode optimization. Read at call time for the frozen-map A/B driver;
 # changing it in a live process requires releasing/rebuilding captured graphs on both ranks.
 DECODE_PIPELINE = os.environ.get("DSV41_FP8_DECODE_PIPELINE", "0") == "1"
+# K tile at decode-sized M when K is a multiple of it. tl.dot chains the accumulator through the same
+# K steps in the same order whatever the tile, so 256 is bit-identical to 128 (checked on every
+# decode shape at 4 and 6 rows). With BLOCK_N=32, cold GB10 weights at 4 rows: wq_b 115 -> 106 us,
+# wo_b 119 -> 104, wo_a 99 -> 91, wq_a+wkv 66 -> 58 (2026-10-08). Read at call time, like BLOCK_N.
+DECODE_BLOCK_K = int(os.environ.get("DSV41_FP8_DECODE_BLOCK_K", "128"))
+if DECODE_BLOCK_K not in (128, 256):
+    raise ValueError("DSV41_FP8_DECODE_BLOCK_K must be 128 or 256")
 _DECODE_BLOCK_N_CHOICES = ("16", "32", "64", "128", "auto")
 if DECODE_BLOCK_N not in _DECODE_BLOCK_N_CHOICES:
     raise ValueError(f"DSV41_FP8_DECODE_BLOCK_N={DECODE_BLOCK_N!r}; use one of {_DECODE_BLOCK_N_CHOICES}")
@@ -343,6 +350,8 @@ def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16, act_qdq:
     BLOCK_M = 16 if decode else 64
     BLOCK_N = decode_block_n(W.N, 1, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
+    if decode and BLOCK_K == 128 and W.K % DECODE_BLOCK_K == 0:
+        BLOCK_K = DECODE_BLOCK_K
     pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
     _fp8_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K, x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
@@ -401,6 +410,8 @@ def fp8_grouped_linear(x: torch.Tensor, W: FP8GroupedWeight) -> torch.Tensor:
     BLOCK_M = 16 if decode else 64
     BLOCK_N = decode_block_n(W.R, W.G, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
+    if decode and BLOCK_K == 128 and W.K % DECODE_BLOCK_K == 0:
+        BLOCK_K = DECODE_BLOCK_K
     pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.R, BLOCK_N), triton.cdiv(T, BLOCK_M), W.G)
     _fp8_grouped_kernel[grid](x, W.w, W.s, y, T, W.R, W.K,

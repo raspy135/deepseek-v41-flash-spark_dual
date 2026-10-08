@@ -49,6 +49,28 @@ def _rms_apply_kernel(X, MEAN, W, OUT, D, EPS, BD: tl.constexpr, OUT_BF16: tl.co
 
 
 @triton.jit
+def _rms_fused_kernel(X, W, OUT, D, stride_x, EPS, BD: tl.constexpr, OUT_BF16: tl.constexpr):
+    """rmsnorm in one launch: mean(x^2) over the row in fp32, then _rms_apply_kernel's arithmetic.
+    Only the summation order of the mean differs from the pad/square/mean/apply spelling."""
+    t = tl.program_id(0)
+    acc = tl.zeros((BD,), dtype=tl.float32)
+    for d0 in range(0, D, BD):
+        db = d0 + tl.arange(0, BD)
+        x = tl.load(X + t * stride_x + db, mask=db < D, other=0.0).to(tl.float32)
+        acc += x * x
+    rs = tl.math.rsqrt(tl.sum(acc, 0) / D + EPS)
+    for d0 in range(0, D, BD):
+        db = d0 + tl.arange(0, BD)
+        m = db < D
+        x = tl.load(X + t * stride_x + db, mask=m, other=0.0).to(tl.float32)
+        y = tl.load(W + db, mask=m, other=0.0) * (x * rs)
+        if OUT_BF16:
+            tl.store(OUT + t * D + db, y.to(tl.bfloat16), mask=m)
+        else:
+            tl.store(OUT + t * D + db, y, mask=m)
+
+
+@triton.jit
 def _hc_rms_kernel(MM, MEAN, S, B, PRE, POST, COMB, EPS_RMS,
                    iters: tl.constexpr, eps: tl.constexpr, HC: tl.constexpr):
     """engine/hc_sinkhorn._hc_kernel with its input formed in-kernel: mixes = mm * rsqrt(mean + eps).
@@ -312,6 +334,12 @@ class LeanOps:
             raise ValueError("DSV41_ROUTER_BF16 must be 0 or 1")
         self.router_bf16 = value == "1"
         self.router_weights = {}
+        # Launch-count fusions at fp32 rounding level (2026-10-08): one-pass RMSNorm (4 launches
+        # -> 1; q/kv norm outputs bit-identical in the screen) and the HC mixes' mean(x^2) folded
+        # into the split-K projection (pad copy, square and mean removed; pre/post/comb differ
+        # by <= 2.4e-7). 10.3 -> 4.1 us per q_norm, 20.5 -> 13.4 us per HC mix on GB10.
+        self.rms_fused = os.environ.get("DSV41_LEAN_RMS_FUSED", "0") == "1"
+        self.hc_front_fused = os.environ.get("DSV41_HC_FRONT_FUSED", "0") == "1"
 
     def prepare_router_weights(self, weights):
         """Validate/retain original BF16 gate values before any graph capture.
@@ -357,6 +385,16 @@ class LeanOps:
         """v41_ref.rmsnorm(x, w, eps) for fewer than MM_TILE rows: 4 launches instead of 12."""
         D = x.shape[-1]
         T = x.numel() // D
+        if self.rms_fused:
+            x2 = x.reshape(T, D)
+            if x2.stride(1) != 1:
+                x2 = x2.contiguous()
+            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            BD = 1024 if D >= 1024 else triton.next_power_of_2(D)
+            _rms_fused_kernel[(T,)](x2, self._wf32(w), out, D, x2.stride(0), float(eps), BD=BD,
+                                    OUT_BF16=x.dtype == torch.bfloat16, num_warps=4,
+                                    enable_fp_fusion=False, enable_reflect_ftz=False)
+            return out
         pad = self._buf(("rms", D, T), (self.mm_tile, D))
         pad[:T].copy_(x.reshape(T, D))
         mean = pad.square().mean(-1, keepdim=True)
@@ -510,6 +548,25 @@ class LeanOps:
         """Model._hc_mixes(x, ...) with HC_FUSED, for fewer than MM_TILE rows: 6 launches instead of
         15, and none for the copies when `out=(pre, post, comb)` names the destination buffers."""
         T = x.size(0)
+        if (self.hc_front_fused and _R is not None and _R.hc_kernel_ok(hc_fn, T)
+                and x.is_contiguous()):
+            from fp32_skinny import skinny_linear_meansq
+            # Same tiles and K order as hc_linear on the fp32 pad, and the bf16 upcast is exact, but
+            # bf16 input changes the compiled MMA lowering: the projection differs at ~1e-7 and the
+            # row mean of squares (same pass, no pad/square/mean kernels) at fp32 rounding.
+            mm, mean = skinny_linear_meansq(x.reshape(T, -1), hc_fn, prec=_R.HC_PREC)
+        else:
+            mm = mean = None
+        if mm is not None:
+            if out is None:
+                pre = torch.empty(T, hc, dtype=torch.float32, device=x.device)
+                post = torch.empty(T, hc, dtype=torch.float32, device=x.device)
+                comb = torch.empty(T, hc, hc, dtype=torch.float32, device=x.device)
+            else:
+                pre, post, comb = out
+            _hc_rms_kernel[(T,)](mm, mean, hc_scale.contiguous(), hc_base.contiguous(), pre, post, comb,
+                                 float(norm_eps), iters=iters, eps=eps, HC=hc)
+            return pre, post, comb
         rows = max(self.mm_tile, self.hc_mm_tile)
         pad = self._buf(("hc", T), (rows, hc_fn.shape[1]))
         pad[:T].copy_(x.reshape(T, -1))
