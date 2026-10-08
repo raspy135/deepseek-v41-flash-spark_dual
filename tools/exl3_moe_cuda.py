@@ -206,7 +206,15 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     """
     import fp4_moe as F4
     T, K = slots.shape
-    block_slot, block_pair, NB = F4.build_routing(slots, arena.slots, block_m)
+    # Compact the slot ids BEFORE routing, exactly as fp4_moe does: build_routing's cost tracks
+    # n_slots, not the experts a chunk touches, and at a 13.5k-slot arena that is the dominant
+    # prefill cost (~1.5 s a layer here against <1 ms compacted).  Pair ids stay original.
+    valid = slots >= 0
+    uniq, inv = torch.unique(slots[valid], return_inverse=True)
+    compact = torch.full_like(slots, -1, dtype=torch.int32)
+    compact[valid] = inv.to(torch.int32)
+    block_slot, block_pair, NB = F4.build_routing(compact, int(uniq.numel()), block_m)
+    block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)], block_slot)
     pair = block_pair.view(NB, block_m)
     members = torch.where(pair >= 0, (pair // K) * 32 + (pair % K), pair).to(torch.int32).contiguous()
     uids = block_slot.to(torch.int32).contiguous()
