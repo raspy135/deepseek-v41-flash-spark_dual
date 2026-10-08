@@ -2007,3 +2007,128 @@ projection on cold weights. Ordered split-K across programs is different: it cha
 The reverse surprise: feeding the split-K HC projection BF16 activations instead of their exact
 FP32 upcast changed its output at ~1e-7. The values are identical, but the compiled MMA lowering
 is not. Treat a dtype change at a `tl.dot` operand as a numerics change and measure it.
+
+## Page-faulted Engram reads stall the GPU through the kernel's memory management (2026-10-08)
+
+Cold prefill on random text was 358–545 tok/s at 8K, and the same prompt again ran 19.6 → 11.4 s.
+Only the MoE phase changed (12.9 → 5.3 s of GPU time). CUPTI traces showed why: single
+`_moe_up_kernel` calls of 20–176 ms against a typical 3–10 ms, the stall *inside* the kernel, on
+one rank at a time. The other rank then sits in the TP all-gather. Paired per call, the
+collectives' real transfer was 0.29 s of an 8K prefill and the waiting 8.9 s.
+
+The trigger is the host, not the GPU work. Each node runs with ~1 GB free, and the memmap row
+path page-faults two 4 KB pages per 264-byte row: ~1.5M faults for a 42K prompt. That forced
+reclaim and compaction: 700–1,500 compaction stalls and 0.35–0.83M migrated pages per prompt.
+Unrelated churn (`cat` of other model files) slowed a hot-row prefill 2.7× by itself, so it is
+the migration/compaction, not the Engram code. The arena is ordinary `cudaMalloc` memory, which
+on GB10 is still system RAM behind the SMMU. Kernels with the largest footprint (the experts)
+stall.
+
+Fix: `DSV41_ENGRAM_DIRECT=1` — `O_DIRECT` reads of the covering 512-byte sectors in the native
+workers, for every gather size. Nothing enters the page cache and nothing is mapped. The bytes
+are identical (30K rows per table, edges included), and a cold 24K-row gather is 0.13–0.16 s
+against 0.38–0.84 s. Paired gate, same seeded prompts: cold 8K 358–545 → 782–933 tok/s, 32K
+530 → 925, first tokens equal. TensorFold arrived at the same design ("never pinned or
+page-cached").
+
+Direct reads for *decode-sized* gathers were measured too, and lost: 22 paired prompts gave
++0.89 ± 0.43 ms/step with identical outputs. A 150-row gather pays the `O_DIRECT` round trip
+where the memmap often hits the page cache. `DSV41_ENGRAM_DIRECT=prefill` (the serving setting)
+reads directly only above 384 rows; decode keeps the memmap and the native gather.
+
+Not every stall is gone. A repeated prompt under direct reads still had a 7.3 s MoE phase, so
+other memory activity on the box can do the same. Bigger prefill chunks only pay once the stalls
+are gone: with them, 512 vs 2,048 rows was within prompt-to-prompt noise; without them, the
+2,048-row expert kernels take 2.1 s of an 8K prompt against ~4 s at 512.
+
+## Prefill kernels: what was exact and what was not (2026-10-08)
+
+Three prefill rewrites, each behind a switch in the boot guard:
+
+- **`DSV41_PREFILL_ATTN_INDEXED`** (exact). Attention reads window rows from the ring and
+  compressed rows from the packed cache by index, instead of from gathered [T, 128, d] and
+  [T, 512, d] copies (the second one is 1 GB per layer at 2,048 rows). Dequantization uses the
+  packed gather's formula, and tiles keep `decode_attention`'s boundaries. Bit-identical in the
+  unit test and on 5 prompts' prefill logits and 64-token decodes. Every block shape swept also
+  gave the same bits; 32 heads per program is fastest (7.35 vs 15.3 ms).
+- **`DSV41_HC_PREFILL_FUSED`** (numerics). One pass for the HC mix front, instead of
+  `x.float()` + cuBLAS FP32 SIMT GEMM (N = 24) + square + mean: 0.57 vs 5.45 ms. Triton's
+  `input_precision="ieee"` was **not** IEEE-accurate here: 5e-6 relative against FP64, against
+  torch's 6e-7, and slower. `tf32x3` gives 6.6e-7–1.1e-6.
+- **`DSV41_INDEX_FUSED`** (ranking numerics). One kernel for the indexer's score matrix: 24×
+  faster at 4K keys, 99.99% identical scores. The heads are summed in a fixed order.
+
+How big "numerics" is: a 1e-6 change in the HC mixes moves 8K-prompt logits by up to ~3, KL up
+to 0.28. Most of that is chaotic amplification through MoE routing near-ties, not precision.
+The engine already does this to itself. Changing only the chunk size (1,024 vs 2,048 rows, same
+code), as adaptive prefill sizing does under memory pressure, gave mean KL 0.026 (max 0.074).
+The three switches together gave mean KL 0.096. Top-1 changed on 1 of 8 prompts in each, and
+64-token continuations diverged on 4 of 6 natural prompts in each. Judge such a change against
+that floor, and not by whether one prompt's tokens match.
+
+## A data-dependent tl.constexpr is a compile per value, inside the request (2026-10-08)
+
+The FP4 MoE routing kernels took the pair count (`_route_counts` `P`), the layer's resident
+count (`_route_kernel` `NS`) and the chunk's token count (`_moe_down_kernel` `NTOK`) as
+`tl.constexpr`; so did the packed-KV `_gather` (`N`). Every new value is a fresh compile. The
+shared cache held 5,382 / 1,905 / 3,123 / 1,416 variants of them. In serving, the last chunk of
+almost every prompt has a new length, and every expert swap changes some layer's resident count,
+so requests kept compiling with the GPU idle. A serving-like gate traced 3.7 s of a 10 s 8K
+prefill in five 0.5–0.9 s gaps before `_route_kernel`. The frozen-map gate never saw it: no swaps,
+and its seeded prompts had compiled their shapes on an earlier run.
+
+They are runtime arguments now, also with `do_not_specialize`, since Triton otherwise compiles per
+divisible-by-16 / == 1 pattern. The outputs are bit-identical (unit check: both routing paths,
+T = 70–2,048, gather up to 1M rows). The remaining constexprs are powers of two: 60 routing
+variants, compiled at boot by `fp4_moe.warm_routing` (10 s cold, 1.1 s from the disk cache).
+
+Rule: a kernel argument that follows request shape (tokens, pairs, resident experts) must not be
+`tl.constexpr`. Count variants per kernel name in `.triton-cache` to find the next one.
+
+Also measured here: 4,096-row prefill chunks were slower than 2,048 (8K 6.7 vs 5.7–5.9 s, 32K
+24.6 vs 23.1 s), and their first two prompts took ~50 s while the allocator grew.
+
+## Prefill-only scaled FP4 saves part of the expert time, not the whole component (2026-10-08)
+
+`DSV41_FP4_PREFILL_DOT_SCALED=1` is an opt-in prompt/replay arm independent of
+`DSV41_FP4_DOT_SCALED`. It can coexist with `DSV41_FP4_CUDA=1`: decode and drafting use
+exactly their old kernels. Pass `prefill=True` explicitly through the model/arena dispatcher,
+including bounded decoder replay and streamed expert batches. Do not infer the phase from
+batch size: a tiny prefill and a verification block can have the same row count. The setting
+must agree in the boot guard; prefill replicas remain restricted to software arithmetic.
+
+On the October 8 profile, a frozen-map TP2 screen passed 36/36 objective checks in both arms,
+including the earlier nesting depths, executable Python, strict tool calls and retrieval up
+to 32K. The real-weight standalone scaled error was <=9.80e-5 relative L2 to BF16-dequant
+matmuls. These results do not undo the September full-expert nesting failure or establish
+universal quality equivalence. See the complete protocol in RESULTS.md.
+
+Four approximately 8K random prompts measured **6.164 → 5.579 s** mean total prefill;
+up/down GPU event envelopes were **2.400 → 1.642 s**. The measured saving is 0.585 s,
+not the requested/estimated 2 seconds. One pair was 0.079 s slower. A component that takes
+roughly two seconds cannot save that entire amount unless its cost is eliminated; even the
+illustrative 2x expert speedup was not reached (measured 1.46x). Do not confuse component
+cost, total latency, and time saved, or transfer the 1.865-second **32K** saving to **8K**.
+
+A subsequent 66-cell tile screen preserved scaled outputs but only showed modest isolated
+component wins at TP shapes, with different schedules winning at 128 and 2,048 rows. Its
+synthetic routes and microbenchmark times do not establish extra end-to-end savings. Those
+tiles remain unpromoted; the default-off arithmetic arm and all measurements are retained.
+Serving was restored to the original `prefill-v4` image/configuration.
+
+**Promoted after review (same day).** Two things were missing for a decision, and both are in
+now. First, a logit-level comparison against the engine's own noise. Over 9 paired prompts (3
+random 8K, 6 natural), scaled vs software prefill gave mean KL 0.119 (max 0.37) with top-1
+unchanged 9/9. Changing only the chunk size (1,024 vs 2,048 rows) gave 0.042 (max 0.22), also
+9/9. That is the same ~3x ratio accepted for the HC/indexer kernels. Second, the tile winners in
+an engine run: `DSV41_FP4_PREFILL_SCALED_TILES` (BM32; up BN128/4 warps/3 stages, down
+BN128/4/4) reproduced the scaled arm's tokens on 9/9 prompts. Paired against the software arm:
+scaled -0.448 ± 0.219 s, scaled + tiles -0.792 ± 0.143 s per 8K prefill. Decode, 22 paired
+prompts, old vs new prefill arithmetic: ms/step +0.27 ± 0.49, acceptance -0.030 ± 0.027.
+Serving runs both switches since `prefill-v5`.
+
+Harness note: construct `V41Engine` outside an outer `torch.inference_mode()` context.
+Expert arenas are populated by loader threads, and inference tensors allocated in the main
+thread cannot be mutated by those threads outside that context. Generation/model methods
+already enter inference mode where appropriate. Also disable the shadow predictor when
+freezing swaps; its validation intentionally requires request-unit adaptation.

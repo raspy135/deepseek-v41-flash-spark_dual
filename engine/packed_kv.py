@@ -34,8 +34,8 @@ def _pack(X, Ids, Cache, START, INDEXED: tl.constexpr,
              scale_words.to(tl.int64))
 
 
-@triton.jit
-def _gather(Cache, Ids, Out, N: tl.constexpr, D: tl.constexpr,
+@triton.jit(do_not_specialize=['N'])
+def _gather(Cache, Ids, Out, N, D: tl.constexpr,
             STRIDE: tl.constexpr, BLOCK: tl.constexpr):
     group = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row, col = group // (D // 16), group % (D // 16)

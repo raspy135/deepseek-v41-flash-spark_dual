@@ -99,6 +99,9 @@ class TestPrefillTiming(unittest.TestCase):
         target.reset_mock()
         ns['moe_fn'](None, None, None, None, 10)
         self.assertNotIn('stage_mark', target.call_args.kwargs)
+        self.assertFalse(target.call_args.kwargs['prefill'])
+        ns['moe_fn'](None, None, None, None, 10, prefill=True)
+        self.assertTrue(target.call_args.kwargs['prefill'])
 
 
 if __name__ == '__main__':

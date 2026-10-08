@@ -50,6 +50,15 @@ INTER = 2304  # expert intermediate size (N of w1/w3, K of w2)
 # partial sum per scale group, whereas dot_scaled carries the MMA accumulator along K.
 # This is a numerics change; a random-error/generation floor gate alone cannot qualify it.
 DOT_SCALED = os.environ.get("DSV41_FP4_DOT_SCALED", "0") == "1"
+# Separate arithmetic arm for prompt encoding and bounded decoder replay, including
+# tiny prefills. Ordinary verification and DSpark stay on their existing kernels:
+# dispatch uses the caller's phase, not a token-count guess. See docs/gotchas.md.
+PREFILL_DOT_SCALED = os.environ.get("DSV41_FP4_PREFILL_DOT_SCALED", "0") == "1"
+# Prefill-sized scaled calls (P > 1024, BM=64 by default) on 32-row blocks: the scaled-arithmetic
+# sweep at TP shapes (results/prefill-expert-20261008/sweep.json, 66 cells, every one bit-identical
+# to the default schedule) has up (BM32, BN128, 4 warps, 3 stages) 11.96 vs 13.80 ms and down
+# (BM32, BN128, 4, 4) 9.78 vs 10.56 ms at 2,048 rows. Scaled prefill only; read at call time.
+PREFILL_SCALED_TILES = os.environ.get("DSV41_FP4_PREFILL_SCALED_TILES", "0") == "1"
 # Native CUDA is the default BM=16 decode path; prefill and unsupported shapes use Triton.
 # Set DSV41_FP4_CUDA=0 to restore Triton throughout. Measured scope is in docs/gotchas.md.
 CUDA_DECODE = os.environ.get("DSV41_FP4_CUDA", "1") == "1"
@@ -330,13 +339,13 @@ def _moe_up_kernel(
 # out different in a short and in a long prefill chunk, which the next layer's router amplifies.
 # k-major and not pair-major: with [T*TOPK, DIM] the scattered fp32 stores cost ~50% at T=512,
 # k-major costs ~6% (the reduction reads one contiguous [T, DIM] plane per k).
-@triton.jit
+@triton.jit(do_not_specialize=['NTOK'])
 def _moe_down_kernel(
     h_ptr, w2_ptr, s2_ptr, y_ptr,
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
+    BM: tl.constexpr, BN: tl.constexpr, NTOK, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
     PARTIAL: tl.constexpr = False,
     PARTS_WORLD: tl.constexpr = 1,
 ):
@@ -405,19 +414,26 @@ def _tp_round_reduce(parts, out, TD: tl.constexpr, TOPK: tl.constexpr, B: tl.con
 
 
 # --------------------------------------------------------------------------- routing
-@triton.jit
-def _route_counts(slots_ptr, counts_ptr, P: tl.constexpr, PB: tl.constexpr):
+# Data-dependent sizes (pair counts, token counts, resident counts) are runtime arguments, never
+# tl.constexpr: each distinct constexpr value is a separate compile. With P, NTOK and NS constexpr
+# the cache held 5,382 _route_kernel / 3,123 _moe_down_kernel / 1,905 _route_counts variants, and
+# a served prompt whose last chunk had a new length -- or a layer whose resident count a swap had
+# just changed -- stopped the GPU for 0.5-0.9 s per compile (3.7 s of a 10 s 8K prefill). The
+# index arithmetic is the same either way. do_not_specialize too: Triton otherwise still compiles a
+# variant per (divisible by 16, == 1) pattern of each integer argument.
+@triton.jit(do_not_specialize=['P'])
+def _route_counts(slots_ptr, counts_ptr, P, PB: tl.constexpr):
     s = tl.program_id(0)
     p = tl.arange(0, PB)
     v = tl.load(slots_ptr + p, mask=p < P, other=-1)
     tl.store(counts_ptr + s, tl.sum((v == s).to(tl.int32), 0))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['P', 'NB', 'NS'])
 def _route_kernel(
     slots_ptr, block_slot_ptr, block_pair_ptr, P, NB, counts_ptr,
     S: tl.constexpr, PB: tl.constexpr, PC: tl.constexpr, BM: tl.constexpr, NBB: tl.constexpr,
-    PRECOUNT: tl.constexpr = False, NS: tl.constexpr = 0,
+    PRECOUNT: tl.constexpr = False, NS=0,
 ):
     """Program s owns arena slot s: finds its pairs and assigns them BM-padded block positions.
 
@@ -537,6 +553,38 @@ def build_routing(slots: torch.Tensor, n_slots: int, BM: int, precount: bool = F
     return block_slot, block_pair, NB
 
 
+def warm_routing(device, max_pairs: int, slot_counts=(200, 300)) -> int:
+    """Compile build_routing's prefill variants before the first request instead of during it.
+
+    With the sizes runtime arguments, the remaining constexprs are powers of two derived from the
+    pair count (PB, NBB, BM) and the slot count (S, PC): a few dozen variants, cached on disk across
+    restarts but recompiled whenever this file changes -- 0.5-0.9 s each, which a served prompt
+    with a new chunk length would otherwise pay with the GPU idle. Rank-local, no collectives.
+    Returns the number of variants launched (compiled, or loaded from the cache)."""
+    seen = set()
+    e = 7
+    while (1 << (e - 1)) < max_pairs:
+        pb = 1 << e
+        for P in sorted({pb // 2 + 1, pb * 3 // 4, pb - 64, pb}):
+            if not 64 < P <= max_pairs:
+                continue
+            # 32 as well above 1,024 pairs: the PREFILL_SCALED_TILES block size.
+            for bm in sorted({_pick_bm(P), 32 if P > 1024 else _pick_bm(P)}):
+                for n_slots in slot_counts:
+                    S = _next_pow2(max(n_slots, 2))
+                    for precount in (True, False):
+                        key = (_next_pow2(max(P, 16)), _next_pow2((P + bm - 1) // bm + 1), bm, S,
+                               max(16, min(_next_pow2(max(P, 16)), 8192 // S)), precount)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        slots = torch.randint(0, n_slots, (P, 1), dtype=torch.int32, device=device)
+                        build_routing(slots, n_slots, bm, precount=precount)
+        e += 1
+    torch.cuda.synchronize(device)
+    return len(seen)
+
+
 def _pick_bm(P: int) -> int:
     if P <= 64:
         return 16
@@ -576,6 +624,7 @@ def moe_forward(
     routing_ids: torch.Tensor | None = None,
     routing_slot_map: torch.Tensor | None = None,
     stage_mark=None,
+    prefill: bool = False,
 ) -> torch.Tensor:
     """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
 
@@ -600,11 +649,16 @@ def moe_forward(
     dev = x.device
     split_decode_null = slots_repeat and null_slot >= 0 and P <= 64
     BM = block_m or (64 if (slots_repeat and P <= 64 and not split_decode_null) else _pick_bm(P))
-    native_decode = CUDA_DECODE and not DOT_SCALED and P <= 64 and BM == 16
+    scaled = DOT_SCALED or (PREFILL_DOT_SCALED and prefill)
+    native_decode = CUDA_DECODE and not scaled and P <= 64 and BM == 16
     if native_decode:
         import fp4_moe_cuda as CUDA
-    bn1, nw1, ns1 = up_cfg or (_UP_CFG_SCALED if DOT_SCALED else _UP_CFG)[BM]
-    bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
+    tiles = (scaled and prefill and PREFILL_SCALED_TILES and block_m is None and BM == 64
+             and up_cfg is None and down_cfg is None)
+    if tiles:
+        BM = 32
+    bn1, nw1, ns1 = up_cfg or ((128, 4, 3) if tiles else (_UP_CFG_SCALED if scaled else _UP_CFG)[BM])
+    bn2, nw2, ns2 = down_cfg or ((128, 4, 4) if tiles else _DOWN_CFG[BM])
     # TP's 1152 intermediate columns are not divisible by the EP decode tile of
     # 256. Kernels intentionally omit N masks, so choose a complete tiling.
     if arena.w1.shape[1] % bn1:
@@ -677,7 +731,7 @@ def moe_forward(
             x, arena.w1, arena.s1, arena.w3, arena.s3, h,
             wgt, block_slot, block_pair,
             x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=DOT_SCALED, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
+            TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=scaled, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
         )
     if stage_mark is not None:
         stage_mark('up_gemm')
@@ -701,7 +755,7 @@ def moe_forward(
             h, arena.w2, arena.s2, parts,
             block_slot, block_pair,
             h.stride(0), parts.stride(0),
-            TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=DOT_SCALED, NULL_SLOT=null_slot,
+            TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=scaled, NULL_SLOT=null_slot,
             PARTIAL=tp and not tp_output, PARTS_WORLD=parts_world,
             num_warps=nw2, num_stages=ns2,
         )

@@ -91,7 +91,7 @@ def stream_spans(indices, keep, capacity):
     return spans
 
 
-def streaming_moe(model, y, indices, weights, layer, store, arena):
+def streaming_moe(model, y, indices, weights, layer, store, arena, *, prefill=False):
     """One shared batch plan, all original top-k contributions, no resident eviction.
 
     The rank-0 broadcast happens even for a single batch. Each kernel handles
@@ -115,7 +115,8 @@ def streaming_moe(model, y, indices, weights, layer, store, arena):
     for a,b in packet['spans']:
         slots = store.resolve(layer, indices[a:b], True)
         parts.append(model.moe_fn(y[a:b], slots, weights[a:b], arena, model.args.swiglu_limit,
-                                  out_dtype=torch.float32, slots_repeat=True, null_slot=store.null_slot))
+                                  out_dtype=torch.float32, slots_repeat=True, null_slot=store.null_slot,
+                                  prefill=prefill))
     return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 

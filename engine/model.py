@@ -71,6 +71,14 @@ PACKED_KV = os.environ.get("DSV41_PACKED_KV", "0") == "1"
 # restores the monolithic path, which stays the default until test_prefix_invariance passes on the
 # streaming one.
 INDEX_STREAM = os.environ.get("DSV41_INDEX_STREAM", "0") == "1"
+# DSV41_INDEX_FUSED=1: prefill-sized score matrices in one kernel (tools/indexer_prefill.py) instead
+# of the tiled einsum/relu/weight/head-sum loop below. The heads are summed in a fixed order that
+# torch's reduction does not share: a ranking-only numerics change, pinned by the boot guard.
+INDEX_FUSED = os.environ.get("DSV41_INDEX_FUSED", "0") == "1"
+try:
+    from indexer_prefill import index_scores as _index_scores  # noqa: E402
+except Exception:  # noqa: BLE001
+    _index_scores = None
 # Dense tensor parallelism (DSV41_TP_DENSE): world size, or 1 when off. Read once -- both ranks
 # must agree, and a rank that shards while its peer does not desyncs on the first all-reduce.
 TP_DENSE_WORLD = (int(os.environ.get("WORLD_SIZE", 1))
@@ -100,6 +108,15 @@ ATTN_TIMING = os.environ.get("DSV41_ATTN_TIMING", "0") == "1"
 # two places with DIFFERENT defaults -- "1" here and "0" in v41_engine's /health reporter -- so
 # with the variable unset the engine used the fused path and /health said it did not.
 PREFILL_FUSED_ATTN = os.environ.get("DSV41_PREFILL_FUSED_ATTN", "1") == "1"
+# DSV41_PREFILL_ATTN_INDEXED=1: the fused prefill attention reads its keys in place -- window rows
+# from the ring, compressed rows from the (packed) cache by the indexer's selection -- instead of
+# from the gathered [T, 128, d] and [T, 512, d] copies (tools/prefill_attn.py). Same bits; the
+# 2,048-row compressed copy alone was 1 GB written and read back per layer. Read at call time.
+PREFILL_ATTN_INDEXED = os.environ.get("DSV41_PREFILL_ATTN_INDEXED", "0") == "1"
+try:
+    from prefill_attn import prefill_attention_indexed as _prefill_attn_indexed  # noqa: E402
+except Exception:  # noqa: BLE001
+    _prefill_attn_indexed = None
 ATTN_PHASES: dict = {}
 _PHASE_MARKS: list = []   # [(name, cuda_event)] in stream order; read once, at report time
 
@@ -208,6 +225,15 @@ try:
 except Exception:  # noqa: BLE001
     _hc_post_fused = _hc_pre_rn_fused = None
 HC_OPS = os.environ.get("DSV41_HC_OPS", "1") == "1" and _hc_post_fused is not None
+
+# DSV41_HC_PREFILL_FUSED=1: prefill-sized HC mix fronts (projection + RMS scale) in one pass over the
+# BF16 residual (tools/hc_prefill.py) instead of x.float() + cuBLAS FP32 SIMT + square + mean.
+# ~1e-7 relative from the summation order: a numerics switch, pinned by the boot guard.
+HC_PREFILL_FUSED = os.environ.get("DSV41_HC_PREFILL_FUSED", "0") == "1"
+try:
+    from hc_prefill import hc_front as _hc_front_prefill  # noqa: E402
+except Exception:  # noqa: BLE001
+    _hc_front_prefill = None
 
 
 # ----------------------------------------------------------------------------- weights
@@ -491,8 +517,12 @@ class Model:
         only the Sinkhorn balancing runs fused. R.mm stays for the projection because chunk
         invariance depends on its fixed-row tiling."""
         a = self.args
-        xf = x.flatten(1).float()
-        mixes = R.hc_linear(xf, hc_fn) * R.rms_rsqrt(xf, a.norm_eps)
+        if (HC_PREFILL_FUSED and _hc_front_prefill is not None and x.size(0) > 16
+                and x.dtype == torch.bfloat16 and torch.is_tensor(hc_fn) and hc_fn.dtype == torch.float32):
+            mixes = _hc_front_prefill(x.flatten(1), hc_fn, a.norm_eps)
+        else:
+            xf = x.flatten(1).float()
+            mixes = R.hc_linear(xf, hc_fn) * R.rms_rsqrt(xf, a.norm_eps)
         if HC_FUSED:
             return _hc_sinkhorn_fused(mixes, hc_scale, hc_base, a.hc_mult,
                                       a.hc_sinkhorn_iters, a.hc_eps)
@@ -547,13 +577,21 @@ class Model:
             win_width = min(a.window_size, S + T) if prefill else None
             wpos = self._window_positions(pos, win_width)
             ring[pos % RING] = kv
-            wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             wmask = wpos >= win_lo if win_lo else wpos >= 0
+            # The indexed kernel reads window and compressed rows where they live (see
+            # PREFILL_ATTN_INDEXED); taps and the torch/compact paths still want the copies.
+            indexed = (prefill and PREFILL_ATTN_INDEXED and _prefill_attn_indexed is not None
+                       and self.tap is None and _use_fused(mtp_extra, T)
+                       and S + T > a.window_size
+                       and wpos.size(1) % int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_N", "32")) == 0)
+            wkv = None if indexed else ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
-            kv_all, mask, ckv_rows = wkv, wmask, None
+            kv_all, mask, ckv_rows, cidx = wkv, wmask, None, None
             _t = _aph("window_gather", _t)
             if w.ratio:
-                ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
+                ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh, rows=not indexed)
+                if indexed:
+                    cidx, ckv_rows = ckv_rows, None
                 _t = _aph("compressed", _t)
                 self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
                 mask = torch.cat([wmask, cmask], dim=1)   # [T, 640] of bool: 3.8 kB, always built
@@ -600,6 +638,15 @@ class Model:
             p = torch.exp(scores - mx)
             denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
             o = torch.einsum("thn,nd->thd", p / denom, compact_kv.float()).to(torch.bfloat16)
+        elif mtp_extra is None and indexed:
+            # 32 heads a program: every local head of a token in one program, so its keys are
+            # loaded and dequantised once. 7.35 vs 9.86 ms at 16 (2,048 rows); every tile shape
+            # swept gave the same bits (results/prefill-trace-20261008/tune_pattn.py).
+            bh = min(int(os.environ.get("DSV41_PREFILL_ATTN_INDEXED_BH", "32")), q.size(1))
+            o = _prefill_attn_indexed(q, ring, wpos, sh.ckv if w.ratio else None, cidx, mask,
+                                      w.attn_sink, a.head_dim ** -0.5, block_h=bh,
+                                      block_n=int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_N", "32")),
+                                      num_warps=4, num_stages=1)
         elif _use_fused(mtp_extra, T):
             # Same math as _softmax_attn (sinked softmax, fp32 scores, split-precision PV), fused:
             # no [T, H, N] score tensor, no concatenated key tensor. Measured 3.6x faster than the
@@ -654,9 +701,10 @@ class Model:
             outs.append(tile(qt, kvt, mt)[:n])
         return torch.cat(outs).to(torch.bfloat16)
 
-    def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared):
+    def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared, rows: bool = True):
         """Produce/read the shared compressed KV for this chunk; run/reuse the indexer; return the
-        gathered rows [T, k, d] and their mask [T, k]."""
+        gathered rows [T, k, d] (or with rows=False the selected positions [T, k], -1 = none) and
+        their mask [T, k]."""
         a = self.args
         r = w.ratio
         c = self.c
@@ -719,9 +767,10 @@ class Model:
             sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
         idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
         self._tap("topk", L, idx); self._tap("n_c", L, n_c)
+        if not rows:
+            return idx, idx >= 0
         from engine.packed_kv import gather
-        rows = gather(sh.ckv, idx.clamp_min(0))
-        return rows, idx >= 0
+        return gather(sh.ckv, idx.clamp_min(0)), idx >= 0
 
     def _indexer(self, x, qr, L, pos, compress_lens, n_c, sh: Shared):
         a = self.args
@@ -756,17 +805,20 @@ class Model:
         # its score mass. fp8 was tried and fails twice over -- 75% overlap, and topk/amax/
         # masked_fill are all unimplemented for float8_e4m3fn, which are the only three operations
         # this buffer exists for.
-        score = torch.empty(T, n_pad, dtype=SCORE_DTYPE, device=self.dev)
-        for i in range(0, T, B):
-            j = min(i + B, T)
-            qt, wt = q[i:j], wts[i:j]
-            if j - i < B:
-                qt = torch.cat([qt, qt.new_zeros(B - (j - i), *qt.shape[1:])])
-                wt = torch.cat([wt, wt.new_zeros(B - (j - i), wt.size(1))])
-            for jb in range(0, n_pad, NB):
-                sc = torch.einsum("thd,nd->thn", qt, k[jb:jb + NB])  # bf16
-                sc = sc.float().relu_() * wt[:, :, None]
-                score[i:j, jb:jb + NB] = sc.sum(dim=1)[:j - i].to(score.dtype)
+        if INDEX_FUSED and _index_scores is not None and T > 16:
+            score = _index_scores(q.contiguous(), k.contiguous(), wts.contiguous(), SCORE_DTYPE)
+        else:
+            score = torch.empty(T, n_pad, dtype=SCORE_DTYPE, device=self.dev)
+            for i in range(0, T, B):
+                j = min(i + B, T)
+                qt, wt = q[i:j], wts[i:j]
+                if j - i < B:
+                    qt = torch.cat([qt, qt.new_zeros(B - (j - i), *qt.shape[1:])])
+                    wt = torch.cat([wt, wt.new_zeros(B - (j - i), wt.size(1))])
+                for jb in range(0, n_pad, NB):
+                    sc = torch.einsum("thd,nd->thn", qt, k[jb:jb + NB])  # bf16
+                    sc = sc.float().relu_() * wt[:, :, None]
+                    score[i:j, jb:jb + NB] = sc.sum(dim=1)[:j - i].to(score.dtype)
         cpos = self._positions[:n_pad]
         score.masked_fill_(cpos[None, :] >= compress_lens[:, None], float("-inf"))
         is_cand_src = L == a.candidate_source_layer
@@ -1113,7 +1165,7 @@ class Model:
         if sector_stream:
             try:
                 from engine.global_residency import streaming_moe
-                routed = streaming_moe(self, y, indices, weights, L, store, arena)
+                routed = streaming_moe(self, y, indices, weights, L, store, arena, prefill=prefill)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -1176,7 +1228,7 @@ class Model:
             # special route, ~18 null pairs overflow one 16-row block; using BM=64 avoids the
             # corruption but makes every real expert slower. See tools/fp4_moe.py.
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, out_dtype=torch.float32,
-                                 slots_repeat=True,
+                                 slots_repeat=True, prefill=prefill,
                                  null_slot=(store.null_slot if (not prefill or
                                             os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1") else -1),
                                  **route_args)
@@ -1199,7 +1251,7 @@ class Model:
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
             self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
         elif not sector_stream:
-            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, prefill=prefill).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         # A TP shared expert's RowParallelWeight reduces before BF16 rounding inside

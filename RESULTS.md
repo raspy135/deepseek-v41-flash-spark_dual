@@ -2929,3 +2929,190 @@ engine files; TTS not loaded):
 ms/step start → now: 86.1 → 72.4, 104.7 → 86.9, 93.3 → 77.2. Paired estimates sum to about
 +19%; the live runs show +20–25%. Artifacts: `results/accept-ab-20261008/{tpattn-off,tpattn-on,
 live-vs-fp8sched,fp8sched-vs-fused}/`, `results/bench-switches-20261008/fused/`.
+
+## 2026-10-08 — Cold prefill: Engram reads were stalling the GPU
+
+Disposable TP2 gate on `fused-v1`. Frozen map, no swaps, no prefix reuse. Fresh random-word 8K
+prompts (bench/bench.py's workload, seeded), plus one 32K. `tools/bench_prefill_trace_tp.py`,
+with `DSV41_PREFILL_TIMING=1` and `DSV41_ATTN_TIMING=1`. Live serving measured 390–470 tok/s on
+the same kind of prompt before. TensorFold publishes 2,028–2,310.
+
+Breakdown (baseline): GPU busy 95%, but in-kernel MoE stalls (above) put both ranks into the
+all-gather. The same prompt with its Engram rows cached: 19.6 → 11.4 s. Root cause and fix in
+docs/gotchas.md. `DSV41_ENGRAM_DIRECT=1` reads rows with `O_DIRECT`; the paired gate used the
+same prompts and the same process layout:
+
+| Prompt | Rows | Baseline s (tok/s) | Direct s (tok/s) |
+| --- | ---: | ---: | ---: |
+| 8K #1 | 512 | 16.53 (496) | 10.48 (782) |
+| 8K #2 | 2048 | 18.61 (440) | 9.98 (820) |
+| 8K #3 | 1024 | 22.88 (358) | 8.78 (933) |
+| 8K #4 | 2048 | 15.04 (545) | 10.01 (818) |
+| 8K #5 | 512 | 19.57 (418) | 10.05 (814) |
+| 32K | 2048 | 61.84 (530) | 35.41 (925) |
+| 8K traced | 512 | 15.81 (517) | 11.61 (705) |
+| 8K traced | 2048 | 16.16 (507) | 8.91 (920) |
+
+First tokens equal on every prompt. With direct reads at 2,048 rows, an 8K prefill is ~8.2 s of
+compute: experts 2.2–2.9 s, elementwise copies 1.7 s, compressed-KV gather and indexing 1.0 s,
+BF16 GEMMs 1.0 s, prefill attention 0.9 s. Collective waiting is 1.8 s, of which 0.27 s is
+transfer. Not yet deployed or measured on decode. Artifacts: `results/prefill-trace-20261008/`
+(`v1/`, `direct/`, `vmstat-probe-1.jsonl`, `churn-probe-1.jsonl`), `results/engram-direct-20261008/`.
+
+### Prefill kernels and serving (2026-10-08, continued)
+
+Paired gate, `DSV41_ENGRAM_DIRECT=prefill`, 2,048 rows. Same process, the arms rotate per prompt:
+3 random 8K prompts + 2 natural (~8K, repo docs).
+
+| Arm | Mean prefill s | Per prompt |
+| --- | ---: | --- |
+| base | 9.48 | 8.66, 7.60, 7.57, 12.72, 10.85 |
+| indexed attention (exact) | 7.55 | 6.72, 9.14, 7.07, 8.14, 6.70 |
+| HC front fused | 7.58 | 7.14, 7.28, 7.29, 8.80, 7.38 |
+| indexer fused | 7.71 | 7.33, 7.34, 7.34, 8.88, 7.68 |
+| all three | 6.59 | 5.72, 6.04, 5.72, 7.06, 8.42 |
+
+Second run (2 random + 6 natural): base 7.89 s mean, all 5.78 s. Base at 1,024 rows was 8.79 s.
+Numerics: the indexed arm's logits and 64-token decodes are identical on every prompt. For
+all three switches, KL to base is mean 0.096; changing only the chunk size gives 0.026. See
+docs/gotchas.md for that comparison. With all switches, 32K runs at 1,420 tok/s, the same rate as
+8K: the fused indexer removed the cost that grew with length.
+
+Serving with the same settings was 9–11 s at 8K. A serving-like gate (live .env, swaps on)
+traced the difference to Triton compiles inside requests, not GPU work. Fixed in `prefill-v4`
+(previous note in docs/gotchas.md).
+
+**Live, `prefill-v4`** (bench/bench.py random workload, cold, fresh prompts, after one warm-up
+request): 8K 6.07–8.8 s (930–1,348 tok/s; v3 and v4 runs, 8 requests), 32K 23.4–26.9 s
+(1,220–1,404 tok/s). Morning baseline: 390–470 tok/s at both. TensorFold publishes 2,028 / 2,310.
+Run-to-run variance in serving is still ±15%. Decode, prose/HTML/code: 26.9 / 51.6 / 39.9 tok/s
+against 26.4 / 53.4 / 40.4 on fused-v1, with ms/step in the same range (73–98 ms). Prose TTFT
+fell 1,181 → 881 ms.
+
+Artifacts: `results/prefill-trace-20261008/` (`ab1/`, `ab2/`, `rows4096/`, `serving1/`,
+`decode-engram-ab/`, `constexpr_check.py`, `image/build.sh`), `results/prefill-live-20261008/`,
+`results/bench-switches-20261008/prefill-v4/`.
+
+### 2026-10-08 — Prefill-only scaled FP4: qualified small screen, below the 2-second saving target
+
+Implemented `DSV41_FP4_PREFILL_DOT_SCALED=1` as a separate, **default-off** arithmetic arm.
+It selects the existing `tl.dot_scaled` kernels during prompt encoding and bounded decoder
+replay, including short/tail chunks. The caller passes the actual prefill phase; row count
+never selects the arithmetic. Ordinary verification and DSpark keep the existing CUDA decode
+path. Original packed expert weights, BF16 linear-output boundaries, routing policy and
+collective sequence are unchanged. The new setting appears in the boot-time rank agreement
+and engine configuration. Prefill replicas retain their software-arithmetic restriction.
+
+This was a request to optimize the remaining expert work, with an intended saving of about
+**2 seconds per 8K prefill**. That is a time-saving target, not a target total latency or a
+2-second expert component. The measured candidate **does not meet it**. A previous estimate
+assumed a 2x expert speedup; the measured expert GPU envelopes improve only 1.46x. Do not
+translate the whole existing expert cost into recoverable end-to-end time.
+
+**Protocol.** Disposable TP2 containers based on the already deployed `prefill-v4`, image
+`sha256:e3fe4870e3f95aad1932dbac04ddcadd8616a1b26bff39605efddf18ee963f71`; one loaded engine,
+9,574 resident experts, 90.2 GB/rank, 65,536 context allocation, 2,048-row chunks, all existing
+prefill/attention/HC settings retained. Frozen learned map, no prefix reuse, swaps, predictor
+or demand persistence. Greedy decoding, thinking off, alternating baseline/candidate order
+per prompt. Both arms warmed before measurement. This is an instrumented engine comparison,
+not a live HTTP benchmark at the serving profile's 512K allocation.
+
+`tools/bench_prefill_expert_tp.py` ran 36 graded prompts per arm:
+
+| Objective checks | Baseline | Scaled prefill |
+| --- | ---: | ---: |
+| JSON nesting, depths 4/6/8/10 and two leaves | 8/8 | 8/8 |
+| Arithmetic with exact JSON answers | 4/4 | 4/4 |
+| JSON extraction, keys/values/types | 4/4 | 4/4 |
+| Python functions, parsing plus executable cases | 6/6 | 6/6 |
+| Tool calls, strict checkpoint parser and exact arguments, no grammar constraint | 6/6 | 6/6 |
+| Retrieval at 8K/16K/32K, facts near beginning/middle/end | 8/8 | 8/8 |
+
+Tool calls were not executed. Python runs in a separate resource-limited subprocess with
+restricted syntax and builtins. This is a bounded regression screen, not general quality
+non-inferiority, sampled-decoding qualification, or validation beyond 32K. It broadens the
+September single-nesting result without erasing that historical failure. All **88 requests**
+(including warmups and timing-only requests) had identical prompt hashes and output tokens
+between ranks; both retained map SHA256
+`19a960c3c9ed5e86cd0130b6a8347ac3a4b9a4cb138d4fbe509856b7df4fa8b2`.
+
+**Fresh random-text timings**, one output token, no prefix reuse. Mean times and total actual
+prompt tokens divided by total prefill time; prompt lengths are approximately 8K/32K:
+
+| Prompt / pairs | Baseline mean | Scaled mean | Time saved | Throughput before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 8K / 4 | 6.164 s | 5.579 s | **0.585 s** | 1,327 → 1,466 tok/s (+10.5%) |
+| 32K / 2 | 24.517 s | 22.652 s | 1.865 s | 1,337 → 1,447 tok/s (+8.2%) |
+
+8K baseline times: 6.780 / 5.998 / 5.970 / 5.907 s; scaled: 5.351 / 5.521 / 6.049 /
+5.395 s. Paired savings are 1.429 / 0.477 / **-0.079** / 0.512 s, mean 0.585 ± 0.312 s
+standard error (n=4). One pair regressed; this small, variable sample does not establish a
+universal 10.5% gain. The 8K saving is **29% of the 2-second target**, about 3.4x smaller.
+The eight graded retrieval prompts also took less prefill time with the candidate in every
+pair (14.513 → 13.085 s mean across the mixed lengths).
+
+Rank-0 GPU event envelopes around expert up/down GEMMs: **2.400 → 1.642 s** at 8K and
+8.864 → 6.432 s at 32K. These include stream idle/host launch delays and are not CUPTI
+kernel-busy totals. Do not add their saving to the end-to-end saving; the latter already
+includes it. Instrumentation is enabled equally in both arms.
+
+**Follow-up tile screen.** Single GPU, actual layer-0 weights for 240 experts, TP-output
+matrix shapes, synthetic uniform top-6 routes, rows 128/512/2048. All 66 measured schedule
+cells matched the existing scaled arithmetic bit-for-bit. At 2,048 rows, up BM32/BN128/
+4 warps/3 stages measured 11.955 ms versus baseline 13.802/14.002 ms; down BM32/BN128/
+4 warps/4 stages measured 9.777 ms versus 10.556/10.860 ms. Smaller-row winners differ.
+These component results do not demonstrate another 1.42 seconds saved in a full 8K prefill.
+No tile change was promoted, and there is no full-engine result for those alternate schedules.
+
+**Validation and disposition.** Real-weight independent BF16-reference checks at rows
+1/4/17/128/513/2048: scaled relative L2 error <=9.80e-5, exact agreement with the old global
+scaled arm, zero null contributions, and unchanged decode outputs when only the prefill flag
+switches. 41 focused tests passed (prefill timing/dispatch, user-prompt streaming, prefill
+graphs, prefix persistence and probe graders); `git diff --check` passed. The serving `.env`
+was left unchanged and the original `prefill-v4` pair restored. The new arm stays opt-in in
+both example configurations; no production speedup is claimed or deployed by this experiment.
+
+Reproduce in an image containing the new engine/tools files, with serving stopped, using
+`tools/run_two_node_gate.sh bench_prefill_expert_tp.py --suite short|long|timing --out ...`
+(one suite per 900-second gate). Both ranks need identical image IDs. The driver freezes
+adaptation and disables the shadow predictor; set `DSV41_PREFILL_ADAPT=0` and
+`DSV41_PREFILL_MOE_TIMING=1` identically on both ranks for the table above. The retained
+private all-in-one runner uses an 1,800-second bound.
+
+Artifacts: `results/prefill-expert-20261008/`, including `paired-v3/rank{0,1}.json`,
+`kernel.json`, `analysis.json`, `sweep_scaled.py`, `sweep.json`, image sources and gate logs.
+The first two gates stopped before inference: the serving shadow predictor requires swaps,
+then an outer `inference_mode()` made asynchronously populated arenas unwritable. Both were
+harness setup errors, corrected before the measured run; their logs are retained.
+
+### 2026-10-08 — Prefill-scaled FP4 reviewed, tiles promoted, deployed (`prefill-v5`)
+
+Review of the default-off arm above. The code is as described: the phase is passed explicitly,
+the setting is in the guard, decode graphs and replicas are untouched. It was missing a
+comparison against the engine's own numerical noise and an engine run of the tile winners.
+
+Paired gate on `prefill-v4` + working tree, frozen map, 2,048 rows, arms rotated per prompt, 3
+random 8K + 6 natural prompts (repo docs/code, ~8K, 64-token continuations). Reference arm:
+`all` (the serving prefill switches).
+
+| Arm | Mean prefill s | Paired vs `all` |
+| --- | ---: | ---: |
+| all | 5.755 | — |
+| + scaled experts | 5.307 | -0.448 ± 0.219 s |
+| + scaled + 32-row tiles | **4.963** | **-0.792 ± 0.143 s** |
+| all at 1,024 rows (noise reference) | 6.541 | +0.786 ± 0.130 s |
+
+Logits against `all`: scaled mean KL 0.119 (max 0.37), top-1 9/9; the 1,024-row reference
+0.042 (max 0.22), 9/9. The tiles reproduced the scaled arm's continuations on 9/9 prompts.
+Decode, `tools/bench_accept_ab_tp.py` `fused_pf_old` vs `fused_pf_new` (all prefill kernels off
+vs on, decode settings identical, 22 prompts): ms/step +0.27 ± 0.49, acceptance -0.030 ±
+0.027, tok/s -0.59 ± 0.39. No significant decode effect.
+
+**Live on `prefill-v5`** (cold random prompts after one warm-up): 8K 5.56–5.74 s
+(**1,423–1,471 tok/s**, 5 requests), 32K 22.5–23.0 s (**1,426–1,454 tok/s**). `prefill-v4`:
+8K median 6.5 s (1,255), 32K ~1,300. Run-to-run spread fell from ±1 s to ±0.1 s. Decode
+prose/HTML/code: 26.0 / 51.5 / 38.7 tok/s, ms/step in the same 73–98 ms range.
+TensorFold publishes 2,028 / 2,310; we are now at 0.70x / 0.62x.
+
+Artifacts: `results/prefill-trace-20261008/scaled-ab/`, `decode-prefill-ab/`,
+`results/prefill-live-20261008/v5-*.json`, `results/bench-switches-20261008/prefill-v5/`.

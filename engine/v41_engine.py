@@ -641,13 +641,22 @@ class V41Engine:
                 fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
                 self.kernel = "triton-fp4"
                 log("using Triton FP4 MoE kernel")
+                if os.environ.get("DSV41_ROUTE_WARM", "1") == "1" and hasattr(K, "warm_routing"):
+                    # Compile the prefill routing variants now, not inside a served prompt
+                    # (tools/fp4_moe.py::warm_routing). Rank-local; free on a warm cache.
+                    t0 = time.perf_counter()
+                    n = K.warm_routing(self.device, 6 * MAX_CHUNK)
+                    log(f"MoE routing kernels warm: {n} variants in {time.perf_counter() - t0:.1f}s")
             except Exception as e:  # noqa: BLE001
                 from engine import moe_fallback as K
                 fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
                 self.kernel = "dequant-fallback"
                 log(f"Triton kernel unavailable ({e!r}); using the slow dequant fallback")
         self.fp4_dot_scaled = bool(getattr(K, "DOT_SCALED", False))
+        self.fp4_prefill_dot_scaled = bool(getattr(K, "PREFILL_DOT_SCALED", False))
         self.fp4_cuda = bool(getattr(K, "CUDA_DECODE", False))
+        if self.fp4_prefill_dot_scaled:
+            log("DSV41_FP4_PREFILL_DOT_SCALED=1: scaled FP4 prompt/replay arithmetic; decode unchanged")
         # Fixed-count random draws keep the ranks aligned, but change seeded completions
         # relative to sequential rejection sampling. Remain opt-in pending serving gates.
         self.batched_verify = os.environ.get("DSV41_BATCHED_VERIFY", "0") == "1"
@@ -684,7 +693,8 @@ class V41Engine:
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
         def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
-                   null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None):
+                   null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None,
+                   prefill=False):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
             drafter would cost acceptance for nothing.
@@ -698,6 +708,8 @@ class V41Engine:
                 return cb3_moe_fn(x, slots, weights, arena, limit,
                                   out_dtype=out_dtype, slots_repeat=slots_repeat)
             extra = {"null_slot": null_slot} if null_slot >= 0 and self.kernel == "triton-fp4" else {}
+            if self.kernel == "triton-fp4":
+                extra['prefill'] = prefill
             if routing_ids is not None and self.kernel == "triton-fp4":
                 extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
             if stage_mark is not None and self.kernel == "triton-fp4":
@@ -745,7 +757,8 @@ class V41Engine:
             raise ValueError('prefill replica admission budget must be in (0, 500] ms')
         self.replica_slots = int(replica_gb * 1e9 / self.expert_bytes)
         replica_bytes = self.replica_slots * self.expert_bytes
-        if self.replica_slots and (self.ep.world != 2 or self.kernel != "triton-fp4" or self.fp4_dot_scaled):
+        if self.replica_slots and (self.ep.world != 2 or self.kernel != "triton-fp4"
+                                   or self.fp4_dot_scaled or self.fp4_prefill_dot_scaled):
             raise ValueError('prefill replicas currently require EP2 software-FP4')
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3"), expert_format
@@ -1187,6 +1200,8 @@ class V41Engine:
                 "hc_prec": R.HC_PREC,
                 "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
                 "fp4_dot_scaled": self.fp4_dot_scaled,
+                "fp4_prefill_dot_scaled": self.fp4_prefill_dot_scaled,
+                "fp4_prefill_scaled_tiles": os.environ.get("DSV41_FP4_PREFILL_SCALED_TILES", "0"),
                 "fp4_cuda": self.fp4_cuda,
                 "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
                 "fp4_cuda_v2": self.fp4_cuda_v2,
@@ -1241,6 +1256,10 @@ class V41Engine:
                 # hangs the pair until the process-group timeout.
                 "engram_row_split": os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0"),
                 "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0"),
+                "engram_direct": os.environ.get("DSV41_ENGRAM_DIRECT", "0"),
+                "hc_prefill_fused": os.environ.get("DSV41_HC_PREFILL_FUSED", "0"),
+                "prefill_attn_indexed": os.environ.get("DSV41_PREFILL_ATTN_INDEXED", "0"),
+                "index_fused": os.environ.get("DSV41_INDEX_FUSED", "0"),
                 "engram_cache_v1_mb": os.environ.get("DSV41_ENGRAM_CACHE_MB", "0"),
                 "engram_cache_v1_peer_mb": os.environ.get("DSV41_ENGRAM_CACHE_MB_PEER", "inherit"),
                 "engram_native_threads": os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64"),
@@ -3250,6 +3269,8 @@ class V41Engine:
             "hc_prec": R.HC_PREC,
             "dense_dequant_cache": os.environ.get("DSV41_DENSE_DEQUANT_CACHE", "0") == "1",
             "fp4_dot_scaled": self.fp4_dot_scaled,
+            "fp4_prefill_dot_scaled": self.fp4_prefill_dot_scaled,
+            "fp4_prefill_scaled_tiles": os.environ.get("DSV41_FP4_PREFILL_SCALED_TILES", "0") == "1",
             "fp4_cuda": self.fp4_cuda,
             "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
             "fp4_cuda_v2": self.fp4_cuda_v2,
@@ -3274,6 +3295,10 @@ class V41Engine:
             "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
             "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
             "engram_native": os.environ.get("DSV41_ENGRAM_NATIVE", "0") == "1",
+            "engram_direct": os.environ.get("DSV41_ENGRAM_DIRECT", "0"),
+            "hc_prefill_fused": os.environ.get("DSV41_HC_PREFILL_FUSED", "0") == "1",
+            "prefill_attn_indexed": os.environ.get("DSV41_PREFILL_ATTN_INDEXED", "0") == "1",
+            "index_fused": os.environ.get("DSV41_INDEX_FUSED", "0") == "1",
             "engram_cache_mb": round(sum(t.row_cache.report()['allocated_bytes'] for t in self.tables.values()
                                          if t.row_cache is not None) / 1024**2, 3),
             "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
@@ -3350,7 +3375,9 @@ class V41Engine:
         return {**self.config(), **self.last_stats}
 
     def close(self):
-        native = [t.native_gather for t in self.tables.values() if getattr(t, 'native_gather', None) is not None]
+        native = {id(g): g for t in self.tables.values()
+                  for g in (getattr(t, 'native_gather', None), getattr(t, 'direct_gather', None)) if g is not None}
+        native = list(native.values())
         if native:
             # No read future may enter the native context after it is destroyed.
             self.eg_pool.shutdown(wait=True)

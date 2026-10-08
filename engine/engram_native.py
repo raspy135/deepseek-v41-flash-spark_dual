@@ -45,6 +45,9 @@ def _library():
     ptr = ctypes.c_void_p
     lib.engram_gather_create.argtypes = [ptr, ptr, ctypes.c_int64, ctypes.c_int]
     lib.engram_gather_create.restype = ptr
+    lib.engram_gather_create_direct.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                                                ctypes.c_int]
+    lib.engram_gather_create_direct.restype = ptr
     lib.engram_gather_run.argtypes = [ptr, ptr, ctypes.c_size_t, ptr]
     lib.engram_gather_run.restype = ctypes.c_int
     lib.engram_gather_destroy.argtypes = [ptr]
@@ -75,18 +78,28 @@ class RowBuffers:
 
 
 class NativeGather:
-    def __init__(self, weights, scales, workers=16):
-        for array, width in ((weights, 256), (scales, 8)):
-            if array.dtype != np.uint8 or array.ndim != 2 or array.shape[1] != width or not array.flags.c_contiguous:
-                raise ValueError('native gather requires contiguous uint8 row tables')
-        if weights.shape[0] != scales.shape[0] or not 1 <= workers <= 128:
-            raise ValueError('table row counts or worker count invalid')
-        self.weights, self.scales = weights, scales  # Own the mappings while C borrows pointers.
+    def __init__(self, weights, scales, workers=16, direct=None):
+        """Mapped tables (`weights` [rows, 256], `scales` [rows, 8] uint8 memmaps), or with
+        `direct=(fd, w_off, s_off, rows)` an O_DIRECT descriptor and the tables' byte offsets
+        (weights and scales then None): sector reads, no page cache, no mapping."""
+        if not 1 <= workers <= 128:
+            raise ValueError('worker count invalid')
         self.lib = _library()
+        if direct is None:
+            for array, width in ((weights, 256), (scales, 8)):
+                if array.dtype != np.uint8 or array.ndim != 2 or array.shape[1] != width or not array.flags.c_contiguous:
+                    raise ValueError('native gather requires contiguous uint8 row tables')
+            if weights.shape[0] != scales.shape[0]:
+                raise ValueError('table row counts differ')
+            self.weights, self.scales = weights, scales  # Own the mappings while C borrows pointers.
+            self.ctx = self.lib.engram_gather_create(weights.ctypes.data, scales.ctypes.data,
+                                                    weights.shape[0], workers)
+        else:
+            fd, w_off, s_off, rows = direct
+            self.weights = self.scales = None  # the caller owns fd and closes it after close()
+            self.ctx = self.lib.engram_gather_create_direct(fd, w_off, s_off, rows, workers)
         self.lock = threading.Lock()
         self.buffers = RowBuffers()
-        self.ctx = self.lib.engram_gather_create(weights.ctypes.data, scales.ctypes.data,
-                                                weights.shape[0], workers)
         if not self.ctx:
             raise RuntimeError('cannot create native gather worker pool')
         self._cleanup = weakref.finalize(self, self.lib.engram_gather_destroy, self.ctx)
@@ -102,6 +115,8 @@ class NativeGather:
             result = self.lib.engram_gather_run(self.ctx, ids.ctypes.data, len(ids), out.ctypes.data)
         if result == 1:
             raise IndexError('Engram row ID out of bounds')
+        if result == 4:
+            raise OSError('Engram direct read failed')
         if result:
             raise RuntimeError(f'native gather failed: {result}')
         return out

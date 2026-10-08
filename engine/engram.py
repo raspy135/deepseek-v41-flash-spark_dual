@@ -1,8 +1,10 @@
 """
 engram.py -- Engram table rows at serve time: 24 random 264-byte reads per token per engram
-layer, straight from the two 101 GB safetensors shards on NVMe (page cache, buffered preadv in a
-thread pool; the reads are far too small for O_DIRECT to help). Hash ids come from the reference
-`NgramHashState`, which depends on the token ids only.
+layer, straight from the two 101 GB safetensors shards on NVMe. By default through the page cache
+(memmap faults); DSV41_ENGRAM_DIRECT=1 reads the covering 512-byte sectors with O_DIRECT instead,
+which matters for what it does to the REST of the box, not for the reads themselves (see
+EngramTable.__init__). Hash ids come from the reference `NgramHashState`, which depends on the
+token ids only.
 """
 
 from __future__ import annotations
@@ -47,8 +49,27 @@ class EngramTable:
         # does the whole gather in C and lets page faults do the I/O -- 8.9M rows/s warm, 891k
         # cold, byte-identical output. DSV41_ENGRAM_MMAP=0 restores the pread path.
         self.mmap_rows = os.environ.get("DSV41_ENGRAM_MMAP", "1") == "1"
+        # DSV41_ENGRAM_DIRECT=1: the native workers pread the 512-byte sectors covering each row's
+        # weights and scale from an O_DIRECT descriptor -- ~1 KB of I/O a row instead of two 4 KB
+        # page faults, nothing added to the page cache, nothing mapped. Every gather size goes
+        # there, decode's and prefill's. The reason is the box, not the read: with ~1 GB free per
+        # node, a cold 8K prompt's ~1.5M faults force reclaim and compaction (700-1,500 compaction
+        # stalls, 0.35-0.83M pages migrated a prompt), and while that runs the MoE kernels stall
+        # inside the kernel -- single calls of 20-176 ms instead of ~5 ms. Same prompt with its
+        # rows already cached: MoE phase 12.9 -> 5.3 s, prefill 19.6 -> 11.4 s (gate,
+        # results/prefill-trace-20261008). Unrelated page-cache churn (cat of other files) slowed a
+        # hot prefill 2.7x by itself. Same bytes either way, so tokens cannot change.
+        # "prefill" (the serving setting) keeps decode-sized gathers (<= 384 rows) on the memmap:
+        # there a page-cache hit beats an O_DIRECT round trip, and all-direct measured +0.89 +-
+        # 0.43 ms/step over 22 paired prompts (results/prefill-trace-20261008/decode-engram-ab).
+        mode = os.environ.get("DSV41_ENGRAM_DIRECT", "0")
+        if mode not in ("0", "1", "prefill"):
+            raise ValueError("DSV41_ENGRAM_DIRECT must be 0, 1 or prefill")
+        self.direct = mode == "1"
+        self.direct_large = mode != "0"
+        self.direct_gather = None
         self.w_mm = self.s_mm = None
-        if self.mmap_rows:
+        if self.mmap_rows and not self.direct:
             self.w_mm = np.memmap(self.path, dtype=np.uint8, mode="r",
                                   offset=self.w_off, shape=(self.n_rows, 256))
             self.s_mm = np.memmap(self.path, dtype=np.uint8, mode="r",
@@ -63,7 +84,17 @@ class EngramTable:
         self.gather_min_parallel = int(os.environ.get("DSV41_ENGRAM_GATHER_MIN", "32"))
         # Decode-sized gathers only; large prefill batches keep their existing path.
         self.native_gather = None
-        if os.environ.get('DSV41_ENGRAM_NATIVE', '0') == '1':
+        if self.direct_large:
+            from engine.engram_native import NativeGather
+            if not self.mmap_rows:
+                raise ValueError('DSV41_ENGRAM_DIRECT replaces the mmap row path; leave DSV41_ENGRAM_MMAP=1')
+            self.direct_fd = os.open(self.path, os.O_RDONLY | os.O_DIRECT)
+            self.direct_gather = NativeGather(
+                None, None, workers=int(os.environ.get('DSV41_ENGRAM_NATIVE_THREADS', '64')),
+                direct=(self.direct_fd, self.w_off, self.s_off, self.n_rows))
+        if self.direct:
+            self.native_gather = self.direct_gather
+        elif os.environ.get('DSV41_ENGRAM_NATIVE', '0') == '1':
             if not self.mmap_rows:
                 raise ValueError('DSV41_ENGRAM_NATIVE requires the mmap row path')
             from engine.engram_native import NativeGather
@@ -133,6 +164,8 @@ class EngramTable:
         directly delays the chunk waiting on it. What paid was removing work: splitting the rows
         across ranks halved per-box volume and took prefill 509 -> 1045 tok/s.
         """
+        if self.direct_gather is not None and (self.direct or len(ids) > 384):
+            return self.direct_gather.gather(np.ascontiguousarray(ids, dtype=np.int64))
         if self.native_gather is not None and len(ids) <= 384:
             return self.native_gather.gather(ids)
         out = np.empty((len(ids), 264), np.uint8)

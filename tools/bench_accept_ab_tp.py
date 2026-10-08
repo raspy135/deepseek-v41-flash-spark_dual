@@ -48,6 +48,14 @@ CONFIGS['draft_fp8_split'] = dict(CONFIGS['draft_fp8'], markov_tp=True)
 CONFIGS['live'] = dict(CONFIGS['draft_fp8_split'], fp8_bn='auto', fp8_bk=128, rms_fused=False, hc_front_fused=False)
 CONFIGS['fp8sched'] = dict(CONFIGS['live'], fp8_bn='32', fp8_bk=256)
 CONFIGS['fused'] = dict(CONFIGS['fp8sched'], rms_fused=True, hc_front_fused=True)
+# Engram row source: memmap faults vs O_DIRECT sector reads. Same bytes, so outputs must match.
+CONFIGS['fused_mm'] = dict(CONFIGS['fused'], engram_direct=False)
+CONFIGS['fused_direct'] = dict(CONFIGS['fused'], engram_direct=True)
+# Prefill arithmetic only (decode settings = fused): the 2026-10-08 prefill kernels off vs on.
+_PREFILL_OFF = dict(pf_indexed=False, pf_hc=False, pf_index=False, pf_scaled=False, pf_tiles=False)
+CONFIGS['fused_pf_old'] = dict(CONFIGS['fused'], **_PREFILL_OFF)
+CONFIGS['fused_pf_new'] = dict(CONFIGS['fused'], pf_indexed=True, pf_hc=True, pf_index=True,
+                               pf_scaled=True, pf_tiles=True)
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -102,6 +110,21 @@ def set_config(e, cfg):
         fd.qkv_prefetch_mb, fd.sh_prefetch_mb, fd.attn_prefetch_mb = cfg['qkv_mb'], cfg['sh_mb'], cfg['attn_mb']
         import engine.l2pf as _l2pf
         _l2pf.MODE = cfg.get('pf_mode', 'touch')  # read by l2pf.touch at capture
+    if 'pf_scaled' in cfg:
+        import engine.model as M
+        import fp4_moe as K
+        M.PREFILL_ATTN_INDEXED, M.HC_PREFILL_FUSED, M.INDEX_FUSED = cfg['pf_indexed'], cfg['pf_hc'], cfg['pf_index']
+        K.PREFILL_DOT_SCALED, K.PREFILL_SCALED_TILES = cfg['pf_scaled'], cfg['pf_tiles']
+    if 'engram_direct' in cfg:
+        from engine.engram_native import NativeGather
+        for t in e.tables.values():
+            if not hasattr(t, '_ab_native'):
+                dfd = os.open(t.path, os.O_RDONLY | os.O_DIRECT)
+                t._ab_native = (t.native_gather, NativeGather(
+                    None, None, workers=64, direct=(dfd, t.w_off, t.s_off, t.n_rows)))
+            t.direct = cfg['engram_direct']  # read per gather by EngramTable._gather_rows_uncached
+            t.direct_gather = t._ab_native[1] if t.direct else None
+            t.native_gather = t._ab_native[0]
     if lean.router_bf16:
         lean.prepare_router_weights([w.gate_w for w in e.W.layers])
 
@@ -182,7 +205,7 @@ def main():
     usable = [i for i in range(len(ids)) if by[(i, args.a)]['steps'] >= 8 and by[(i, args.b)]['steps'] >= 8]
     # Target arithmetic keys; draft-only and exact-schedule (fp8_bn/fp8_bk) differences must leave
     # greedy outputs bit-identical, so those A/Bs assert it.
-    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused']
+    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused'] + list(_PREFILL_OFF)
     draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in target_keys)
     report['summary'] = {
         'draft_only': draft_only,
