@@ -68,7 +68,6 @@ abliteration enabled, dynamic speculative depth and adaptation active. TTS was n
 | Python LRU cache with TTL, thread safety and tests | **40.4 tok/s** (39.2–41.6) | 0.74 s |
 | Coastal-ecosystem essay | **26.4 tok/s** (26.4–26.5) | 1.18 s |
 | Angry Birds single-file HTML game | **53.4 tok/s** (52.0–54.9) | 0.23 s* |
-| Uncached random 8K prompt (2026-10-06, older profile) | 23.2 tok/s | 21.36 s |
 
 Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
 fixed output length. Decode speed excludes time to first token. *The HTML prompt reused
@@ -95,6 +94,17 @@ head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
 decode round speed about **2%**, with identical tested tokens and acceptance.
 The draft head must be `off`/`bf16` unless `DSV41_TP_DRAFT_HEAD=1` builds a separate
 FP8 draft shard; the example enables both.
+
+Prefill, **2026-10-08**, cold (uncached random-word prompts):
+
+| Prompt | Before | After |
+| --- | ---: | ---: |
+| 8K | 390–470 tok/s (17–21 s) | **1,423–1,471 tok/s** (5.6 s) |
+| 32K | 470 tok/s (70 s) | **1,426–1,454 tok/s** (23 s) |
+
+Switches: `DSV41_ENGRAM_DIRECT=prefill`, `DSV41_PREFILL_CHUNK=2048`, `DSV41_PREFILL_ATTN_INDEXED=1`,
+`DSV41_HC_PREFILL_FUSED=1`, `DSV41_INDEX_FUSED=1`, `DSV41_FP4_PREFILL_DOT_SCALED=1`,
+`DSV41_FP4_PREFILL_SCALED_TILES=1`. Decode is unchanged within paired noise (22 prompts).
 
 Reproduce an individual workload against a running server:
 
@@ -199,7 +209,7 @@ refer to the example profile, not every engine fallback default.
 | `DSV41_ADAPT_SENSITIVITY=high` | How quickly new traffic changes expert ranking: `low`, `medium`, `high`, `max`; `off` freezes adaptation. Higher follows changes faster but can displace useful experts sooner. |
 | `DSV41_ADAPT_PRIOR=4` | Weight of the shipped routing trace. Lower values let your observed traffic dominate sooner. |
 | `DSV41_ADAPT_DECODE_TOKENS=600` / `DSV41_ADAPT_URGENT=1` | Periodic and urgent adaptation during an answer. Setting the interval to `0` disables both decode triggers; post-prefill adaptation remains. |
-| `DSV41_PREFILL_CHUNK=1024` | Tokens processed per prefill chunk. Smaller chunks reduce temporary memory and give finer prefix-cache boundaries. |
+| `DSV41_PREFILL_CHUNK=2048` | Tokens processed per prefill chunk. Smaller chunks reduce temporary memory and give finer prefix-cache boundaries; `DSV41_PREFILL_ADAPT=1` shrinks them under memory pressure. |
 | `DSV41_ENGRAM_CACHE_MB=256` / `DSV41_ENGRAM_CACHE_MB_PEER=1024` | Engram row-cache budgets in MiB on the head and worker. Separate from expert residency and prompt caching. |
 | `DSV41_VISION=1` / `DSV41_VISION_MODE=peer` | Enable images and put the vision tower on rank 1. Set vision to `0` for text-only serving. |
 | `DSV41_PREFIX_CACHE=1` | Reuse matching prompt state in RAM. Keep `DSV41_PREFIX_DISK=0` and `DSV41_PREFIX_RESPONSE=0` with dynamic allocation. |
