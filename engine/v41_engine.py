@@ -498,10 +498,16 @@ class V41Engine:
         self.model_dir = model_dir
         self.device = device
         self.spec = spec
+        self._decode_probe_reply = {"version": 1, "action": "status", "ok": True,
+                                    "ranks": [{"rank": rank or 0, "ok": True,
+                                               "status": "stopped"}]}
+        self._decode_probe_phases = None
         from engine import draft_bypass
         from engine.tensor_parallel import tp_draft_head_enabled
+        from engine.native_head import validate_config, head_kernel, HEAD_KERNEL_VERSION
         self.draft_bypass_enabled = draft_bypass.enabled()
         tp_draft_head_enabled()  # validate even on the unsharded path
+        validate_config()
         if os.environ.get("DSV41_LOOKUP_DRAFT_ENABLED", "0") not in ("0", "1"):
             raise ValueError("DSV41_LOOKUP_DRAFT_ENABLED must be 0 or 1")
         if LOOKUP_DRAFT_ENABLED and (LOOKUP_DRAFT_NGRAM < 2 or LOOKUP_DRAFT_CANDIDATES < 1):
@@ -600,6 +606,9 @@ class V41Engine:
                 raise ValueError('critical prefill requires PREFIX_CACHE=0, PREFIX_DISK=0, PREFILL_GRAPHS=0')
             if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
                 raise ValueError('critical prefill prototype requires concurrency 1')
+        from engine.prefill_budget import PrefillBudget
+        self.prefill_budget = PrefillBudget.from_env()
+        self.prefill_budget_last = {}
         from engine.predictive_prefill import PredictivePrefill
         self.predictive = PredictivePrefill(self.args.n_layers, self.args.n_routed_experts)
         # Serving preference, independent of the checkpoint's reference value (512).
@@ -1080,6 +1089,18 @@ class V41Engine:
             from engine.lookup_draft import VERSION as LOOKUP_VERSION
             from engine.tensor_parallel import TP_DRAFT_HEAD_VERSION
             cfg = {
+                "decode_probe_version": 1,
+                "router_fused_tail": os.environ.get("DSV41_ROUTER_FUSED_TAIL", "0"),
+                "router_fused_tail_version": 1,
+                "router_bf16": os.environ.get("DSV41_ROUTER_BF16", "0"),
+                "router_bf16_version": 1,
+                "verify_odd": os.environ.get("DSV41_VERIFY_ODD", "0"),
+                "verify_odd_version": 1,
+                "confidence_cost_refresh": int(os.environ.get("DSV41_CONF_COST_REFRESH", "0")),
+                "graphs_max": int(os.environ.get("DSV41_GRAPHS_MAX", "8")),
+                "graph_pool_rotation_version": 2,
+                "prefill_budget": vars(self.prefill_budget),
+                "prefill_budget_version": 1,
                 "draft_tokens": T_DRAFT if self.spec else 0,
                 "expert_format": self.expert_format,
                 "tp_dense": os.environ.get("DSV41_TP_DENSE", "0"),
@@ -1091,6 +1112,8 @@ class V41Engine:
                 "tp_linear_layout": os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output'),
                 "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
                 "tp_attention": os.environ.get('DSV41_TP_ATTN', '0'),
+                "tp_draft_attention": os.environ.get('DSV41_TP_DRAFT_ATTN', '0'),
+                "draft_markov_topk": int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0')),
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
                 "tp_embed": os.environ.get('DSV41_TP_EMBED', '0'),
                 "tp_draft_experts": self.tp_draft_experts,
@@ -1145,6 +1168,8 @@ class V41Engine:
                 "ablate_wob": R_ablit.enabled(),
                 "ablate_wob_digest": R_ablit.digest(),
                 "head_fmt": R.head_fmt(),
+                "head_kernel": head_kernel(),
+                "head_kernel_version": HEAD_KERNEL_VERSION,
                 "draft_head_fmt": R.draft_head_fmt(),
                 "tp_draft_head": tp_draft_head_enabled(),
                 "tp_draft_head_version": TP_DRAFT_HEAD_VERSION,
@@ -1172,6 +1197,9 @@ class V41Engine:
                 "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
                 "l2pf_bytes": l2pf.budget_bytes(),
                 "l2pf_version": l2pf.VERSION,
+                "l2pf_mode": l2pf.MODE,
+                "l2pf_attn_mb": int(os.environ.get("DSV41_L2PF_ATTN_MB", "0")),
+                "l2pf_pace_gbps": l2pf.PACE_GBPS,
                 # Which verify widths exist (buffers, graphs). The depth each step uses is
                 # decided on rank 0 and broadcast with the control flag, so the other
                 # DSV41_BLOCK_DYNAMIC_* policy knobs only need to be right on rank 0.
@@ -1186,12 +1214,14 @@ class V41Engine:
                 # guarantee; a pair split across them must refuse to start.
                 "fp8_decode_block_n": os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto"),
                 "fp8_decode_warps": os.environ.get("DSV41_FP8_DECODE_WARPS", "4"),
+                "fp8_decode_pipeline": os.environ.get("DSV41_FP8_DECODE_PIPELINE", "0") == "1",
                 "decode_merged_proj": os.environ.get("DSV41_DECODE_MERGED_PROJ", "1") == "1",
                 "decode_lean": os.environ.get("DSV41_DECODE_LEAN", "1") == "1",
                 "decode_lean_rope": os.environ.get("DSV41_DECODE_LEAN_ROPE", "1") == "1",
                 "decode_lean_softmax": os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1",
                 "decode_lean_moe": os.environ.get("DSV41_DECODE_LEAN_MOE", "1") == "1",
                 "decode_lean_attn": os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1",
+                "attn_staged": os.environ.get("DSV41_ATTN_STAGED", "0"),
                 "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
                 "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
                 "moe_fallback": self.kernel == "dequant-fallback",
@@ -1344,6 +1374,8 @@ class V41Engine:
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
         from engine.fastdecode import T_VERIFY as _TV, VERIFY_WIDTHS, DYNAMIC_DEPTHS, CONFIDENCE_DEPTHS
         self._tv = _TV
+        self.verify_odd = os.environ.get("DSV41_VERIFY_ODD", "0") == "1"
+        self._root_width = 1 if self.verify_odd else 2
         # one (block, readback, pinned host) triple per verify width; the defaults are the widest
         self._vbufs = {T: (torch.empty(T, dtype=torch.long, device=device),
                            torch.empty(T + 1, dtype=torch.long, device=device),
@@ -1362,15 +1394,16 @@ class V41Engine:
             self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS or (3, 5))
             if CONFIDENCE_DEPTHS:
                 self.confidence_depth_policy = ConfidenceDepthPolicy()
-                log("confidence depth 1/3/5 at every temperature (sampled requests use prefix decisions)")
+                log(f"confidence depths {self.confidence_depth_policy.depths} at every temperature "
+                    "(sampled requests use prefix decisions)")
             log(f"dynamic speculative depth {DYNAMIC_DEPTHS or (3, 5)} (start {self.depth_policy.start}, "
                 f"decided every {self.depth_policy.interval} tokens)")
         if LOOKUP_DRAFT_ENABLED or self.draft_bypass_enabled:
             if not (self.spec and self.fast is not None and self.fast.use_graphs
                     and int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 1):
                 raise ValueError('draft experiments require single-request graphed speculation')
-            if self.draft_bypass_enabled and 2 not in VERIFY_WIDTHS:
-                raise ValueError('draft bypass requires the two-row graph (confidence depth 1)')
+            if self.draft_bypass_enabled and self._root_width not in VERIFY_WIDTHS:
+                raise ValueError('draft bypass requires its root verification graph')
         from engine.prefill_graphs import enabled as prefill_graphs_enabled, PrefillFFNGraphs
         self.model.prefill_graphs = None
         if prefill_graphs_enabled():
@@ -1610,10 +1643,13 @@ class V41Engine:
             yield from self._generate(list(prompt_ids), max_tokens, temperature, top_p, set(stop_token_ids or ()),
                                       seed, ignore_eos, grammar, penalties, user_prompt_ranges)
 
-    def _policy_step_s(self, t_iter: float, n_graphs: int):
+    def _policy_step_s(self, t_iter: float, n_captures: int | None):
         """Wall time of this decode step for DepthPolicy, or None if it captured a graph."""
-        now = len(self.fast.graphs) + (self.fast.draft_graphs is not None)
-        return None if now != n_graphs else time.perf_counter() - t_iter
+        # Pool rotation can replace a graph without changing the live count
+        # (notably at DSV41_GRAPHS_MAX=1). Missing legacy counters fail closed:
+        # an unknown capture state must not train the policy's step costs.
+        now = getattr(self.fast, "graph_captures", None)
+        return None if n_captures is None or now != n_captures else time.perf_counter() - t_iter
 
     def _generate(self, prompt, max_tokens, temperature, top_p, stop_ids, seed, ignore_eos=False, grammar=None,
                   penalties=None, user_prompt_ranges=None):
@@ -1684,6 +1720,8 @@ class V41Engine:
             t_prefill = _st.get("t_prefill", t_prefill)
             t_dec = max(time.perf_counter() - _st.get("t_decode0", t_start), 1e-9)
             _ph = _st.get("phases")
+            if _ph is not None and hasattr(_ph, "report"):
+                self._decode_probe_phases = _ph
             if _ph is not None and _ph.steps:
                 _notes = []
                 _fd0 = _st.get("fd0")
@@ -1691,14 +1729,16 @@ class V41Engine:
                     _notes = [("of it: engram", self.fast.stats["engram_s"] - _fd0["engram_s"]),
                               ("of it: graphs", self.fast.stats["graph_s"] - _fd0["graph_s"]),
                               ("of it: draft g", self.fast.stats["draft_s"] - _fd0["draft_s"])]
-                print(f"[step timing] host wall clock per decode step, {_ph.steps} steps "
-                      f"(DSV41_STEP_TIMING=1)\n{_ph.table(_notes)}", flush=True)
+                if STEP_TIMING:
+                    print(f"[step timing] host wall clock per decode step, {_ph.steps} steps "
+                          f"(DSV41_STEP_TIMING=1)\n{_ph.table(_notes)}", flush=True)
             st = self.store.stats
             m = self.model
             self.last_stats = {
                 "prompt_tokens": P, "completion_tokens": n_out, "prefill_s": round(t_prefill, 3),
                 "prefix_cached_tokens": _st.get("prefix_cached_tokens", 0),
                 "predictive_prefill": dict(self.predictive.last),
+                "prefill_budget": _st.get("prefill_budget"),
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
@@ -2442,7 +2482,7 @@ class V41Engine:
         """Attach this request's vision inputs; cleared at the end of generate()."""
         self._token_types, self._images = token_types, images
 
-    def _prefill_spans(self, P: int, start: int = 0):
+    def _prefill_spans(self, P: int, start: int = 0, chunk_size=None):
         """Chunk boundaries for this prompt: MAX_CHUNK, except that no image span may straddle one.
 
         A span must be spliced whole (inference/model.py:1254), and the obvious fix -- a bigger
@@ -2453,8 +2493,11 @@ class V41Engine:
         """
         sp = sorted((im.start, im.start + im.types.numel()) for im in (self._images or ()))
         out, s = [], start
+        chunk_size = MAX_CHUNK if chunk_size is None else chunk_size
+        if chunk_size < 1:
+            raise ValueError("prefill chunk must be positive")
         while s < P:
-            e = min(s + MAX_CHUNK, P)
+            e = min(s + chunk_size, P)
             # a span that begins exactly here must be contained whole, even past MAX_CHUNK
             floor = max([en for st, en in sp if st == s], default=0)
             e = max(e, floor)
@@ -2537,7 +2580,25 @@ class V41Engine:
         # is sliced per chunk exactly like them. TEXT is -1, so `>= 0` marks a whole image span.
         tt = getattr(self, "_token_types", None)
         eg_mask = None if tt is None else ~(tt >= 0)
-        spans = self._prefill_spans(P, prefix_start)
+        chunk_size = MAX_CHUNK
+        if self.prefill_budget.enabled:
+            # Reached by EVERY rank before planning read-ahead, including a full
+            # prefix hit. Rank-local availability must never choose TP boundaries.
+            available = self.ep.gather_objects(host_available_bytes())
+            self.prefill_budget_last = self.prefill_budget.choose(MAX_CHUNK, P, available)
+            self.prefill_budget_last["rank_available_bytes"] = available
+            chunk_size = self.prefill_budget_last["rows"]
+            if P > prefix_start and self.ep.rank == 0 and chunk_size != MAX_CHUNK:
+                log(f"prefill budget: {chunk_size}/{MAX_CHUNK} rows; tighter rank "
+                    f"{self.prefill_budget_last['available_bytes'] / 2**30:.2f} GiB available; "
+                    f"estimate fits reserve: {self.prefill_budget_last['estimate_fits']}")
+        else:
+            self.prefill_budget_last = dict(enabled=False, rows=MAX_CHUNK)
+        spans = self._prefill_spans(P, prefix_start, chunk_size)
+        self.prefill_budget_last["largest_span"] = max((e-s for s,e in spans), default=0)
+        self.prefill_budget_last["image_span_exceeds_rows"] = self.prefill_budget_last["largest_span"] > chunk_size
+        self.prefill_budget_last["new_tokens"] = P - prefix_start
+        out_st["prefill_budget"] = dict(self.prefill_budget_last)
         replicas = self.prefill_replicas
         if replicas is not None:
             replicas.begin(len(spans) > 1)
@@ -2652,7 +2713,13 @@ class V41Engine:
         from engine.fastdecode import SPEC_CONF, TREE_PROBE
         conf_hist = [] if (SPEC_CONF and self.spec and self.fast is not None) else None
         tree_hist = [] if (TREE_PROBE and self.spec and self.fast is not None) else None
-        ph = StepPhases() if STEP_TIMING else None
+        probe = getattr(self.fast, "decode_probe", None)
+        if probe is not None and probe.active:
+            from engine.decode_probe_phases import DecodeLoopPhases
+            ph = DecodeLoopPhases(StepPhases(), self.device,
+                                  lambda: self.fast.graph_captures)
+        else:
+            ph = StepPhases() if STEP_TIMING else None
         if self.fast is not None:
             # the engram row wait and the graph queueing both live inside the "step" phase; record
             # where they started so the table can break that phase down. Taken unconditionally --
@@ -2722,8 +2789,8 @@ class V41Engine:
             t_iter = time.perf_counter()
             # A step that captures a CUDA graph (first use of a width/parity/bucket, or the
             # drafter) costs seconds; timing it would skew the policy's step-time estimate.
-            n_graphs = (len(self.fast.graphs) + (self.fast.draft_graphs is not None)
-                        if pol is not None or bypass is not None else 0)
+            n_graphs = (getattr(self.fast, "graph_captures", None)
+                        if pol is not None or bypass is not None else None)
             mode = self.ep.control_value
             copied, root_only = mode < 0, mode == 0
             depth = abs(mode) if mode else 0
@@ -2738,7 +2805,7 @@ class V41Engine:
                         f"{sw['tokens_per_step']} tokens/step over {sw['steps']} steps; "
                         + ", ".join(f"depth {d} {'would be ' if d == other else ''}{r} tok/s"
                                     for d, r in sorted(sw["rate"].items())))
-            vblk, vout, vhost = self._vbufs[2 if root_only else depth + 1]
+            vblk, vout, vhost = self._vbufs[self._root_width if root_only else depth + 1]
             if ph is not None:
                 ph.start()
             if self.spec:
@@ -2770,7 +2837,7 @@ class V41Engine:
                         if not self.ep.control(True, chosen):
                             break
                         depth = self.ep.control_value
-                        vblk, vout, vhost = self._vbufs[2 if root_only else depth + 1]
+                        vblk, vout, vhost = self._vbufs[self._root_width if root_only else depth + 1]
                     if depth < drafts.numel():
                         # dynamic depth: verify the first `depth` of the deeper draft
                         drafts, q = drafts[:depth], q[:depth]
@@ -2781,8 +2848,8 @@ class V41Engine:
                     if ph is not None:
                         ph.mark("draft")
                     if root_only:
-                        # Ratio-2 compression requires two rows. The dummy is causal,
-                        # never emitted and rolled back; only row 0 supplies a sample.
+                        # Odd verification can preserve an unmatched compressor token.
+                        # The original two-row path retains its discarded causal dummy.
                         block = vblk
                         block.fill_(tok)
                     elif lean:
@@ -2990,7 +3057,8 @@ class V41Engine:
                         ph.mark("consumer")
                     if any(t in stop_ids for t in emitted):
                         break
-                if pol is not None and self.ep.rank == 0 and not root_only and not copied:
+                if (pol is not None and self.ep.rank == 0 and not copied
+                        and (not root_only or getattr(pol, 'lo', None) == 0)):
                     pol.observe(depth, a, len(emitted), self._policy_step_s(t_iter, n_graphs))
                 if bypass is not None and self.ep.rank == 0 and not copied:
                     bypass.observe(root_only, len(emitted), self._policy_step_s(t_iter, n_graphs))
@@ -3045,13 +3113,84 @@ class V41Engine:
     # ------------------------------------------------------------------ introspection
     supports_penalties = True
 
+    def decode_probe_status(self):
+        """CPU metadata only; safe for observer polling during generation."""
+        reply = dict(self._decode_probe_reply)
+        probe = getattr(self.fast, "decode_probe", None)
+        if probe is not None:
+            reply["local_status"] = probe.status()
+        return reply
+
+    def decode_probe_command(self, body):
+        """Mirrored, idle command. Every rank reaches the same final gather.
+
+        The server owns the request lock/broadcast. Isolation never executes a
+        collective or changes the live model, arena, KV cache or RNG state.
+        Clearing instrumented graphs precedes releasing their event/copy owners.
+        """
+        from dataclasses import asdict
+        from engine.decode_probe import DecodeProbe, ProbeConfig
+        action = body.get("action", "arm")
+        local = {"rank": self.ep.rank, "ok": False}
+        try:
+            fd = self.fast
+            if fd is None or not fd.use_graphs:
+                raise RuntimeError("decode probe needs speculative CUDA graphs")
+            probe = fd.decode_probe
+            if action == "run" and probe is not None:
+                opts = asdict(probe.config)
+                opts.update(body)
+                cfg = ProbeConfig.from_dict(opts)
+            else:
+                cfg = ProbeConfig.from_dict(body)
+            if action == "arm":
+                fd.release_graphs()
+                if probe is not None:
+                    probe.disarm()
+                fd.decode_probe = DecodeProbe(cfg, device=self.device,
+                                             isolation_stream=fd.capture_warmup_stream)
+                local["report"] = fd.decode_probe.arm()
+                self._decode_probe_phases = None
+            elif action == "run":
+                if probe is None or not probe.active:
+                    raise RuntimeError("arm the decode probe and generate before running it")
+                local["report"] = probe.profile_idle(cfg)
+                if self._decode_probe_phases is not None:
+                    local["report"]["loop_phases"] = self._decode_probe_phases.report()
+            else:
+                fd.release_graphs()
+                if probe is not None:
+                    probe.disarm()
+                fd.decode_probe = None
+                self._decode_probe_phases = None
+                local["report"] = {"status": "stopped", "snapshot_bytes": 0}
+            local["ok"] = True
+        except Exception as exc:
+            # Local failures cannot strand the healthy peer at the rendezvous.
+            # Arbitrary library exception text may contain activation values.
+            local["error"] = type(exc).__name__
+        ranks = self.ep.gather_objects(local)
+        ok = all(item["ok"] for item in ranks)
+        if action == "arm" and not ok and self.fast is not None:
+            # Shared outcome rolls back both ranks, even after one local failure.
+            self.fast.release_graphs()
+            if self.fast.decode_probe is not None:
+                self.fast.decode_probe.disarm()
+            self.fast.decode_probe = None
+        self._decode_probe_reply = {"version": 1, "action": action, "ok": ok, "ranks": ranks}
+        return self._decode_probe_reply
+
     def config(self):
         """Static engine configuration -- everything a measured number has to be quoted with."""
+        from engine.native_head import head_kernel
+        from engine.tensor_parallel import draft_head_bytes
         return {
             "engine": "v41",
             "ep_world_size": self.ep.world,
             "ep_rank": self.ep.rank,
             "tp_experts": self.ep.tensor_parallel,
+            "tp_draft_attention": os.environ.get('DSV41_TP_DRAFT_ATTN', '0') == '1',
+            "draft_markov_topk": int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0')),
             "prefill_dual_rail": self.ep.prefill_dual_rail,
             "collective_rails_version": DT.collective_rails.VERSION,
             "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
@@ -3087,6 +3226,8 @@ class V41Engine:
             # construction, so a difference between them is a desync that nothing else reports.
             "expert_generation": self.expert_generation,
             "head_fmt": R.head_fmt(),
+            "head_kernel": head_kernel(),
+            "head_weight_bytes": draft_head_bytes(self.W.head),
             "fp4_dense_split": os.environ.get("DSV41_FP4_DENSE_SPLIT", "auto"),
             "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
@@ -3115,6 +3256,8 @@ class V41Engine:
             "decode_shared_overlap": os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1",
             "fp8_decode_block_n": os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto"),
             "fp8_decode_warps": int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4")),
+            "fp8_decode_pipeline": os.environ.get("DSV41_FP8_DECODE_PIPELINE", "0") == "1",
+            "attn_staged": getattr(self.fast, "staged_attention", False),
             "decode_merged_proj": getattr(self.fast, "merged_proj", 0),
             "decode_lean": getattr(self.fast, "lean", None) is not None,
             "block_confidence": getattr(self, "confidence_depth_policy", None) is not None,
@@ -3181,6 +3324,15 @@ class V41Engine:
             "critical_stream": self.critical.report(),
             "hot_profile": self.hot_profile,
             "prefill_chunk": MAX_CHUNK,
+            "prefill_budget": {"policy": vars(self.prefill_budget), "last": dict(self.prefill_budget_last)},
+            "l2_prefetch": {"mode": os.environ.get("DSV41_L2PF_MODE", "touch"),
+                            "mb": int(os.environ.get("DSV41_L2PF_MB", "2")),
+                            "attention_mb": self.fast.attn_prefetch_mb if self.fast is not None else 0,
+                            "pace_gbps": int(os.environ.get("DSV41_L2PF_PACE_GBPS", "0"))},
+            "decode_memory": self.fast.memory_report() if self.fast is not None else None,
+            "router_fused_tail": os.environ.get("DSV41_ROUTER_FUSED_TAIL", "0") == "1",
+            "router_bf16": os.environ.get("DSV41_ROUTER_BF16", "0") == "1",
+            "verify_odd": os.environ.get("DSV41_VERIFY_ODD", "0") == "1",
             "io_threads": self.store.io_threads,
             "read_threads": self.store.read_threads,
             "read_chunk_mb": round(self.store.read_chunk / 1024 / 1024, 2),

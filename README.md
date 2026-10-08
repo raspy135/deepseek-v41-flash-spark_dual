@@ -79,6 +79,11 @@ time to first token. These are short throughput checks, not answer-quality tests
 or measurements of the larger 9,800-expert example. Prompt content, draft acceptance,
 expert history and cache reuse affect speed. See [full results](RESULTS.md).
 
+Optional `DSV41_HEAD_KERNEL=packed` losslessly packs the native BF16 vocabulary
+head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
+decode round speed about **2%**, with identical tested tokens and acceptance.
+It requires `DSV41_DRAFT_HEAD_FMT=off` (or `bf16`); the example leaves it off.
+
 Reproduce an individual workload against a running server:
 
 ```bash
@@ -121,7 +126,10 @@ in `.env.example`.
 ## Use
 
 - API: `http://<host>:8000/v1`, model name **`deepseek`**.
-- Health: `/health` shows the actual serving configuration.
+- Health: `/health` shows the actual serving configuration and allocated/reserved CUDA memory.
+  `DSV41_GRAPHS_MAX=8` bounds cached graph variants by rotating their shared pool.
+  `DSV41_PREFILL_ADAPT=1` shrinks prefill chunks under memory pressure on either node;
+  `DSV41_PREFILL_CHUNK` remains the maximum. The scratch estimate is not an OOM guarantee.
 - Expert map: `/expert-map` shows resident, loading and missing experts by layer
   or arena sector. `/v1/expert-map` returns JSON; it does not expose prompt text.
 - Logs: `docker logs -f deepseek-v41-ep2-rank0`. Container names retain `ep2`,
@@ -184,6 +192,7 @@ refer to the example profile, not every engine fallback default.
 | `DSV41_VISION=1` / `DSV41_VISION_MODE=peer` | Enable images and put the vision tower on rank 1. Set vision to `0` for text-only serving. |
 | `DSV41_PREFIX_CACHE=1` | Reuse matching prompt state in RAM. Keep `DSV41_PREFIX_DISK=0` and `DSV41_PREFIX_RESPONSE=0` with dynamic allocation. |
 | `SPEC=1` | Enable DSpark speculative decoding; `0` disables drafting. Speed depends on draft acceptance. |
+| `DSV41_HEAD_KERNEL=off` | Optional `packed` stores the native BF16 head losslessly and uses a decode kernel. Requires `DSV41_DRAFT_HEAD_FMT=off` or `bf16`. Saves about 146 MiB/node; measured code/prose decode gain was about 2%. |
 | `DEFAULT_THINKING=off` / `DEFAULT_EFFORT=75` | Defaults when the client does not specify thinking. Effort is 1–100 and applies when thinking is enabled; clients can override it per request. |
 
 The two `ADAPT_*` ranking knobs derive the normal swap thresholds; copying old
@@ -223,6 +232,7 @@ another model, so disabling it does not free an extra expert arena.
   and [known issues and rejected experiments](docs/gotchas.md)
 - [TP memory](docs/tp-memory.md), [packed KV](docs/packed-kv.md),
   and [speculative decoding](docs/decode-dynamic-depth.md)
+- Decode dashboard at `/decode-probe`: [timing, buffer reuse and local replay controls](docs/decode-probe.md)
 
 Original engine by 0xBakeer; see [credits](CREDITS.md). Repository code is
 [MIT-licensed](LICENSE); model use is governed by the checkpoint's own license.

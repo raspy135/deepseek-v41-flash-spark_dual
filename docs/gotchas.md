@@ -1497,3 +1497,411 @@ Prediction validation must run after `self.ep` exists. The first live test faile
 at boot when the TP2 requirement check was placed alongside predictor construction,
 before distributed initialization. The check now sits with the dynamic-residency
 validation, while all control fields still join the normal configuration guard.
+
+## Dynamic draft length makes mean accepted block length a policy metric
+
+`accept_len_mean` is mean leading accepted drafts plus one, before the final
+output-length clamp. It is not a probability. A five-draft step can yield six
+tokens; a three-draft step can yield four. `DepthPolicy` compares their measured
+tokens/second, so slowing the wider step can lower the reported average simply
+by making the controller verify fewer drafts. Compare temperature, generated
+length, depth mix and per-depth timings before diagnosing a drafter regression.
+
+On 2026-10-06 the old/new code headline was 3.72 versus 2.82, but temperature
+changed 0.6 to 0, output length changed 512 to 256, and the five-draft share fell
+60.8% to 23.1%. Fixed-five tests with the current native-attention overlay still
+yielded 3.85/3.78. Removing the overlay did not recover acceptance (3.36/3.70);
+do not assume abliteration explains this result. Reducing index_topk 1024 to 512
+with stock weights preserved both answers and acceptance exactly in those two
+short tests, while reducing mean step time 4.23%. These are workload-specific
+observations, not quality claims. Protocol and full results are in
+[RESULTS.md](../RESULTS.md#2026-10-06--investigating-the-apparent-speculative-acceptance-drop).
+
+### October 6: a lower acceptance length can be the faster policy
+
+The frozen-map dynamic-residency gate compared the same greedy tokens at
+verification depths 3 and 5. Prose accepted 1.88 versus 1.96 tokens/step, but
+ran at 20.11 versus 17.93 tok/s. Automatic depth stayed shallow and reached
+20.27. Code's automatic 32.26 tok/s was close to fixed depth 5's 32.75.
+Do not force depth 5 merely to restore an old acceptance-length headline.
+`tools/bench_dynamic_residency_depth_tp.py` retains the exact-output check and
+alternating-order measurement; artifacts are under
+`results/dynamic-speed-investigation-20261006/`.
+
+Current dynamic serving subsequently measured 32.01 tok/s on the same
+512-token sampled code protocol as the native-attention rollback (31.52).
+The original shorter greedy README protocol still measured 27.98 on that
+same restored engine. Comparing it directly with the historical 37.34
+FP4-attention / 512-token sampled result overstates evidence of a code
+regression. Keep precision, request settings, expert map and cache state
+explicit; timing variation and adaptive depth also change the mean acceptance
+length. No depth-policy rewrite or allocator rollback was warranted by this
+screen. The existing host Engram cache also differed by only 0.4% in its
+matched ABBA comparison; disabling it was not justified as a major speed fix.
+
+
+### October 7: graph warm-up streams retain cuBLAS workspaces
+
+`FastDecoder.capture` used to create a new CUDA stream for each context/parity/
+verification-width capture. On the current Torch/GB10 build, an isolated
+16x5120 by 5120x384 FP32 GEMM probe allocated another **32 MiB per new stream**;
+six calls on the same stream added **zero** bytes. cuBLAS's process-wide
+workspace cache outlives these short-lived Python stream objects. Reuse the
+single `capture_warmup_stream`; do not recreate it during graph-cache rotation.
+This explains a measured source of growth, not necessarily the entire earlier
+55k-context OOM. Probe: `results/tensorfold-port-20261007/workspace-probe.json`.
+
+The verification graphs and draft graphs also share a CUDA graph pool. Evicting
+individual graph keys does not release every owner of that pool. At
+`DSV41_GRAPHS_MAX` (default 8, 0 = unbounded), release all verify graphs, their
+memos, draft graphs and pool handle after synchronization, then recapture on
+demand. `empty_cache` belongs at that infrequent boundary, never every token.
+Static model/width buffers and expert LUTs remain valid. `/health` reports
+allocated, reserved and peak allocated bytes, captures and pool rotations.
+
+### October 7: bulk prefetch needs the right overlap window
+
+A 15-us simulated communication-window microbenchmark favored a 4 MiB bulk
+prefetch over the existing touch kernel (20.5 vs 25.0 us for wait plus read),
+but pacing at 150 GB/s made it slower (33.6 us). This engine's short RoCE window
+cannot blindly inherit TensorFold's larger prefetch budget. The initial
+full-engine screen found no clear benefit from replacing the existing 2 MiB
+site with bulk 2 or 4 MiB; retain the negative result and measure alternative
+placement beside attention separately. A warm L2 microbenchmark alone is
+insufficient evidence for deployment.
+
+### October 7: chunk comparison must distinguish answers from forced post-EOS tokens
+
+The 11,063-token chunk-512/chunk-256 probe returned the same complete answer
+about weather, train arrivals and library hours. Its fixed 32-token benchmark
+continued *after EOS*, where token streams diverged. Record both the full
+stream and normal-answer comparisons; do not label this an answer-quality
+failure, or claim complete token equivalence. Long-context sparse-index ties
+can depend on chunk extent (see the earlier bit-exactness limitation).
+128-token chunks additionally encounter the special compact-attention path at
+the beginning of a prompt; the adaptive default minimum remains 256 pending
+separate qualification. Memory adaptation plans once per request, using both
+nodes' reports before Engram read-ahead. An indivisible image span can exceed
+the chosen rows; this is surfaced in telemetry. The memory estimate is not an
+allocation guarantee, and the watchdog must remain enabled.
+
+### October 7: classify shared experts before comparing dense-kernel totals
+
+The first TensorFold breakdown classified our FP8 shared-expert projections as
+dense, but TensorFold's EXL3 expert kernel family includes shared experts. In the
+four-row capture this misplaced 7.272 ms up + 2.983 ms down per window. Corrected
+dense/head kernel sums are **21.752 vs 9.564 ms**, not 32.007 vs 9.564. Shared
+expert kernels overlap routed kernels: neither the original nor corrected
+component sums are additive phase latency. The trace-specific classifier and
+480-up/480-down count assertion live in
+`results/round-breakdown-20261007/reclassify_shared.py`; raw results remain intact.
+
+The actual EXL3 metadata has 5-bit attention projections, except layer 0's
+6-bit wq_a/wkv, and a 6-bit vocabulary head. A 2.9-bpw pack average is not the dense layer precision. Our
+native counterparts are FP8 and BF16 respectively, so do not attribute their
+entire time ratio to kernel quality, or promise a 3x lossless implementation gain.
+
+### October 7: screen native FP8 tweaks before spending full-model test time
+
+`results/dense-decode-opt-20261007/` retains cold-weight microbenchmarks (16
+distinct weight copies, decode rows 1/4/6) and experiments. Computing activation
+QDQ once helped narrow standalone projections, but hurt wide ones. Independent
+128-K partial dots followed by ordered FP32 reduction did **not** reproduce the
+original accumulated dot bits (maximum observed difference 2.07e-5 without QDQ);
+an ordered final sum does not restore the original MMA accumulation order.
+
+Bit-derived activation/weight scales passed every finite BF16 value and all
+256 scale codes, then real layer 0/10/20/30/39 tests at 1/4/6/16 rows, with exact
+FP32 outputs and row invariance. Five-stage pipelining initially appeared 14%
+faster for wo_b in a schedule sweep, but the controlled production-shape test
+showed only 103.4 -> 99.9 us at four rows. Fused qkv was 47.3 -> 45.6 us;
+wide wq_b did not improve. The decode pipeline switch stays **off**: these small
+results do not justify a full-model campaign or a large speedup claim.
+
+### October 7: staged attention improves the core, but changes accumulation
+
+`DSV41_ATTN_STAGED` remains opt-in: 0 retains the existing FP32 cuBLAS GEMMs,
+1 uses tensor cores around the **existing full-matrix FP32 softmax**, and 2 also
+stages the keys in BF16 instead of widening them into FP32 scratch. These keys
+already contain BF16 values; bitwise comparison after widening found no changed
+key bits, including signed zeros. Projection weights remain native FP8. PV uses
+TF32x3 with FP32 probabilities and output, not a single BF16 probability product.
+
+This is **not bit-exact attention**. BF16-typed keys also change the compiler's
+TF32x3 lowering slightly (about 6.5e-8 relative output difference versus FP32
+key storage in the screen). Three exact structural answers survived both full
+model A/Bs, but prose/code token streams changed. Do not call three probes a
+general quality gate, or attribute changed speculative acceptance entirely to
+kernel speed. Mode 2's A/B/A measured 23.76 versus 21.145 tok/s prose and 30.80
+versus 29.56 code. The depth policy's final smoothed step estimates fell about
+2-3%, but total decode wall time divided by steps was 91.33 vs 92.17 ms for
+prose and 93.97 vs 93.64 ms for code: there is no demonstrated large round-time
+gain. Both ranks agreed, the expert map was frozen, and repeat baseline token
+hashes matched.
+
+Rejected variants are retained in `tools/decode_attn_staged.py` and the micro
+drivers. Direct packed-cache tile loads were **236 us versus 47.7 us** for
+BF16 staging at T=4, H=32, N=1152: repeated tile-local unpacking outweighed the
+saved intermediate buffer. Splitting PV four ways did not improve long-key
+latency. Three BF16 probability components were no faster and increased FP64
+relative error to 3.72e-6 at 3200 keys, versus 6.96e-7 for TF32x3. None is
+used by the engine. Artifacts: `results/attention-core-opt-20261007/`.
+
+## Batch-one attention and odd verification (2026-10-07)
+
+Adding odd compressor groups is not enough to make width-one verification
+match a wider target block. Native `torch.einsum` QK/PV at batch one selects
+different FP32 accumulation from batched calls. In the 128/1,152/3,200-key
+screen, this changed 2/9/4 final BF16 elements; broadcasting both inputs to
+batch two, then keeping row zero, restored bit-identical scores and values.
+Widths two through five already matched width six in that screen. See
+`tools/bench_bmm_rows.py` and `results/decode-followup-20261007/bmm-rows.json`.
+The initial model check caught a 0.875 maximum logit difference at width one
+despite exact CPU compressor/rollback tests; it was rejected before generation.
+
+Odd widths must update host pending state from **end parity `(S + T) % 2`**,
+not just the starting parity. The old condition is equivalent only for even
+widths. Preserve a pending tuple before cold graph capture: it can alias the
+static compressor buffers that warm-up overwrites.
+
+The corrected TP2 test matched full logits/hidden prefixes at all widths 1–6
+and both parities after a 4,114/4,115-token prefix. This qualification used
+native attention/router and a frozen learned expert map. The short exact
+generation comparison found code depth four 9% faster than five, but native
+depth three was already as fast in a separate control. Do not turn that into
+a 9% gain over the default. Prose depth two beat three by only 1.6%.
+
+The default eight-graph cap cannot hold both start parities across all six
+widths in one context bucket. Crossing it rotates the whole pool, including
+draft graphs. Use a sufficient cap for qualification and track captures/pool
+resets; do not interpret recurring cold captures as steady-state kernel cost.
+
+## Ordered-chain pair batching (2026-10-07)
+
+`FP4_V2_PAIR_BATCH=2` stages two tokens' partials and runs their identical
+ordered chains together. Eighty-four intermediate, final and mixed-null bit
+checks passed. Cold real TP-output weights improved favorable low-U cells
+4–11%, but rows4/U14 slowed 609.3 -> 620.0 us and rows6/U20 slowed
+866.4 -> 884.3 us. Shared memory rises 20,736 -> 31,232 bytes/CTA for up
+and 10,368 -> 15,616 for down. Keep the compile default at one; even repeated
+favorable cells imply only a few milliseconds across 40 layers. The retained
+source and `tools/bench_fp4_pairbatch.py` prevent repeating this campaign.
+
+## BF16-source router: component win is not output equivalence (2026-10-07)
+
+All 40 main gates originated as BF16. A tensor-core BF16-source/FP32-accumulate
+router cut cold projection latency from 60–61 to 19–20 us, and 9,600 synthetic
+routing cases preserved selected experts/order. Its split accumulation still
+changes logits: both prose/code output hashes changed in the full-model test.
+Three exact structural answers survived, which is only a quality floor.
+Following-baseline prose wall time per step improved 94.78 -> 91.83 ms;
+code worsened 93.58 -> 95.35 ms. `DSV41_ROUTER_BF16` stays off, adds 150 MiB
+per rank when enabled, and rejects genuinely FP32 gates that would narrow.
+Artifacts: `results/decode-followup-20261007/tp-v2/router-rank*.json`.
+
+## Lossless head storage still needs an arithmetic gate (2026-10-07)
+
+The native BF16 head compresses losslessly by keeping sign/mantissa bytes,
+four-bit exponent deltas per 128 values and rare full-exponent escape groups.
+The TP2 shard shrank 661,913,600 -> 508,819,072 bytes; every original bit was
+checked. A straightforward byte-derived Triton dot still changed 72/77 of
+258,560 logits in two actual-weight cases, despite identical decoded weights.
+The compiler chose **kWidth=4**, while native BF16 loads selected **kWidth=2**,
+changing the K-fragment summation grouping. Tiny rounded random tests missed it.
+
+The repeated K16 cancellation pattern `[2**25, 1, -2**25, 1, 0, ...]` gives
+**640** with native geometry and guarded cuBLAS, but **0** with the inferred
+byte-dot geometry. Explicit Gluon `DotOperandLayout(..., k_width=2)` preserves
+the native raw FP32 result in this regression. The test checks raw accumulators,
+odd widths, vocabulary tails and captured replay, as well as final BF16 logits.
+
+Row-major packed storage measured **4.624 ms** versus native **2.882 ms** at M4;
+tiled storage with inferred byte-dot reached **2.956 ms** but still changed
+logits. Explicit-layout tiled Gluon BN32 measured **2.25–2.28 ms** at widths1–6
+against production **2.94–3.08 ms**, exact over 5.43 million checked logits.
+BN64 was slower, so no larger tuning campaign was run. Reconstruction accuracy
+does not establish universal cuBLAS accumulation equivalence. Keep the opt-in
+separate from the default and preserve the negative controls.
+
+`DSV41_HEAD_KERNEL=packed` requires native BF16 head storage and draft-head
+reuse (`DSV41_DRAFT_HEAD_FMT=off` or `bf16`). Packing runs before capture and
+retains no original GPU tensor in serving. The benchmark adapters intentionally
+retain original control weights and must never be used for serving. Larger
+prefill calls unpack at most 16,384 vocabulary rows at a time; initial JIT and
+this extra traffic can increase prefill latency. The feature changes neither
+expert allocation nor the unconditional TP vocabulary gather. Both ranks must
+agree on the kernel and version in the boot guard.
+
+Artifacts: `results/head-native-20261008/`, `results/head-packed-asm-20261007/`
+and `results/head-packed-integration-20261008/`; `tools/test_native_head.py`
+keeps the cancellation failure and integration regressions executable.
+
+## Native expert rewrites need a byte floor and the exact reduction tree (2026-10-07)
+
+The corrected four-row profile's 44.55 ms expert kernel sum contains 34.30 ms
+of native routed FP4 kernels and 10.26 ms of overlapping FP8 shared-expert
+work. TensorFold's 22.19 ms includes both kinds too. The ratio is not an
+independently recoverable native-kernel speedup: their weight formats, routes
+and trajectories differ, and the component sums include overlapping streams.
+
+The cold actual-weight TP-output screen in
+`results/fp4-pairbatch-20261007/screen.json` uses four independent copies of
+32 layer-0 experts, rotating disjoint expert sets in captured calls. Each
+native expert occupies **9,400,320 bytes per rank**:
+
+```
+up:   2 * (1152 * 5120 / 2 + 1152 * 5120 / 32) = 6,266,880 bytes
+down:      2560 * 2304 / 2 + 2560 * 2304 / 32  = 3,133,440 bytes
+effective GB/s = distinct_real_experts * 9,400,320 / total_microseconds / 1000
+```
+
+This is minimum weight payload per call divided by measured kernel time,
+including scale bytes. It is not a DRAM-counter measurement and excludes
+activation/output traffic. Baseline cells, before rejected pair batching:
+
+| Tokens / distinct experts | Up + down, us | Minimum payload rate, GB/s |
+| --- | ---: | ---: |
+| 4 / 6 | 437.3 | 129.0 |
+| 4 / 14 | 609.3 | 216.0 |
+| 4 / 20 | 852.6 | 220.5 |
+| 6 / 6 | 573.7 | 98.3 |
+| 6 / 20 | 866.4 | 217.0 |
+| 6 / 26 | 1,207.2 | 202.5 |
+
+The v2 kernel already loads a complete packed weight row into registers once,
+before processing that expert's routed pairs. A tensor-core rewrite cannot
+save repeated DRAM reads that this implementation has already removed.
+Low-U repeated-expert cells still have a useful compute gap. Using the new
+head's roughly 223 GB/s payload rate as a reference, six experts take 252.9 us
+just to read their native weight payload: the 4/6 and 6/6 component ceilings
+would be 1.73x and 2.27x. That reference is not a hardware guarantee; high-U
+cells already approach it, and the low-U fraction in a real request matters.
+
+Lossless FP4 entropy coding also has much less room than BF16-head packing.
+A CPU-only histogram of expert zero at layers 0/20/39, all w1/w2/w3, measured
+**3.884–3.896 bits per nibble** including signed zero. Ideal zero-order coding
+would save only 2.6–2.9% of code bytes before headers/decompression; scales
+are additional. This does not bound predictive or conditional compression.
+Reproduce with `tools/inspect_fp4_entropy.py`; counts and source hash are in
+`results/fp4-pairbatch-20261007/symbol-entropy.json`.
+
+Ordinary FP16/BF16 tensor-core GEMM changes the deployed reduction tree even
+with unchanged weights. `group_partial` forms two independent two-product
+FP32 FMA chains per four-K virtual lane, adds even/odd chains, then performs
+an explicit eight-leaf tree. Four separate scaled chains accumulate groups
+`i, i+4, ...` and are combined in order. Pre-scaling weights or carrying an
+MMA accumulator through all K changes those boundaries. Existing
+`DOT_SCALED` results do not price the cold TP-output low-U cells and retain
+structural-quality negatives; they are not a qualified exact replacement.
+
+An unqualified exact-TC prototype can instead give each real member eight
+sparse virtual MMA rows, compute its even and odd two-product dots separately,
+then reproduce the old tree/chains explicitly. It keeps the packed weights
+and avoids an expanded GPU weight cache, but increases padded TC arithmetic
+substantially. First prove raw per-group FP32 equality against the CUDA
+reference, including BF16-to-FP16 conversion, subnormals and cancellation.
+Only a passing proof justifies a small cold low-U screen plus a high-U control;
+no full-model campaign or production option is justified by this audit alone.
+
+## Sparse native FP4 MMA: exact products work, but this layout is slower (2026-10-07)
+
+The benchmark-only `tools/fp4_group_tc.py` tested the proposed eight virtual
+rows per real member against the extracted serving `group_partial`, including
+its BF16-to-FP16 activation conversion. The even/odd two-product MMA spelling
+failed **854/7,488** mixed signed-logrange raw FP32 outputs, although the
+18,304 uniform-code and 4,096 byte-pattern boundary checks passed. PTX retained
+the explicit `add.rn` tree: preserving the tree alone does not preserve the
+rounding inside an FP16 MMA. An isolated example with `x0=1`,
+`x2=1.5 * 2^-23`, `w0=w2=1`, all other activations zero, gives CUDA
+`1 + 2^-22` versus MMA `1 + 2^-23`.
+
+Four separate one-product MMAs, followed by RN FP32 `p0+p2`, `p1+p3`, their
+sum and the original eight-leaf tree, passed **35,776 finite raw FP32 checks**.
+These cover every BF16 code that stays finite after FP16 conversion, all 16
+FP4 codes, all 256 packed-byte patterns, subnormals, signed zero, cancellation,
+mixed exponent ranges and the isolated alignment counterexample. A separate
+32-output overflow/NaN report also matched on this device; it does not extend
+the finite exactness claim to arbitrary NaN payloads or future hardware.
+
+The exact spelling still loses the isolated helper screen. With 256 groups,
+N1152, one 32-K group, captured 32 calls and six balanced quartets on GB10:
+
+| Members | Extracted CUDA SIMT, us | Four-product sparse MMA, us | MMA / SIMT |
+| ---: | ---: | ---: | ---: |
+| 1 | 8.063 | 109.108 | 13.53x |
+| 2 | 15.220 | 108.539 | 7.13x |
+
+This is a hot one-group arithmetic/layout screen, **not cold actual-weight
+MoE timing**. It excludes scale decoding, four ordered full-K chains, SiLU,
+routing and shared experts. Padding four MMAs plus conversion/gather work
+overwhelms reuse here; no full-K extension or model campaign followed. A
+different relayout could improve it, so this rejects the measured spelling,
+not the possibility of an exact tensor-core algorithm.
+
+Reproduce the positive gate and helper cost with
+`tools/test_fp4_group_tc.py --single-products --timing --out <report.json>`.
+Omit `--single-products` to retain the numerical failure. Artifacts and
+qualified source/PTX snapshots: `results/fp4-group-tc-20261007/`. Production
+expert kernels, configuration and defaults were not changed by this proof.
+## Runtime decode snapshots need storage independent of captured graph pools
+
+The initial runtime probe retained each private input/output Tensor but allocated
+its storage inside the shared capture pool. The 33-token/96-completion full-engine
+TP2 canary produced only 432/488 exact local replays on **both** ranks: the same
+40 verify sites and 16 greedy-draft sites failed. The small shared-pool synthetic
+fixture passed both versions and did not reproduce the full-engine failure.
+An external 64 MiB snapshot slab, with disjoint slices reused until graph eviction,
+made all 488/488 comparisons exact on both ranks. Retaining a Python Tensor alone
+is insufficient qualification for snapshots across this engine's graph variants.
+The guard withheld all rejected latency comparisons; do not bypass it.
+
+Reuse the existing capture warm-up stream for isolation. cuBLAS retains workspace
+per stream on this build; creating one stream per case can consume gigabytes while
+profiling hundreds of small operations. A standalone CUDA test has roughly 100 MiB
+of tracked allocation including library workspaces, despite less than 4 MiB of
+explicit test/snapshot/flush storage. Starting another CUDA context alongside the
+loaded engine can fail; the runtime probe uses the engine's existing context.
+
+## HTTP backpressure can starve the TP2 keepalive
+
+On October 7, generation finished at 01:11:23 UTC, but the final SSE write did
+not return until 01:26:25 (`OSError: No route to host`). The request still held
+the engine lock, so the 30-second heartbeat could not acquire it. Rank 1's
+600-second idle Gloo receive expired at 01:21:23; the subsequent dashboard
+command exposed the broken pair rather than causing it.
+
+Bound HTTP socket I/O to 30 seconds, including the final statistics chunk, and
+explicitly close an active streaming generator when its consumer fails. This
+limits time blocked in a write; it does not cap generation or prefill runtime.
+Real socket backpressure tests cover active chat/completion streams, final
+statistics and non-stream responses without loading the model.
+
+A heartbeat failure must latch the pair fault before releasing the request
+lock. `/health` returns 503 for a faulted pair. A failed headless broadcast must
+exit nonzero immediately: graceful distributed teardown after a failed Gloo
+group can hang and leave Docker reporting a container as running. Explicit
+shutdown still performs normal cleanup. The dashboard retains its saved report
+but disables diagnostic actions until health recovers.
+
+## Decode probe intervals are not intrinsic kernel durations
+
+The initial saved 33-token/48-output TP2 diagnostic reads one last CUDA-event
+interval per capture key and phase, not a mean over `replay_count`. At L17,
+key `[1,4096,4]`, the output projection wrapper measured 0.180/1.551 ms on
+rank 0/1. Its local FP8 leaf was 0.127/0.119 ms; the TP communication interval
+was 0.013/1.388 ms. A projection wrapper can include a peer rendezvous, child
+snapshot/event work and concurrent GPU resource contention. Even a local leaf's
+live event interval can include device scheduling delays. Exact private replay
+outputs qualify correctness, not the fidelity of instrumented live durations.
+
+The quick screen used only two calls and two repeats, with one eager warmup.
+Among 478 matched FP8/grouped leaves, the first warm sample exceeded the second
+at 472 sites on rank 0 and 477 on rank 1. Median first/second ratios were
+1.85/1.81. With two samples, the reported median averages that startup-biased
+sample with the later one: L15 `wo_a` rank 0 was 0.538/0.036 ms, reported as
+0.287 ms. The warm graph is not replay-primed before each measured warm replay.
+Do not use that saved screen to claim pure kernel cost or available speedup.
+Before making such claims, qualify instrumentation with a small serial/fork-join
+calibration and collect warmed repeated samples with their spread. Its 16 MiB
+flush is controlled cache pressure, not a guarantee of fully cold DRAM weights.
+

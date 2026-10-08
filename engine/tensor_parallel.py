@@ -45,6 +45,8 @@ def draft_head_bytes(head):
     if head is None:
         return 0
     local = head.local if isinstance(head, VocabParallelHead) else head
+    if hasattr(local, 'stored_bytes'):
+        return local.stored_bytes
     tensors = ((local,) if isinstance(local, torch.Tensor)
                else (local.w, local.s))
     return sum(t.numel() * t.element_size() for t in tensors)

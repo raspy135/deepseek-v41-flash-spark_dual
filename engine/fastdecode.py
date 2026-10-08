@@ -24,6 +24,7 @@ the verifier must produce the target model's logits, not merely a close approxim
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 import time
 
 import torch
@@ -107,9 +108,21 @@ def merge_decode_projections(weights) -> int:
 # The verify block: one accepted token plus DSV41_BLOCK drafted ones. The checkpoint's DSpark head
 # was trained at `dspark_block_size` = 5 (so 6 verify positions), which stays the default; a larger
 # block reads the same 40 layers of routed experts for more candidate tokens per step but drafts
-# further outside the head's trained horizon, and a smaller one does the reverse. Only even verify
-# widths are allowed: the ratio-2 key compressor groups the block's positions in pairs around a
-# single pending slot, which is what `capture(S_parity)`'s two parities encode.
+# further outside the head's trained horizon, and a smaller one does the reverse. Even target
+# widths remain the default. The opt-in odd widths preserve the compressor's unpaired token.
+from engine.spec_depth import verify_odd_enabled
+VERIFY_ODD = verify_odd_enabled()
+
+
+def _compressor_group_cut(tokens: int, parity: int, ratio: int = 2) -> int:
+    """Complete grouped positions, including a pending position at odd start parity.
+
+    The remaining final position becomes pending; a width-one even-start
+    forward makes no compressed row. All values are static for a graph key.
+    """
+    return (tokens + parity) // ratio * ratio
+
+
 def _draft_block() -> int:
     v = os.environ.get("DSV41_BLOCK", "").strip()
     if v in ("", "off", "default"):
@@ -138,8 +151,10 @@ def _dynamic_depths():
     except ValueError:
         raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two odd depths, e.g. 3,5") from None
     # T_VERIFY <= 10 is the graph-capturable routing limit (docs/gotchas.md, wider verify block)
-    if len(depths) != 2 or any(d < 1 or d > 9 or d % 2 == 0 for d in depths):
-        raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two different odd depths in 1..9, e.g. 3,5")
+    if len(depths) != 2 or any(d > 9 or d < (0 if VERIFY_ODD else 1)
+                             or (not VERIFY_ODD and d % 2 == 0) for d in depths):
+        allowed = "depths in 0..9" if VERIFY_ODD else "odd depths in 1..9"
+        raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two different {allowed}")
     fixed = os.environ.get("DSV41_BLOCK", "").strip()
     if fixed not in ("", "off", "default") and int(fixed) != depths[-1]:
         raise ValueError(f"DSV41_BLOCK={fixed} conflicts with DSV41_BLOCK_DYNAMIC={v}: the drafter "
@@ -162,10 +177,12 @@ COMPUTE_CONF = SPEC_CONF or CONFIDENCE_DEPTHS is not None
 # not the tree mechanism, decides whether a second candidate is worth a second draft chain.
 TREE_PROBE = os.environ.get("DSV41_TREE_PROBE", "0") == "1"
 _DEPTHS = CONFIDENCE_DEPTHS or DYNAMIC_DEPTHS
-T_DRAFT = _DEPTHS[-1] if _DEPTHS else _draft_block()
-T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts; the widest verify block
+T_DRAFT = max(5, _DEPTHS[-1]) if VERIFY_ODD and _DEPTHS else (_DEPTHS[-1] if _DEPTHS else _draft_block())
+T_VERIFY = _DEPTHS[-1] + 1 if _DEPTHS else T_DRAFT + 1  # widest configured target block
 # Every verify width this process captures graphs and static buffers for.
 VERIFY_WIDTHS = tuple(d + 1 for d in _DEPTHS) if _DEPTHS else (T_VERIFY,)
+if VERIFY_ODD:
+    VERIFY_WIDTHS = tuple(sorted({1, *VERIFY_WIDTHS}))
 # FastDecoder attributes that are sized by the verify width; _bind(T) points them at T's set.
 _WIDTH_ATTRS = ("ids", "pos", "eg_rows", "slots", "h", "pre_mix", "attn_pre", "ffn_post", "ffn_comb",
                 "ffn_pre", "y", "route_idx", "route_w", "topk", "candidates", "main_hidden", "logits",
@@ -206,17 +223,33 @@ class FastDecoder:
         self.W = model.W
         self.c = model.c
         self.use_graphs = use_graphs
+        # Runtime diagnostics are attached only between requests on both ranks.
+        # Normal graphs contain no probe events or input snapshots.
+        self.decode_probe = None
+        self._probe_draft_key = None
         self.stream_layers = getattr(model, 'stream_layers', frozenset())
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
         # DSV41_L2PF_MB: prefetch the next layer's weights during the MoE all-gather (engine/l2pf.py)
         self.l2pf_side = torch.cuda.Stream(device=self.dev) if l2pf.enabled() else None
+        self.attn_prefetch_mb = int(os.environ.get("DSV41_L2PF_ATTN_MB", "0"))
+        if not 0 <= self.attn_prefetch_mb <= 12:
+            raise ValueError("DSV41_L2PF_ATTN_MB must be in 0..12")
         # Before any capture: graphs bake in weight addresses.
         self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
                             if MERGED_PROJ else 0)
         self.lean = None
+        staged = os.environ.get("DSV41_ATTN_STAGED", "0")
+        if staged not in ("0", "1", "2"):
+            raise ValueError("DSV41_ATTN_STAGED must be 0 (off), 1 (FP32 keys), or 2 (BF16 keys)")
+        self.staged_attention = int(staged)
+        if self.staged_attention and FUSED_ATTN:
+            raise ValueError("DSV41_ATTN_STAGED and DSV41_FUSED_ATTN are separate arithmetic paths")
         if LEAN and _HC_OPS and M.HC_FUSED:
             from engine.decode_lean import LeanOps
             self.lean = LeanOps(model.dev, R.MM_TILE, R.HC_MM_TILE)
+            self.lean.prepare_router_weights([w.gate_w for w in self.W.layers])
+        if self.staged_attention and (self.lean is None or not LEAN_SOFTMAX):
+            raise ValueError("DSV41_ATTN_STAGED requires decode lean and lean softmax")
         a = self.a
         dev = self.dev
         self.pend_buf = {L: torch.zeros(2, a.head_dim, dtype=torch.float32, device=dev)
@@ -248,18 +281,34 @@ class FastDecoder:
         # verifier (_final) always reads self.head, so its logits and the accepted tokens are
         # untouched; only the proposed drafts differ.
         self.draft_head = getattr(self.W, "draft_head", None) or self.head
-        self.gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.layers]
-        self.mtp_gate_bf16 = [w.gate_w.to(torch.bfloat16) for w in self.W.mtp]
+        # Routers read the original FP32 gate_w below. Do not retain the unused BF16
+        # copies: 40 backbone + 3 draft gates cost 153.75 MiB per rank without a consumer.
         self.markov_embed_bf16 = self.W.mtp[2].markov_embed.to(torch.bfloat16)
         self.markov_head_bf16 = self.W.mtp[2].markov_head.to(torch.bfloat16)
+        # Proposal-only shortlist. The target still verifies every emitted token.
+        # Kept opt-in: changing proposals can reduce acceptance even with a faster draft pass.
+        self.draft_markov_topk = int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0'))
+        if self.draft_markov_topk not in (0, 64, 128, 256, 512):
+            raise ValueError('DSV41_DRAFT_MARKOV_TOPK must be 0, 64, 128, 256 or 512')
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
         self._index_cpos = torch.arange(self._n_cache(1), device=dev)
-        self.graphs = {}
+        self.graphs = OrderedDict()
+        self.graph_limit = int(os.environ.get("DSV41_GRAPHS_MAX", "8"))
+        if self.graph_limit < 0:
+            raise ValueError("DSV41_GRAPHS_MAX must be >= 0 (0 = unbounded)")
+        self.graph_evictions = 0
+        self.graph_pool_resets = 0
+        self.graph_captures = 0
+        self.graph_memory = {}
         # graph key -> the per-step memo its capture filled (_step_memo); kept alive with the graphs
         self._memos = {}
         self._memo = None
         self.draft_graphs = None
         self.pool = None
+        # cuBLAS retains a 32 MiB workspace per warm-up stream on this build.
+        # Reuse one stream across context/width captures instead of leaking a new
+        # workspace into its process-wide stream cache on every graph variant.
+        self.capture_warmup_stream = torch.cuda.Stream(device=self.dev)
         # resident mode: (layer, expert) -> arena slot as a device table, so the router's expert ids can be
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
         self.lut = None
@@ -466,7 +515,8 @@ class FastDecoder:
                 # the torch spelling below builds twice (one per einsum) after a bf16 cat
                 n1 = kv1.shape[1]
                 kvf = torch.empty(T, n1 + (0 if kv2 is None else kv2.shape[1]), kv1.shape[2],
-                                  dtype=torch.float32, device=kv1.device)
+                                  dtype=torch.bfloat16 if self.staged_attention == 2 else torch.float32,
+                                  device=kv1.device)
                 kvf[:, :n1].copy_(kv1)
                 if kv2 is not None:
                     kvf[:, n1:].copy_(kv2)
@@ -475,17 +525,29 @@ class FastDecoder:
                 kv_all = kv1 if kv2 is None else torch.cat([kv1, kv2], dim=1)
                 kvs = (kv_all.float(), None)
             if self.lean is not None and LEAN_SOFTMAX:
-                probs = self.lean.attn_probs(torch.einsum("thd,tnd->thn", q.float(), kvs[0]),
+                if self.staged_attention:
+                    from decode_attn_staged import scores
+                    logits = scores(q, kvs[0])
+                else:
+                    logits = (self._verify_attention_product("thd,tnd->thn", q.float(), kvs[0]) if mtp_last is None
+                              else torch.einsum("thd,tnd->thn", q.float(), kvs[0]))
+                probs = self.lean.attn_probs(logits,
                                              mask, w.attn_sink, scale)
             else:
-                scores = torch.einsum("thd,tnd->thn", q.float(), kvs[0]) * scale
+                scores = (self._verify_attention_product("thd,tnd->thn", q.float(), kvs[0]) if mtp_last is None
+                          else torch.einsum("thd,tnd->thn", q.float(), kvs[0])) * scale
                 scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
                 mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
                 p = torch.exp(scores - mx)
                 denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - mx)
                 probs = p / denom
-            o = torch.einsum("thn,tnd->thd", probs,
-                             kvs[1] if kvs[1] is not None else kv_all.float()).to(torch.bfloat16)
+            if self.staged_attention and self.lean is not None and LEAN_SOFTMAX:
+                from decode_attn_staged import values
+                o = values(probs, kvs[1]).to(torch.bfloat16)
+            else:
+                keys = kvs[1] if kvs[1] is not None else kv_all.float()
+                o = (self._verify_attention_product("thn,tnd->thd", probs, keys) if mtp_last is None
+                     else torch.einsum("thn,tnd->thd", probs, keys)).to(torch.bfloat16)
         o = self._rope(o, fq, inverse=True).reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
@@ -507,12 +569,38 @@ class FastDecoder:
         mask = wmask
         if w.ratio:
             (cache, idx), mask = self._compressed(x, qr, w, L, pos, sh_state, wmask=wmask, rows=False)
-        kvf = self.lean.keys_f32(ring, slot_r, cache, idx)
-        probs = self.lean.attn_probs(torch.einsum("thd,tnd->thn", qf, kvf), mask, w.attn_sink,
-                                     a.head_dim ** -0.5)
-        o = self.lean.rope(torch.einsum("thn,tnd->thd", probs, kvf), fq, rd, inverse=True)
+        # This window is attention arithmetic, longer than the RoCE-only site.
+        # Prefetch only this layer's output projection; next-layer weights would
+        # be evicted by MoE before use. The graph joins before consuming weights.
+        prefetch = self.attn_prefetch_mb and self.l2pf_side is not None
+        if prefetch:
+            self.l2pf_side.wait_stream(torch.cuda.current_stream())
+            l2pf.touch(self.l2pf_side, [w.wo_a, w.wo_b], self.attn_prefetch_mb * 1024**2,
+                        mode="bulk", pace=0)
+        kvf = self.lean.keys_f32(ring, slot_r, cache, idx,
+                               dtype=torch.bfloat16 if self.staged_attention == 2 else torch.float32)
+        if self.staged_attention:
+            from decode_attn_staged import attention
+            raw = attention(qf, kvf, mask, w.attn_sink, a.head_dim ** -0.5, self.lean)
+        else:
+            probs = self.lean.attn_probs(self._verify_attention_product("thd,tnd->thn", qf, kvf), mask, w.attn_sink,
+                                         a.head_dim ** -0.5)
+            raw = self._verify_attention_product("thn,tnd->thd", probs, kvf)
+        o = self.lean.rope(raw, fq, rd, inverse=True)
+        if prefetch:
+            torch.cuda.current_stream().wait_stream(self.l2pf_side)
         o = R.wo_a_proj(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1), w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
+
+    def _verify_attention_product(self, equation, left, right):
+        # CUDA's batch-1 SGEMM accumulates differently from batch>=2 BMM. In
+        # results/decode-followup-20261007/bmm-rows.json, broadcast batch-2
+        # QK/PV matched T6 bitwise at N=128/1152/3200; native T1 flipped BF16
+        # output elements. Stride-0 expand keeps the same keys without a copy.
+        # Opt-in verify only: the existing single-row drafter stays unchanged.
+        if VERIFY_ODD and left.size(0) == 1:
+            return torch.einsum(equation, left.expand(2, -1, -1), right.expand(2, -1, -1))[:1]
+        return torch.einsum(equation, left, right)
 
     def _window(self, pos):
         """(ring slot of each query, ring slots of its window, window mask) -- the same for every
@@ -536,33 +624,41 @@ class FastDecoder:
                 # static per-layer copies for Caches.rollback (host patches the tuple after the step)
                 self.kvl_buf[L].copy_(kvl); self.sc_buf[L].copy_(sc)
                 buf = self.pend_buf[L]  # [2, 512]: kv, score of the pending token (host-maintained)
-                if st["parity"] == 1:  # S odd: pending + t0, (t1,t2), ...; the last token -> new pending
+                if st["parity"] == 1:  # Include the pending position before this block.
                     kvl2 = torch.cat([buf[0][None], kvl]); sc2 = torch.cat([buf[1][None], sc])
-                    g_kv = kvl2[:T].unflatten(0, (-1, r)); g_sc = sc2[:T].unflatten(0, (-1, r))
+                else:
+                    kvl2, sc2 = kvl, sc
+                cut = _compressor_group_cut(T, st["parity"], r)
+                if (T + st["parity"]) % r:
                     buf[0].copy_(kvl[T - 1]); buf[1].copy_(sc[T - 1])
-                else:  # S even: (t0,t1),(t2,t3),..., no pending
-                    g_kv = kvl.unflatten(0, (-1, r)); g_sc = sc.unflatten(0, (-1, r))
-                latent = (g_kv * g_sc.softmax(dim=1)).sum(dim=1)
-                latent = self._rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
+                if cut:
+                    g_kv = kvl2[:cut].unflatten(0, (-1, r)); g_sc = sc2[:cut].unflatten(0, (-1, r))
+                    latent = (g_kv * g_sc.softmax(dim=1)).sum(dim=1)
+                    latent = self._rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
+                else:
+                    # Same as Model._compressed: no complete pair yet. Leave
+                    # compressed/index history intact and keep this token pending.
+                    latent = None
                 j0 = (pos[0] - st["parity"]) // r
             else:
                 latent = self._rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
                 j0 = pos[0]
-            nj = latent.size(0)
-            jidx = j0 + self._ar_t[:nj]
-            fj = self.m.freqs_c[jidx * r]
-            if L in self.W.indexers:
-                iw = self.W.indexers[L]
-                k = self._rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
-                c.ik[L][jidx] = self._rope(k, fj)
-            ckv = self._rope(latent, fj)
-            if M.PACKED_KV:
-                from engine.packed_kv import write
-                write(c.ckv[L], ckv.contiguous(), jidx)
-            else:
-                if M.KV_CACHE_QDQ:
-                    ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
-                c.ckv[L][jidx] = ckv
+            if latent is not None:
+                nj = latent.size(0)
+                jidx = j0 + self._ar_t[:nj]
+                fj = self.m.freqs_c[jidx * r]
+                if L in self.W.indexers:
+                    iw = self.W.indexers[L]
+                    k = self._rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
+                    c.ik[L][jidx] = self._rope(k, fj)
+                ckv = self._rope(latent, fj)
+                if M.PACKED_KV:
+                    from engine.packed_kv import write
+                    write(c.ckv[L], ckv.contiguous(), jidx)
+                else:
+                    if M.KV_CACHE_QDQ:
+                        ckv = R.fp4_qdq(ckv, 16, "e4m3", self.m.fp4_grid)
+                    c.ckv[L][jidx] = ckv
             st["ckv"], st["ik"], st["ratio"] = c.ckv[L], c.ik[L], r
         from engine.packed_kv import gather
         if wmask is not None:
@@ -933,9 +1029,17 @@ class FastDecoder:
         x_pre = R.hc_pre(h, pre_mix)
         x = self._rmsnorm(x_pre, w.norm, a.norm_eps)
         logits = R.head_logits(x, self.draft_head)  # [T_DRAFT, V]
+        shortlist = greedy and self.draft_markov_topk > 0 and not TREE_PROBE
+        if shortlist:
+            from engine.draft_markov import shortlist_greedy
+            proposals, embeds = shortlist_greedy(logits, self.markov_embed_bf16,
+                                                self.markov_head_bf16, self.d_tok[0],
+                                                self.draft_markov_topk, _lin)
+            self.d_out.copy_(proposals)
         prev = self.d_tok[0]
-        embeds = []
-        for i in range(T_DRAFT):
+        if not shortlist:
+            embeds = []
+        for i in range(0 if shortlist else T_DRAFT):
             e = self.markov_embed_bf16[prev.view(1)]  # 1-d index: a 0-d tensor index syncs
             embeds.append(e)
             bias = _lin(e, self.markov_head_bf16).float()[0]
@@ -1079,6 +1183,39 @@ class FastDecoder:
         return {"steps": self.rs_steps, "per_layer": [round(v, 4) for v in per],
                 "mean": sum(per) / len(per), "total": sum(per)}
 
+    def release_graphs(self):
+        """Release every owner of the shared graph pool between completed steps.
+
+        Static model/width buffers and resident LUTs remain untouched. A partial
+        LRU cannot return this pool's high-water memory while draft graphs pin it.
+        Both ranks call this on the same key sequence under the boot guard.
+        """
+        torch.cuda.synchronize()
+        self.graph_evictions += len(self.graphs)
+        self.graphs.clear()
+        self._memos.clear()
+        self._memo = None
+        self.draft_graphs = None
+        self.pool = None
+        self._probe_draft_key = None
+        if self.decode_probe is not None:
+            self.decode_probe.clear_captures()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.graph_pool_resets += 1
+
+    def memory_report(self):
+        """Read-only allocator counters; no device synchronization on /health."""
+        return dict(graph_limit=self.graph_limit, graph_count=len(self.graphs),
+                    graph_keys=[list(k) for k in self.graphs],
+                    graph_captures=self.graph_captures, graph_evictions=self.graph_evictions,
+                    graph_pool_resets=self.graph_pool_resets,
+                    allocated_bytes=torch.cuda.memory_allocated(),
+                    reserved_bytes=torch.cuda.memory_reserved(),
+                    peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                    last_capture=dict(self.graph_memory))
+
     # ------------------------------------------------------------------ capture
     def capture(self, S_parity: int, index_bucket: int):
         """Capture graphs for one start parity, fixed indexer context bucket and the currently
@@ -1093,7 +1230,14 @@ class FastDecoder:
             return
         key = (S_parity, index_bucket, self.width)
         if key in self.graphs:
+            self.graphs.move_to_end(key)
             return
+        # All verify graphs and draft graphs share one pool. LRU removal alone
+        # leaves that pool pinned by the surviving graphs, so rotate the entire
+        # generation at the cap. This happens at a new key, never on a cache hit.
+        if self.graph_limit and len(self.graphs) >= self.graph_limit:
+            self.release_graphs()
+        before = torch.cuda.memory_allocated()
         # Compiler warmup is not traffic. Preserve the request's counts AND score evidence,
         # in place, so graph capture cannot bias placement or inflate the reported misses.
         counters = {}
@@ -1108,7 +1252,7 @@ class FastDecoder:
             self.pool = torch.cuda.graph_pool_handle()
         st = {"parity": S_parity, "index_bucket": index_bucket,
               "ckv": None, "ik": None, "ratio": 0}
-        s = torch.cuda.Stream()
+        s = self.capture_warmup_stream
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             # warm-up run (allocations, triton compiles) on a scratch copy of the state
@@ -1126,7 +1270,20 @@ class FastDecoder:
         if self.lean is not None:
             self._memo = self._memos[key] = {}
         try:
-            self._capture_layers(key, st)
+            probe = self.decode_probe
+            if probe is not None and probe.active:
+                from engine.decode_probe_hooks import capture_hooks
+                had_draft = self.draft_graphs is not None
+                with capture_hooks(self, probe, key):
+                    self._capture_layers(key, st)
+                if not had_draft:
+                    self._probe_draft_key = key
+            else:
+                self._capture_layers(key, st)
+            self.graph_captures += 1
+            self.graph_memory = dict(last_key=list(key), allocated_before=before,
+                                     allocated_after=torch.cuda.memory_allocated(),
+                                     reserved_after=torch.cuda.memory_reserved())
         finally:
             self._memo = None
             for tensor, saved in saved_counters:
@@ -1236,6 +1393,8 @@ class FastDecoder:
         index_bucket = (_index_bucket(S + T, self.c.max_seq)
                         if INDEX_BUCKETS else self.c.max_seq)
         graph_key = (parity, index_bucket, T)
+        if graph_key in self.graphs:
+            self.graphs.move_to_end(graph_key)
         self.prepare_pending_buffers()
         if not LEAN_STEP or graph_key not in self.graphs:
             pending = ({L: None if value is None else (value[0].clone(), value[1].clone())
@@ -1286,6 +1445,8 @@ class FastDecoder:
                     if _ev_segment is not None:
                         _ev_segment.record()
                 gF.replay()
+            if self.decode_probe is not None and self.decode_probe.active:
+                self.decode_probe.mark_replay(graph_key, phase="verify")
             if self.lut is not None:
                 # bookkeeping the host resolve would have done: LRU touch is irrelevant while resident
                 self.m.store.stats["hits"] += int((a.n_layers - len(self.stream_layers)) * self.route_idx.numel())
@@ -1302,7 +1463,7 @@ class FastDecoder:
         for L in self.kvl_buf:
             before = self.c.pending.get(L)
             self.c._chunk_inputs[L] = (S, self.kvl_buf[L], self.sc_buf[L], before)
-            if parity == 1:
+            if (S + T) % 2 == 1:
                 self.c.pending[L] = (self.kvl_buf[L][T - 1].clone(),
                                      self.sc_buf[L][T - 1].clone())  # the last token is unpaired
             else:
@@ -1326,6 +1487,9 @@ class FastDecoder:
         _ev_draft = self._ev_begin("draft")
         if self.use_graphs and self.draft_graphs is not None:
             self.draft_graphs[0 if greedy else 1].replay()
+            if self.decode_probe is not None and self.decode_probe.active and self._probe_draft_key is not None:
+                self.decode_probe.mark_replay(self._probe_draft_key,
+                    phase="draft.greedy" if greedy else "draft.sampled")
         else:
             self._draft(greedy)
         if _ev_draft is not None:

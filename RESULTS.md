@@ -1834,3 +1834,935 @@ identity; the benchmark used the already-running service.
 
 Artifacts: `results/readme-throughput-20261006/`: per-workload JSON, combined
 `summary.json`, `run.py`, warmup log and before/after health snapshots.
+
+### 2026-10-06 — Investigating the apparent speculative acceptance drop
+
+The earlier code result (2026-10-01) used temperature 0.6 and 512 output tokens;
+the README run above used greedy decoding and 256 tokens. Their respective
+`accept_len_mean` values, 3.72 and 2.82, are **not acceptance probabilities**.
+They are mean leading accepted drafts plus one, before final output truncation.
+The controller also changed its depth mix: five-draft steps were 256/421 (60.8%)
+in the old runs and 42/182 (23.1%) in the newer runs. Its decisions depend on
+relative measured step time as well as acceptance. Reported five/three step-cost
+ratios were roughly 1.17 before and 1.25 in the newer greedy runs. Runtime changes
+can therefore change this metric indirectly, even without changing draft logits.
+
+Replayed the old request protocol on the current live engine: same prompt salt
+(`run`), temperature 0.6, top_p 0.95, thinking off, 512-token limit, EOS honored,
+one warmup and three measured runs. Normal adaptation remained active for this
+replay. All three reached 512 tokens. Yields were **2.83, 3.32, 3.21** (median
+3.21), at **26.85, 28.84, 29.12 tok/s**. Matching request settings did not recover
+the entire old result; stochastic outputs and expert history were not identical.
+
+Then isolated weight and attention-width options using the same 62-token LRU
+cache prompt, seeds 42/43, temperature 0.6, top_p 0.95, 512 output tokens,
+`ignore_eos=true`, thinking off, and fixed **five-draft** verification. Each arm
+had a 64-token warmup. All four arms used the same copied demand history, 9,574
+residents, and identical expert-to-slot maps (checked from `/v1/expert-map`).
+Swaps, predictive prefill and prefix caching were disabled for these arms;
+generation stayed zero and no decode adaptation passes ran. The production
+demand file's SHA-256 stayed unchanged throughout these isolated tests. TP2,
+90.2 GB/node, 524288 context allocation, 1024-token prefill chunks and the TTS
+service remained in place. Attention FP4 also changes the DSpark attention
+projections; it is not a main-backbone-only switch.
+
+| Attention / overlay / index_topk | Tokens per step, seeds 42 / 43 | Mean ms/step | Mean client decode tok/s |
+| --- | --- | ---: | ---: |
+| Native / on / 1024 | 3.85 / 3.78 | 122.28 | 31.07 |
+| Native / off / 1024 | 3.36 / 3.70 | 126.06 | 28.00 |
+| FP4 `attn,wo_a` / off / 1024 | 3.61 / 3.99 | 114.34 | 32.95 |
+| Native / off / 512 | 3.36 / 3.70 | 120.73 | 29.24 |
+
+Findings and limits:
+
+- Removing abliteration did **not** recover acceptance on this workload. Keep
+  this negative result: its plausible main-model/drafter mismatch was not
+  supported by these two samples. No answer-quality improvement was tested.
+- `index_topk=512` produced byte-identical answer text, identical step counts
+  and identical acceptance metrics to 1024 for both seeds, while reducing mean
+  step time by **4.23%**. Wider attention contributed runtime cost here, not a
+  direct draft-agreement loss. This short test says nothing about long-context
+  quality at 512 versus 1024.
+- Attention FP4 reduced mean step time by **9.30%** against native stock and
+  changed generated text and acceptance. It is a measured speed/precision
+  tradeoff, not evidence of better model quality or a general acceptance gain.
+- The old/new headline mixed request settings, model weights, residency and a
+  timing-sensitive draft-depth policy. It cannot establish a 24% intrinsic
+  acceptance-probability regression or uniquely assign the historical gap to one
+  change. Fixed-depth results demonstrate that long accepted blocks remain
+  possible; a same-token-prefix evaluation would be needed to isolate intrinsic
+  draft agreement from different generated trajectories.
+
+The user requested keeping abliteration disabled regardless of this result:
+`.env` now clears `DSV41_ABLIT_WOB`. Normal dynamic depth 3/5, native dense
+precision, index_topk 1024, adaptive loading and shadow prediction are the
+restoration configuration. Neither the overlay file nor the checkpoint was
+modified. Artifacts: `results/acceptance-investigation-20261006/`, including
+protocols, per-seed outputs/stats, all four maps, summary and launch logs. The
+first wrapper's immediate idle assertion raced end-of-request cleanup after its
+completed baseline; continuation waits for idle. Its original restore assertion
+also expected overlay-on, superseded by the user's overlay-off instruction.
+
+### 2026-10-06 — Decode diff audit and urgent-monitoring evidence
+
+Compared the Oct 1 baseline code (`7df4e0d`, adjacent to the saved throughput
+run) with the current checkout. The old result does not record an immutable
+runtime source identity, so this is a source audit, not a complete binary bisect.
+AST comparisons found the original `DepthPolicy`, `sample_probs`, and sequential
+accept/reject loop unchanged. The DSpark `_draft` body also matches after removing
+the inactive `TREE_PROBE` branch and mapping `COMPUTE_CONF` back to `SPEC_CONF`.
+Live inspection confirmed confidence depth, lookup drafts, bypass, separate TP
+draft head and layer streaming are all off. Dynamic residency still uses the
+existing device LUT in the resident decode path. The expert-map endpoint reads
+CPU state, not CUDA routing masks.
+
+The source diff adds urgent counter readback on each verification burst, a host
+Engram row cache, and score-miss totals in the fused routing-statistics kernel.
+These are costs to distinguish from numerical changes, not demonstrated major
+regressions. Historical isolated urgent-monitoring results were already saved:
+`results/urgent-overhead-20261003/urgent-rank0.json` and `summary.json`. Warmed
+512-token greedy prose, pinned depth 3, swaps suppressed, measured ABBA:
+**24.485 tok/s off versus 24.720 on**; all outputs and both ranks agreed exactly.
+This small difference is not evidence of a speedup, but the test found no slowdown.
+Read the retained `urgent-adapt` Docker image without launching a model and
+confirmed AST-identical `_decode_adapt_due`, `decode_miss_snapshot`, and
+`UrgentAdaptWindow` against current code. Keep monitoring enabled: a `.tolist()`
+alone is insufficient evidence to remove useful urgent loading. This historical
+test used FP4 attention and an older memory profile; it does not quantify overhead
+for every current workload. Actual expert-loading pauses are separate from
+monitor-only cost.
+
+Another historical comparison mismatch: every Oct 1 measured code run restored
+**62/62 prefix tokens**, whereas the newer README runs restored **0/62**. This
+changes prefill execution/cache state; it is not a demonstrated explanation for
+decode acceptance by itself. Historical Engram cache tests also showed modest,
+workload-dependent effects (cold cache -2.55% to +0.07%, warm -1.30% to +1.85%),
+not a universal improvement or a demonstrated cause of the current gap.
+No serving settings or inference code were changed for this read-only audit.
+
+### October 6: old-code rollback with native attention
+
+At the user's request, deployed `7df4e0d` in an isolated worktree/image while
+preserving the current checkout. Both TP2 nodes use image
+`deepseek-v41-flash-spark:oct1-baseline-7df4e0d` (image ID
+`841a5f91572fbe99c230906bb952485c4fc935be348a7e03cf482896e155859a`).
+Native attention is retained (`DSV41_DENSE_FP4=off`), abliteration stays off,
+and checkpoint index top-k is 512. Optional L2 prefetch is disabled because
+that old implementation is incompatible with native FP8 weights. This is
+therefore not a reproduction of the historical FP4-attention preset.
+
+The old allocator loads 9,400 experts, 235 per layer, into an 89.0 GB arena.
+Both ranks passed their config and prune-mask guards. It does not provide
+cross-layer allocation or the expert-map endpoint. Vision is replicated;
+TTS remains running. RAM prefix caching stays enabled and disk prefix caching
+stays disabled. The old engine uses a separate compatible frequency-history
+copy; SHA-256 checks confirmed the three production learning files were
+unchanged after the switch. Configuration backup, deployment logs, health
+snapshot, and history hashes are in `results/rollback-oct1-20261006/`.
+
+Smoke test: thinking off, temperature 0, maximum 16 output tokens, prompt
+`Reply with exactly READY.` returned `READY` (2 completion tokens). This
+verifies serving only; no throughput or quality recovery is established by
+this test.
+
+Rollback code benchmark (`code-bench.json` in that directory): one warmup and
+three measured 512-token generations, thinking off, temperature 0.6, normal
+EOS, `--seed-salt run`, matching the earlier `old-settings.json` requests.
+Sampling was unseeded and adaptation remained enabled. Measured decode rates
+were 31.29, 35.31, and 31.52 tok/s; median **31.52 tok/s**, versus **28.84**
+for the newer engine with the same request settings (+9.3%). Median reported
+acceptance length was **3.23** versus **3.21**; median decode time per
+speculative step was **99.71 ms** versus **108.27 ms**. All measured prompts
+had zero cached tokens. The older October 1 FP4-attention result remains
+37.34 tok/s with acceptance length 3.72 and fully cached 62-token prompts.
+
+This rollback recovered throughput on this small workload without materially
+recovering median acceptance length. It does not isolate a code regression:
+expert allocation/history, attention index top-k, abliteration, host caches,
+and adaptation behavior also differ from the newer-engine reference. Nor is
+it an expert-map overhead experiment. Raw per-run depth distributions and
+comparisons are saved in `comparison.json`. No quality claim follows.
+
+### October 6: snapshot immediately before dynamic cross-layer allocation
+
+Deployed retained `user-prompt-priority-v3` image, immediately preceding
+`dynamic-experts-v4`, to locate the throughput change more narrowly. The two
+hosts initially had different image IDs under the same tag; copied the local
+image to the peer and verified both use
+`sha256:0b0c45fdd6aa6f659916ff589190b9cfd8ef027dcdbcc3297d06c0e65f1c67eb`.
+Source inspection confirms no dynamic-expert flag/global allocator, and swaps
+remain within layers. Current tracked checkout is unchanged. The earlier
+October 1 service configuration is backed up in
+`results/pre-dynamic-bench-20261006/current.env`.
+
+Retained native attention, top-k 512, no abliteration, 89.0 GB arena, 9,400
+residents (235/layer), frequency ranking, depth 3/5, no confidence controller,
+no host Engram cache, and no urgent adaptation. Prompt/layer streaming and disk
+prefix caching remain off. Used an isolated copy of the same initial frequency
+counts as the October 1 rollback; both ranks passed mask/config guards. The
+inactive prompt-streaming load cap was set to unlimited. Original production
+learning-file hashes remain unchanged; TTS remains running.
+
+Same code workload, temperature 0.6, normal EOS, `--seed-salt run`, one warmup
+and three measured 512-token generations, unseeded sampling, adaptation on:
+
+| Version | Median decode tok/s | Median acceptance length | Median ms/step |
+|---|---:|---:|---:|
+| October 1 code, native attention | 31.52 | 3.23 | 99.71 |
+| Pre-dynamic v3, native attention | 32.17 | 3.36 | 99.82 |
+| Previously measured newer live configuration | 28.84 | 3.21 | 108.27 |
+
+Pre-dynamic measured runs were 32.17, 31.84, 33.00 tok/s, all with zero cached
+prompt tokens. This small screen does not show an additional slowdown between
+October 1 and the pre-dynamic snapshot under these settings. It narrows the
+investigation toward later changes/settings but does not attribute the newer
+reference's slowdown to dynamic allocation: that reference also differed in
+index width, abliteration, expert ranking/residency and host cache/adaptation
+settings. Dynamic depth and stochastic text prevent treating these as a fixed
+GPU-work replay. Raw results, deployment logs and per-run depth statistics:
+`results/pre-dynamic-bench-20261006/`. The pre-dynamic snapshot remains live.
+
+### October 6: current code with dynamic residency disabled
+
+Repeated the preceding pre-dynamic benchmark using `predictive-v11`, with
+`DSV41_DYNAMIC_EXPERTS=0` and the same isolated initial frequency counts.
+Native attention, top-k 512, no abliteration, 9,400 experts at 235/layer,
+89.0 GB arena, zero host Engram cache, no urgent adaptation, and depth 3/5
+were retained. Initial resident mask SHA-256 matched the pre-dynamic snapshot:
+`9008dd660d034580005889d58f0341b9137d765aea190128846741fc8f2ffd03`.
+Both ranks ran image
+`sha256:0b425ba19b73597a355a200b175b4b04967d9faf1bfd1168901f46d6956727bc`;
+its serving sources match the current checkout (only a test file differs).
+
+One warmup, then three 512-token code generations at temperature 0.6 with
+`--seed-salt run`, unseeded sampling, adaptation enabled: **31.60, 33.70,
+30.08 tok/s**, median **31.60**, median acceptance length **3.19**. The
+pre-dynamic median was 32.17 and October 1 native median 31.52. This short
+screen does not establish a substantial regression in current code with fixed
+layer allocation. Expert-map polling was active; this is not an isolated
+map-overhead measurement. Config backups, logs and raw data are in
+`results/current-static-bench-20261006/`.
+
+### October 6: dynamic residency, verification depth, and live speed qualification
+
+The current engine can retain dynamic allocation and match the October 1
+native-attention throughput on the matched short code workload. No inference
+kernel or depth-policy change was needed to reproduce that speed. This does
+not identify a unique cause for every earlier slow run.
+
+Added `tools/bench_dynamic_residency_depth_tp.py`, a disposable two-rank gate
+using a single frozen dynamic map, the full five-token DSpark drafter at every
+verification width, alternating mode order, and exact token/rank assertions.
+The gate used native attention, top-k 1024, 9,574 experts selected from a copy
+of the production score history (205–276 per layer), 90.2 GB arena, peer-only
+vision, L2 prefetch 2 MiB, and no prefix reuse or adaptive swaps during timing.
+It never wrote production history. This freezes placement for diagnosis only;
+normal serving's adaptation was subsequently restored. Image/serving sources
+were the same current `predictive-v11` image used in the preceding static test.
+
+After warming both graph widths, two 384-token greedy runs per mode/workload:
+
+| Mean engine decode tok/s | Fixed depth 3 | Fixed depth 5 | Automatic 3/5 |
+|---|---:|---:|---:|
+| Code | 31.270 | 32.745 | 32.260 |
+| Prose | 20.110 | 17.925 | 20.265 |
+
+All modes produced identical greedy token sequences for each workload, on both
+ranks, and the expert mask stayed unchanged. Automatic depth was 1.5% below
+the better fixed code depth and within timing variation of the better prose
+depth. Prose's fixed-depth acceptance length rose from 1.88 to 1.96 while
+throughput fell 10.9% relative to fixed depth 3. Higher acceptance length alone
+is not a reason to force depth 5. The existing controller chooses using
+estimated tokens/second, before the next proposal, preserving the sampled
+accept/reject rule; no confidence-policy experiment was enabled.
+
+A fixed-depth-3 ABBA cache test on the same 384-token code output measured
+31.24 tok/s with the host Engram cache off and 31.12 with a cold application
+cache (256 MiB head / 1 GiB peer), a 0.4% difference. A warm-cache repeat was
+31.04. Cache buffers were fully touched before timing; the OS page cache was
+not dropped. Seeded 128-token sampled cache on/off runs were also token-identical.
+This screen does not justify disabling the cache or blaming it for a large
+regression. Eleven CPU depth-policy tests passed. Both ranks completed the
+full gate successfully. Data: `results/dynamic-speed-investigation-20261006/`
+(`depth-rank*.json`, `summary.json`, `rank*.log`).
+
+Normal dynamic serving was then restored: original production score-history
+path, 9,574 residents, native attention, top-k 1024, abliteration off, automatic
+depth 3/5, urgent adaptation enabled, host Engram caches 256 MiB/1 GiB,
+peer-only vision, RAM prefixes on, disk/response prefixes off, and predictive
+prefill in shadow mode. TTS stayed running throughout. The following live
+requests contribute normally to adaptation, unlike the isolated gate above.
+
+The same 512-token code benchmark used for both rollbacks (temperature 0.6,
+`--seed-salt run`, one warmup, three measured runs, normal EOS, unseeded
+sampling) measured **31.44, 32.01, 32.76 tok/s**, median **32.01**. Compare
+October 1 native **31.52**, pre-dynamic native **32.17**, and current fixed
+allocation **31.60**. Median acceptance length was 3.28; per-run lengths were
+3.81, 3.23, 3.28. Global transfers were active at prefill/end boundaries, and
+urgent monitoring was enabled (no urgent pass was triggered in these measured
+requests). Decode request miss rate was 3.88%, 3.52%, 3.19%. This supports
+retaining the current allocator and automatic depth policy rather than
+sacrificing them to recover throughput. It is a small workload, not a universal
+speed or quality-equivalence claim.
+
+Reproducing the *original README benchmark settings* (256 tokens, greedy,
+`--seed-salt readme-20261006-code`, ignore EOS, one warmup/two measured) on this
+same restored engine gave **28.57 and 27.38 tok/s**, median **27.98**. The prior
+README median was 26.87. Thus the 37.34 historical FP4/512-token sampled result
+and the 26.87 native/256-token greedy result are not a matched code-regression
+comparison. Precision, request settings/prompt tags, selected expert maps,
+cache state and stochastic trajectories are confounded. Do not add percentages
+from separate tests or attribute the full difference to dynamic allocation.
+
+Functional qualification: exact 1–20 counting, Japanese `日本語もいける？`, and
+a generated run-length encoder passing seven empty/ASCII/Unicode cases.
+Repeating the Japanese request consecutively reused all 35 input tokens;
+an intervening unrelated request correctly prevented that short-prefix reuse.
+These checks are stronger than merely seeing HTTP 200 but do not establish
+broad benchmark quality. A 20-request local expert-map latency probe had
+15.87 ms median round trip (including JSON parsing) and 97.81 ms maximum;
+it is not a page-open/page-closed throughput experiment. The map remained
+available during live timing. Final live model: `deepseek`, current dynamic
+engine; no lower-precision attention or fixed-depth workaround was deployed.
+
+### October 7: re-enable the abliteration overlay
+
+At the user's request, restored `DSV41_ABLIT_WOB` to
+`/models/dsv41-wo-b-ablit/wo_b_l10_35.safetensors`. Both nodes have SHA-256
+`5a777976d86d03b681fde951c08908bc49e3b243007e8cfed3c1934bcb07a2c5`.
+The TP2 boot guard agreed, health reports `ablate_wob=true`, and a short
+Japanese smoke request returned `おはよう`. Dynamic allocation, 9,574 residents,
+native attention and top-k 1024 remain configured as before. No new throughput
+claim: the preceding 32.01 tok/s measurement was with abliteration off.
+Config backup and verification: `results/ablit-reenabled-20261007/`.
+
+### October 7: memory pressure with TTS; smaller prefill chunks are provisional
+
+At 14:42:09 UTC, rank 0's host-memory watchdog exited after MemAvailable
+remained below its 2.5 GB floor for three seconds (2.4 GB at exit). NVIDIA
+kernel logs had already reported `NV_ERR_NO_MEMORY` at 14:42:06–07. The
+request had 55,020 input tokens and had generated at least 1,382 reasoning
+tokens. This was a decode-time failure, not the configured context limit.
+Rank 1 still had approximately 8.9 GiB available. TTS was running on rank 0's
+node with approximately 5,753 MiB reported GPU memory.
+
+Retained the 2.5 GB watchdog floor: lowering it releases no memory and would
+not address the earlier driver allocation failure. Restarted with only local
+`DSV41_PREFILL_CHUNK` changed from 1024 to 512; all 9,574 residents, native
+attention, the abliteration overlay, and TTS remain enabled. Health confirms
+512-token chunks. This roughly halves buffers linear in chunk length, but
+there is no matched measurement of total GB saved, and no evidence yet that
+retained prefill workspace caused the decode-time failure. Do not describe
+this as a confirmed fix or a 50% reduction in total engine memory.
+
+The user's harness resumed after restart: a 15,223-token full prefill plus
+104 output tokens completed successfully, as did a 22,608-token request
+with 192 output tokens (15,223 prefix tokens reused).
+No competing synthetic request was submitted. This short observation does
+not qualify the previously failing 55k-context workload. Diagnostic logs,
+private config backup, and bounded memory samples are saved under
+`results/memory-pressure-20261007/`.
+
+### October 7: TensorFold-inspired router, prefetch and memory improvements
+
+Source inspection suggested specialized router work, graph-cache management,
+memory-aware prefill, and better overlap for weight reads. Implemented these
+without changing the resident expert budget or native attention precision.
+All engine tests used a **frozen copy** of the production score history and
+suppressed saves; the production NPZ SHA-256 stayed unchanged throughout.
+TTS stayed running. No model weights were downloaded or converted.
+
+**Router:** retained the original padded FP32 cuBLAS projection and torch top-k
+(including tie behavior), and fused gathering six selected scores, their sum
+and normalization into one kernel. Its sum reproduces the current Torch CUDA
+six-element reduction order. Across 400 random/extreme/tied-input cases at
+1/2/4/6/8 rows, IDs, scores and normalized weights were bit-identical. The
+existing real-checkpoint router test also passed. CUDA-graph microbenchmarks:
+4 rows **51.82 -> 49.05 us**, 6 rows **52.46 -> 49.45 us**. This is a component
+speedup, not a 6% total-engine claim. Full-router GEMV replacement remains a
+separate numerical change; this implementation deliberately preserves it.
+
+Initial full-engine screen (greedy, 160 output tokens, fixed draft depth 3,
+two runs per variant in forward/reverse order, frozen 9,574-expert map,
+65,536 allocated context, top-k 1024, native attention, overlay on): baseline
+code/prose **27.84/22.11 tok/s**, fused tail **28.23/21.96**, fused tail plus
+bulk prefetch 2 MiB **28.08/21.97**, bulk 4 MiB **28.15/21.90**. No clear
+full-engine benefit from replacing the existing communication-site prefetch.
+The first gate stopped at an overly strict long-prompt/post-EOS comparison;
+its preceding matched router/prefetch trials were token-identical across
+variants and both ranks. The next gate had a test-output-directory setup
+failure on the peer; the driver now creates its output directory on each rank
+and exits promptly after errors instead of hanging in NCCL teardown.
+
+A second placement prefetches this layer's output-projection weights while
+attention computes, using the hardware bulk hint. Final fixed-depth-3 screen,
+192 output tokens, two runs each in order 0/4/8/12/12/8/4/0 MiB:
+
+| Attention prefetch | Code tok/s | Prose tok/s |
+| --- | ---: | ---: |
+| Off | 28.860 | 22.725 |
+| 4 MiB | 29.160 | 22.890 |
+| 8 MiB | 29.205 | 22.870 |
+| 12 MiB | 29.090 | 22.800 |
+
+Selected **4 MiB**, the smallest favorable tested budget: approximately
+**+1.0% code / +0.7% prose** in this short screen. Variance is comparable to
+some of the code gain; this is not evidence of a large general speedup.
+Every fixed-length output was identical. Pacing at 150 GB/s lost the short
+communication-window microbenchmark (4 MiB: 33.6 us versus unpaced bulk
+20.5 and touch 25.0); it remains disabled. The original communication site
+remains touch/2 MiB.
+
+**Memory:** an isolated CUDA GEMM probe exposed **32 MiB retained per new
+warm-up stream** by cuBLAS; repeatedly using the same stream added zero.
+`FastDecoder` now reuses one warm-up stream across captures. In the final
+full-engine screen, allocated memory after each of eight two-parity warmups
+was exactly **100,771,292,672 bytes**. The initial test's first-to-last warmup
+allocated growth was **448 MiB** across the same number of captures. This
+fixes a verified growth mechanism, not a proven explanation of the entire
+previous 55k-context OOM.
+
+A graph-key cap alone was insufficient because draft graphs keep the shared
+pool alive. At eight variants (configurable; 0 disables the cap), synchronize
+and release verify graphs, memos, draft graphs and their pool together, then
+recapture. The final forced two-entry-cache test alternated depths 3/5/3:
+identical 96-token outputs across widths and both ranks, at most two entries,
+and successful pool rotation. The new width's small static buffers remain;
+returning to width 3 no longer creates a new 32 MiB stream workspace.
+
+**Prefill:** both ranks agree on a conservative chunk budget before read-ahead
+starts; current maximum remains 512, minimum 256, soft reserve 4 GiB. On the
+11,063-token prompt, 512 versus forced-256 rows gave peak allocated memory
+**101,557,899,264 versus 101,414,183,936 bytes** (137.06 MiB lower), at
+**12.975 versus 18.049 s prefill**. The complete normal answer was identical;
+forced post-EOS continuation differed, consistent with the documented
+long-context index-tie limitation. This is a small bounded memory/answer
+check, not a 55k or 200k+ context qualification. No context limit was reduced.
+Images retain indivisible spans; oversized spans are reported. The scratch
+estimate is not an OOM guarantee; the 2.5 GB watchdog is unchanged.
+
+**Depth costs:** added opt-in `DSV41_CONF_COST_REFRESH` to replace stale
+confidence-policy costs using three non-capture measurements of an unselected
+width. Probe selection is independent of draft tokens, preserving the sampled
+prefix stopping rule. CPU tests cover stale-cost recovery, capture exclusion,
+disabled mode and pinned modes. It remains **off**, as does confidence depth;
+normal serving retains the previously qualified automatic 3/5 policy.
+
+Validation: **28 CPU tests**, exact synthetic/real-weight router checks, and
+**29 final TP2 requests with matching rank hashes**, plus the initial speed
+screen. Artifacts: `results/tensorfold-port-20261007/`, especially
+`summary.json`, `router-micro.json`, `workspace-probe.json`, and
+`v5/gate-rank{0,1}.json`. Live restoration uses image
+`deepseek-v41-flash-spark:router-memory-v1`, with 9,574 residents, native
+attention, abliteration enabled, prefix reuse and TTS preserved.
+
+Live verification after restart: both nodes run the same image; head health
+passes, native attention/abliteration/dynamic 9,574 residents are confirmed,
+and TTS remains running. Exact `READY` and Japanese `はい` requests passed;
+repeating the Japanese request reused **18/18 prefix tokens**. Health exposes
+the selected prefill policy, attention prefetch budget and graph-memory counters.
+
+### 2026-10-07 — Matched live HTTP prose, HTML and code: ours vs TensorFold
+
+The user requested our existing benchmark on both engines. Reused
+`bench/bench.py::WORKLOADS` and `run_once`: coastal-ecosystem prose, the Angry Birds
+single-file HTML game, and the Python LRU/TTL module. One sequential stream,
+512 output tokens, greedy temperature 0, top_p 0.95, seed 42, thinking false,
+ignore_eos true; one warmup then two measured requests per workload, in that
+order on each engine. All 18 requests completed with exactly 512 output tokens,
+finish=length and no reasoning text. Request text/hash and generation settings
+match across engines. Client decode rate is `(completion_tokens - 1) /
+(total_s - first_content_time)`, using usage tokens, not SSE chunk count.
+
+| Workload | Ours runs (tok/s) | TensorFold runs (tok/s) | Ours median | TF median | TF / ours |
+| --- | --- | --- | --- | --- | --- |
+| Prose | 20.496, 19.527 | 42.625, 43.040 | 20.011 | 42.833 | 2.14x |
+| Angry Birds HTML | 37.841, 39.373 | 85.771, 85.475 | 38.607 | 85.623 | 2.22x |
+| Python LRU/TTL code | 29.337, 29.413 | 60.824, 62.892 | 29.375 | 61.858 | 2.11x |
+
+Our live image was `deepseek-v41-flash-spark:router-memory-v1` (the optimizations
+above), dynamic TP2 with 9,574 residents, native attention, abliteration ON,
+normal expert adaptation and urgent loads, depth 3/5, context 524,288. TensorFold
+used the already installed `dsv41-tensorfold:local-overlay` image (sha256
+`da0556529150d39598102b5acb95c7cc3520c023d7585a3e9de77341481d5444`), its existing
+EXL3 2.9 bpw pack and prepared caches, saved local full-prefill profile, expert
+pruning OFF, fp32 mHC mixing/logits, overlay OFF, 196,608 context and four slots
+(one active). Its source pack itself is labelled uncensored. No model download,
+repack or image rebuild. TTS was already stopped before the comparison and was
+left stopped for both engines. This is a comparison of the saved usable engine
+profiles, not equal weights, equal numerics, equal resident coverage or equal
+memory allocations, and not a reproduction of TensorFold's README speed preset.
+
+The gap is not explained by TensorFold accepting more tokens per round. Measured
+output tokens per verification window (ours / TensorFold) were prose
+1.91–1.99 / 1.646–1.684, HTML 4.62–4.66 / 4.531, and code 3.00–3.07 / 2.96–3.03.
+Dividing these by client decode throughput implies about 97–98 / 39 ms per prose
+round, 117–123 / 53 ms per HTML round, and 102–105 / 48–49 ms per code round.
+These are effective wall-time estimates, including host/adaptation/drafting;
+they are NOT direct GPU verification-kernel timings, nor matched verify row
+counts. They justify profiling round cost before attributing the gap to draft
+acceptance. Weight formats, attention precision, selected widths and execution
+paths still differ; bit-width scaling alone does not establish an attainable
+native-weight target.
+
+Median TTFT (ours / TensorFold): prose 1,185 / 297 ms; HTML 269 / 310 ms; code
+803 / 331 ms. Our measured HTML requests reused all 62 prompt tokens; TF reported
+zero cached tokens. Prose/code reported zero reused prompt tokens on both. Thus
+HTML TTFT is not a cold-prefill comparison. These short prompts do not measure
+bulk prefill throughput. All answers are token-capped; outputs are saved for
+inspection but these timings establish neither complete-game/code correctness
+nor quality parity. Two measured runs provide a small screen, not a confidence
+interval or a sustained-load qualification.
+
+Operational note: TF initially reached the API in 50 seconds, but its first
+strict canary hit the memory-admission timeout while startup file caches occupied
+RAM. The launcher stopped the pair. The retry reclaimed clean host file caches
+on both nodes immediately at API readiness; all five strict canaries passed.
+Memory floors and saved model settings were unchanged. Both attempts are retained
+in the artifacts. Our service was restored after the comparison.
+
+Artifacts: `results/engine-comparison-20261007/`: `run.py`, `summary.json`,
+`manifest.json`, per-engine per-request outputs/stats, TF raw SSE streams and
+rank logs, and startup/restoration logs. The ignored configuration snapshot is
+mode 0600. Exact prompts are in each request JSON; comparison checks all nine
+prompt hashes against one another. No benchmark answer is fed into a later
+request.
+
+### 2026-10-07 — GPU breakdown against TensorFold, four verification rows
+
+The user authorized using the pair for profiling. Both serving engines were
+already stopped after the user's TF launcher hit its 104 GiB pre-load gate
+(head had 103 GiB free). Reclaimed clean file caches, then ran disposable TP2
+profiles; finally started TensorFold in the unchanged saved serving profile
+(196,608 context, four slots, model `deepseek`, port 8000). Its five startup
+canaries passed; `/health` reported TensorFold OK, idle, zero errors.
+
+Diagnostic workload: the same `[req 70101]` Python LRU/TTL benchmark prompt (62
+rendered tokens), greedy, 160 output tokens, no EOS stopping. Both used a 32,768
+context allocation, fixed draft depth 3 / four verify rows. Our 9,574-resident
+map was frozen (snapshot of the learned database, no persistence or adaptation);
+TensorFold used one request slot and a 32,768-token pool. Native attention and
+abliteration stayed on in ours; TF retained the saved EXL3/full-prefill/no-pruning/
+FP32-mixing profile, overlay off. This aligns verification width, not weights,
+precision, output trajectories, expert selections or profiling positions.
+
+Used PyTorch/CUPTI kernel traces, without per-operator synchronization. Our
+existing timeline driver captures 12 middle decode rounds (output tokens 67–102)
+on both ranks after two full warm runs. TF captures one 160-token request after
+two warm runs. Its four-row main graph has 1,113 distinct kernel nodes, each
+replayed 62 times; a single shorter final window is excluded. Our six main
+segment/parity graphs have complete 5/7-replay node sets, totaling 12 forwards.
+Both profiled outputs matched their own warm outputs; ours matched on both ranks.
+This does not mean outputs match *between engines*.
+
+| Rank-0 GPU measurement, ms | Ours | TensorFold |
+| --- | ---: | ---: |
+| Main verification graph span per four-row forward | 80.62 | 41.80 |
+| Expert matrix kernels (routed + shared), summed per forward | 44.55 | 22.19 |
+| Dense projection kernels including BF16 matmuls/head in ours | 21.75 | 9.56 |
+| Communication kernels inside main graphs | 4.10 | 1.84 |
+| Draft graph span per pass | 10.40 | 3.72 |
+
+Main span is the first kernel start to last kernel end for each graph replay;
+ours sums its sequential graph segments per forward. Component rows are summed
+kernel durations; kernels on different streams overlap, so **do not add these
+rows or interpret their differences as independent recoverable savings**.
+Correction: the first kernel-name grouping counted our shared experts as dense,
+while TF's x3ld class included them as experts. Their 7.27 ms up + 2.98 ms down
+are now assigned to experts on both sides. Our dense row is
+`_fp8_linear_kernel` + `_fp8_grouped_kernel` (28.47 ms), minus those 10.26 ms,
+plus BF16 WMMA matmuls (3.54 ms). The apparent 3.35x dense gap was therefore
+misclassified; the corrected kernel-sum ratio is 2.27x. Shared expert work
+overlaps routed work, so the corrected expert sum is not critical-path latency.
+`reclassify_shared.py` verifies 480 up and 480 down calls (40 layers, 12 rounds),
+using the shared-down/routed-down overlap to distinguish wo_b's identical grid.
+The original `breakdown.json` is retained as the raw-family audit;
+`corrected-grouping.json` records this correction.
+TF's row is EXL3 `dense3::lanes_linear_kernel` and
+`linear_kernel` projections (9.56 ms). Our other main FP32 matmuls total 11.37 ms
+(router/mHC and other small GEMMs); TF's fused mHC boundary alone is 4.04 ms, but
+these scopes are not identical and should not be called a matched mHC speedup.
+TF paced prefetch kernels sum to 10.25 ms, substantially overlapped; they are
+not an additional 10.25 ms of wall latency.
+
+Our draft graph includes 4.51 ms of BF16 matmuls and 2.52 ms of FP8 projections
+per pass. TF's EXL3 dense projections consume 1.68 ms per draft pass. This makes
+dense attention/head/draft math a stronger profiling target than another small
+router-tail or prefetch tweak. Much of the comparison is a format/precision
+tradeoff (TF quantizes attention/head too), not yet a demonstrated implementation
+inefficiency or permission to reduce native precision. No DRAM counters were
+collected; this cannot establish achieved memory bandwidth or a guaranteed 1.5x
+native-weight speedup.
+
+Our 12-round rank-0 capture covers 1,154.01 ms, with GPU-activity interval union
+1,087.75 ms and 66.26 ms idle (5.74%); rank 1 idle 54.55/1,152.86 ms (4.73%).
+The Engram future-wait spans overlapped only 0.044 ms of rank-0 GPU idle in this
+capture. Earlier host `engram`/`decode_engram_wait` counters include GPU waits
+and can overlap; their percentages cannot establish an SSD bottleneck. Ours'
+last unprofiled run was 5.454 s decode for 160 tokens. TF's unprofiled client
+rate was 54.71 tok/s and profiled rate 53.45 tok/s at this fixed depth. These
+short diagnostic numbers are not replacements for the preceding live 512-token
+workload comparison.
+
+Profiler pitfalls retained: first Nsight run suppressed most TF CUDA graphs
+because its extra memory pushed below the capture floor, so those measurements
+were rejected. CUDA-profiler API triggering produced no report. NVTX triggering
+produced a host-only report; its SQLite diagnostics showed insufficient CUPTI
+privileges, and even a small SYS_ADMIN probe yielded runtime events but no
+kernel events (incomplete hardware tracing). A PyTorch CUDA profiler probe
+successfully recorded real GPU kernels, so both accepted profiles use that.
+With Nsight removed, TF held its normal main/draft graphs and replayed them.
+No graph memory guard was lowered. Failed/rejected traces and logs are retained.
+
+Artifacts: `results/round-breakdown-20261007/`: `breakdown.json`, `analyze.py`,
+`tensorfold/trace.json` and `report.json`, `ours/rank0.json`, both rank summaries,
+launchers/logs, frozen learned-map copy, failed Nsight runs and tiny probes,
+and `restored-tf-health.json`. Driver: `tools/bench_round_breakdown_tp.py`.
+No serving engine implementation was changed by that profiling measurement.
+
+### October 7: decode candidates screened; no new default adopted
+
+Native FP8 scheduling/bit-scale microbenchmarks are retained under
+`results/dense-decode-opt-20261007/`. A 14% wo_b win in the initial sweep shrank
+to **103.4 -> 99.9 us** in the controlled four-row test; fused qkv was
+47.3 -> 45.6 us and wq_b did not improve. Exhaustive finite-BF16 activation
+checks, all 256 scale codes, and 120 real-layer/shape/row checks passed exactness
+and row invariance. `DSV41_FP8_DECODE_PIPELINE=0` remains the default; a full-model
+campaign for this marginal candidate was skipped. Ordered split-K and one-time
+QDQ negatives are recorded in `docs/gotchas.md`.
+
+The larger draft-work prototype combines native TP attention for the three
+DSpark blocks and scoring Markov biases only over 128 base-logit candidates.
+The target's weights and verification remain unchanged. Shortlisting is an
+approximate **proposal** change and applies only to greedy, non-tree drafting;
+sampled drafting retains its full-vocabulary Markov calculation. Both new
+settings are checked in the boot-time pair guard and default off:
+`DSV41_TP_DRAFT_ATTN=0`, `DSV41_DRAFT_MARKOV_TOPK=0`.
+
+The actual Markov weights with synthetic five-row logits measured **1.933 ms
+full vs 0.114 ms shortlist**, about 17x for that component. Graph and eager
+outputs agreed within each path. This is a latency screen, not an acceptance
+or quality result. The frozen-map TP2 test then used native attention,
+abliteration on, 9,574 residents, context 32K, fixed draft depth 3, temperature
+zero, and the prose/code `[req 70101]` prompts, 192 generated tokens each:
+
+| Arm | Prose tok/s | Code tok/s | Prose accepted block | Code accepted block |
+| --- | ---: | ---: | ---: | ---: |
+| Initial baseline (earlier process) | 22.57 | 31.78 | 1.97 | 2.77 |
+| TP draft attention + shortlist 128 | 20.65 | 29.83 | 1.89 | 2.73 |
+| Following baseline (same process as candidate) | 20.48 | 29.54 | 1.97 | 2.77 |
+
+All completed candidate/baseline output hashes matched across arms and ranks,
+including 64-token warmups; the expert map stayed fixed. The same-process
+~1% throughput difference is not a demonstrated useful gain, particularly
+given the larger baseline variation across processes. Faster draft work lost
+acceptance; no new option was enabled in the live preset. No broader benchmark
+suite was run. The initial combined attempt ended before candidate output;
+graph-unsafe scalar candidate indexing was replaced with device gather and
+checked in the standalone graph screen. A retry exposed a diagnostic resume
+path bug on rank 1; the driver now checks each rank's own baseline file before
+loading the model. Failure artifacts are retained alongside the successful
+`draft-tp-final/` run. The isolated TensorFold dense sweep was stopped following
+the user's request to limit benchmarking; it has no usable result.
+
+Checkpoint-header accounting also explains why a pack's headline 2.9 bpw is
+misleading here. Core attention projections plus the vocabulary head contain
+**3.380 GB/rank native vs 1.947 GB/rank EXL3 packed weights**, a 1.736x byte
+ratio before implementation differences. This is a one-read payload model,
+not measured DRAM traffic; it excludes auxiliaries/experts/KV and small EXL3
+scale tables. Attention is predominantly 5-bit in the EXL3 pack (layer-0
+wq_a/wkv are 6-bit), and its head is 6-bit versus our BF16. The audit is in
+`core-weight-bytes.json` and `tf-dense-formats.json`. Neither these bytes nor
+overlapping kernel-duration sums establish a recoverable 3x native speedup.
+
+## October 7: staged decode attention (experimental, default off)
+
+`DSV41_ATTN_STAGED=1` replaces the decode attention core's two FP32 SIMT
+matmuls with tensor-core QK and TF32x3 PV, retaining the existing full-matrix
+FP32 softmax. `=2` additionally stages the BF16-valued keys directly in BF16
+scratch. Native FP8 projection weights, expert allocation, and prefill are
+unchanged. Both ranks guard the mode at boot. The default remains `0` because
+accumulation changes and this was a small quality screen.
+
+The isolated graph screen (GB10, T=4, H=32, D=512, synthetic BF16-valued Q/K)
+measured 37.53 -> 12.93 us at 128 keys and 59.42 -> 28.72 us at 640 keys for
+the two GEMMs plus softmax. Relative error against FP64 was below 8e-7 in
+those cases; about 0.05% of final BF16 elements differed from the existing
+core. This is a hot repeated graph microbenchmark, not full-layer latency.
+Keeping key scratch in BF16 then reduced gather-plus-staged-core latency
+from 73.50 to 47.69 us at 1152 keys, and 321.66 to 157.68 us at 3200 keys.
+The scratch key bits were identical after widening (including signed zeros),
+but BF16 input typing changed the compiler's PV lowering slightly.
+
+Two bounded TP2 A/B/A runs kept the expert map frozen (9574 residents), native
+FP8 attention, ablit on, depth 3, temperature 0, seed 42, thinking off, and
+192 forced output tokens. Prompt prefix was `[req 70101]` for prose and code.
+Mode 2's surrounding baselines and candidate were:
+
+| Workload | Baseline before / after, tok/s | Staged BF16 keys, tok/s | Change vs baseline mean |
+| --- | ---: | ---: | ---: |
+| Prose | 21.14 / 21.15 | 23.76 | +12.4% |
+| Code | 29.41 / 29.71 | 30.80 | +4.2% |
+
+**These are different generated token sequences**, not a controlled same-output
+speedup: acceptance changed from 1.97 to 2.17 on prose and 2.77 to 2.92 on code.
+Repeat baseline hashes matched. The depth policy's final smoothed step estimates
+were 88.7 vs 91.05 ms and 90.1 vs 92.05 ms, but total decode wall time divided
+by steps was 91.33 vs 92.17 ms and 93.97 vs 93.64 ms respectively. Therefore
+the throughput gains do not establish a large pure execution-time improvement.
+Mode 1 had measured +10.6% prose and +0.8% code under its own A/B/A.
+
+Both ranks agreed on every output. Eight-deep JSON, exact mixed-language copying,
+and arithmetic JSON passed 3/3 in both arms of each run with identical answers.
+These three objective checks do not establish general quality parity; no
+default or live `.env` was changed. TensorFold was restored after the tests.
+
+Rejected micro-only variants are retained: direct packed-key tile loads were
+236.07 us at T=4/N=1152, versus 47.69 us for BF16 staging; repeated unpacking
+was more expensive than staging. Four-way PV splitting did not help the long
+case. Three BF16 probability components offered no gain and worse FP64 error.
+No full-model test was spent on those variants.
+
+Drivers: `tools/bench_decode_attn_staged.py`, `tools/bench_attention_direct.py`,
+`tools/bench_attention_staged_tp.py`. Raw outputs, source snapshots, summaries,
+and rejected screens: `results/attention-core-opt-20261007/`.
+
+## October 7: exact verification widths and router/expert follow-up
+
+The next decode screen adds opt-in `DSV41_VERIFY_ODD=1`: the target can verify
+one through six rows, allowing draft depths 0/2/4 as well as 1/3/5. Confidence
+selection can use depths 1–5; its sampled prefix stopping rule still makes
+decisions without looking ahead into unproposed tokens. The default is `0`.
+The trained DSpark drafter retains its five-row shape for dynamic depth grids.
+Both ranks guard the new mode at boot.
+
+Qualification caught two real correctness issues. Odd widths need compressor
+pending state based on end parity, and native batch-one QK/PV accumulation
+differs from a wider batch. Broadcasting the one-row attention product to two
+rows before retaining row zero restored its native batched arithmetic. Cold
+capture must also preserve pending values that alias static warm-up buffers.
+The initial failed run is retained; its graph timings are invalid because the
+driver had not refreshed embedding/pre-mix inputs before every timed replay.
+
+The corrected TP2 check used native attention/router, ablit on, 9,574 frozen
+residents, context 32K and graph cap 16. A 4,114/4,115-token prefix exercised
+compressed-key selection above 1,024 entries. All 12 width/parity combinations
+matched the six-row target's **full FP32 logits and hidden-state prefixes
+bit-for-bit**, on both ranks. Actual eager/fast compressor rollback checks
+passed 54 boundaries and native attention-product checks passed 24 cases.
+Main-graph event medians (three replays with input/state refreshed outside
+events) were 55–56 ms at width one, 64–65 at two, 72 at three, 81 at four,
+87–90 at five and 93–95 at six. These exclude draft/host work and are not
+end-to-end round latency.
+
+The following short generation comparison kept the same map, native math,
+temperature zero, seed 42, thinking off and `[req 70101]` prose/code prompts.
+Each arm had a 32-token warm-up followed by 192 forced generated tokens:
+
+| Workload / pinned draft depth | Decode tok/s | Decode wall ms/step | Mean accepted block |
+| --- | ---: | ---: | ---: |
+| Prose / 3 | 20.09 | 97.01 | 1.97 |
+| Prose / 2 | 20.42 | 88.23 | 1.82 |
+| Code / 5 | 26.76 | 120.95 | 3.24 |
+| Code / 4 | 29.18 | 103.89 | 3.03 |
+
+Each pair emitted identical 192-token sequences, with rank agreement. Depth
+two improved prose throughput only **1.6%**; depth four improved code **9.0%**
+versus five. This was a single A/B, not A/B/A or a broad workload result.
+Native depth three in the separate router control measured 29.11–29.58 tok/s
+on code: the depth-four result is not a 9% improvement over the default depth
+three. The useful change is finer choices for the cost/acceptance policy,
+not a universal speedup or evidence that the deepest block is best.
+
+All six widths at both parities exceed the default eight-graph pool capacity.
+The qualification used 16; the default remains eight for memory safety.
+An all-depth deployment must budget graph memory or accept pool recaptures.
+Narrow depth grids can avoid that expansion. No live `.env` was changed.
+
+The second candidate, `DSV41_ROUTER_BF16=1`, uses the router's original BF16
+gate values with FP32 tensor-core accumulation and a split reduction. It
+rejects gates whose FP32 values would narrow when copied into BF16; default
+router math is unchanged. Cold gates from all 40 layers measured **60–61 ->
+19–20 us** at rows 1/4/6. In 9,600 synthetic row/mask/scale routing cases,
+selected sets/order stayed identical and routed-weight deltas were below
+1.8e-7. This is a component screen, not a serving quality result.
+
+The same-loaded-model A/B/A used fixed depth three and the same 192-token
+workloads. Graphs were released between arms; both ranks and the expert map
+agreed throughout:
+
+| Workload | Native before / after, tok/s | BF16 router, tok/s | Native before / after, wall ms/step | BF16 router, wall ms/step |
+| --- | ---: | ---: | ---: | ---: |
+| Prose | 19.83 / 20.56 | 21.66 | 98.30 / 94.78 | 91.83 |
+| Code | 29.11 / 29.58 | 29.46 | 95.10 / 93.58 | 95.35 |
+
+Baseline output hashes repeated exactly; BF16 router hashes changed on both
+workloads. Prose wall time per step was about 3.1% lower than the following
+baseline; code did not improve. The baseline drift and changed acceptance
+preclude calling the component's 3x speedup a general engine gain. Eight-deep
+JSON, verbatim Japanese/accented copying and arithmetic JSON passed 3/3 with
+identical answers in both arms. They are only a quality floor; their timings
+are not throughput measurements. The router option stays **off** and adds
+150 MiB/rank when enabled.
+
+Removed unused `FastDecoder` BF16 main/draft gate copies: **153.75 MiB saved
+per rank by default**, with no changed production arithmetic. The optional
+router prepares its own main-gate copies outside graph capture. Timing-policy
+guards now use cumulative capture counts, so a full graph-pool replacement
+cannot masquerade as a warm step when the number of cached graphs is unchanged.
+
+Finally, `FP4_V2_PAIR_BATCH=2` interleaves two expert reduction chains while
+preserving their order. Eighty-four bit checks passed, including intermediate
+partials, final BF16/FP32 output and mixed absent/null experts. Favorable
+low-union cells improved 4–11%, but rows4/U14 slowed 609.3 -> 620.0 us and
+rows6/U20 slowed 866.4 -> 884.3 us. More shared memory makes the gain
+workload-dependent; the compile default remains one. No full-model campaign
+was spent on this mixed microbenchmark result.
+
+Artifacts: `results/decode-followup-20261007/`, successful TP2 files in
+`tp-v2/` from both ranks, rejected initial run in `tp/`, and compact
+`summary.json`; expert screen in `results/fp4-pairbatch-20261007/`.
+Drivers: `tools/bench_verify_odd_tp.py`, `tools/bench_verify_depths_tp.py`,
+`tools/bench_router_bf16.py`, `tools/bench_router_followup_tp.py`,
+`tools/bench_bmm_rows.py`, `tools/bench_fp4_pairbatch.py`.
+TensorFold was restored afterward; all five startup canaries passed and
+`restored-tf-health.json` reports idle, healthy, zero errors.
+
+## October 7: lossless BF16 head rewrite and bounded TP2 qualification
+
+The user authorized rewriting head kernels or other inefficient engine logic.
+TensorFold was stopped and remains off. The new opt-in
+`DSV41_HEAD_KERNEL=packed` keeps every BF16 checkpoint bit while storing
+sign/mantissa bytes, four-bit exponent deltas per128 weights, and full-exponent
+escape groups. K-group-major tiles plus explicit Gluon native MMA kWidth2
+reduce the actual local TP2 shard **661,913,600 -> 508,819,072 bytes**, saving
+**146.00 MiB per rank**. Only 15,949 of 2,585,600 groups needed escape storage.
+Serving keeps no duplicate native GPU head.
+
+Cold actual-weight microbenchmark, N64640/K5120, widths1–6, four seeded BF16
+activation cases (scales0.1/1/4), six balanced quartets:
+
+| Rows | Production head, ms | Packed Gluon BN32, ms |
+| ---: | ---: | ---: |
+| 1 | 3.078 | 2.251 |
+| 2 | 2.951 | 2.252 |
+| 3 | 2.953 | 2.273 |
+| 4 | 2.945 | 2.262 |
+| 5 | 2.951 | 2.262 |
+| 6 | 2.975 | 2.277 |
+
+Every checked logit, row prefix and graph replay matched, totaling
+**5,429,760 checked logits**. All stored weight bits matched. The prefill
+fallback at M17/32/128/512, two scales, matched **89,073,920 logits** against
+the guarded native cuBLAS result. These finite checks are not a proof for
+every possible activation. Nine focused regression tests passed, including
+the raw FP32 cancellation example, masks, graph replay, ownership, config
+rejection and consumer dispatch. The default remains off in `.env.example`.
+
+A same-loaded-model **native / packed / packed / native** full-engine gate
+used two nodes, native attention, abliteration on, fixed speculative depth3,
+temperature0, seed42, maxcontext65,536 and a frozen 9,574-resident learned
+expert map. Each arm had one64-token code warmup, then160 tokens each of the
+existing `[req41420]` code and prose prompts. Graphs were released between
+arms; no learned history or prefix cache was written or reused.
+
+| Workload | Native tok/s (two arms) | Packed tok/s (two arms) | Native / packed mean wall ms/round | Accepted block, both |
+| --- | ---: | ---: | ---: | ---: |
+| Code | 29.25 / 29.71 | 29.66 / 30.49 | 91.43 / 89.62 | 2.71 |
+| Prose | 21.02 / 21.24 | 21.45 / 21.69 | 89.57 / 87.76 | 1.93 |
+
+Mean round throughput improved **2.02% code / 2.07% prose**. Tokens, step
+counts, acceptance, expert map and both rank outputs matched in all12 runs.
+Sixteen eager actual-activation head checks per rank were also bit-identical.
+Use these short results with their baseline drift; the head's30–37% component
+gain does not imply a similar engine gain or close the TensorFold speed gap.
+The first packed code prefill included JIT and took1.083s; the following warm
+one took0.419s versus native0.417–0.418s. Prefill throughput was not a target.
+
+Rejected prototypes are retained: direct native TC only saved~2% of head time;
+SIMT changed outputs; row-major byte-packed projection was slower; tiled
+byte-derived dot changed arithmetic. See the cancellation negative in
+`docs/gotchas.md`. The winner reads its packed bytes at roughly223GB/s,
+close to the unpacked kernel's measured bandwidth, so further tiny tile
+tuning was skipped.
+
+Artifacts: `results/head-native-20261008/` (native/packed screens and prefill
+fallback), `results/head-packed-asm-20261007/` (compiler arithmetic audit and
+width qualification), `results/head-packed-integration-20261008/` (both rank
+reports, ABBA summary and immutable source snapshot). Driver:
+`tools/bench_native_head_tp.py`. No additional quantization was introduced.
+
+### 2026-10-07 — Native MoE byte floor and low-U rewrite scope
+
+Read-only audit; no additional GPU/model/service benchmark was run. The
+corrected four-row profile contains **34.30 ms native routed FP4** and
+**10.26 ms FP8 shared-expert** kernel sums, with overlapping work. Thus the
+44.55 vs TensorFold 22.19 ms comparison does not establish a recoverable 2x
+native-kernel gain.
+
+The existing cold real layer-0 TP-output microbenchmark has 9,400,320 bytes
+per expert per rank, counting native FP4 codes and UE8M0 scales. Derived
+minimum-payload throughput is `U * 9,400,320 / (up_us + down_us) / 1000`:
+T4/U14 **609.3 us, 216.0 GB/s**; T4/U20 **852.6 us, 220.5 GB/s**;
+T6/U20 **866.4 us, 217.0 GB/s**. These are payload/time estimates, not DRAM
+counters. The deployed v2 already reads every weight row once per expert
+block and reuses its registers across members.
+
+Repeated-expert cells have more room: T4/U6 **437.3 us, 129.0 GB/s** and
+T6/U6 **573.7 us, 98.3 GB/s**. Reading six native experts at a reference
+223 GB/s takes 252.9 us, giving illustrative component ceilings of 1.73x
+and 2.27x. These are neither measured TC gains nor engine throughput claims.
+A generic full-K tensor-core dot changes the current arithmetic; an exact
+sparse-virtual-row group prototype must prove the existing even/odd FMA tree,
+FP16 activation conversion and four scaled ordered chains before timing.
+Existing `DOT_SCALED` results do not measure these cold TP-output low-U cells.
+
+CPU-only actual-code histograms over nine matrices (expert zero at layers
+0/20/39, w1/w2/w3) measured zero-order entropy **3.884–3.896 bits** including
+signed zero, leaving only 2.6–2.9% ideal code-byte saving before overhead.
+This rules out assuming BF16-head-like savings from simple symbol coding;
+it is not a bound on more elaborate conditional compression.
+
+Artifacts: existing `results/fp4-pairbatch-20261007/screen.json` and corrected
+`results/round-breakdown-20261007/corrected-grouping.json`; new CPU histogram
+`results/fp4-pairbatch-20261007/symbol-entropy.json`, reproducible with
+`tools/inspect_fp4_entropy.py`. No new runtime default or numerical policy
+was selected.
+
+### 2026-10-07 — Sparse native FP4 tensor-core proof and rejected helper cost
+
+Benchmark-only prototype `tools/fp4_group_tc.py` preserves native packed E2M1
+codes and BF16-to-FP16 activation conversion, then explicitly reconstructs
+the existing eight-leaf group reduction. Even/odd two-product MMAs changed
+**854/7,488** mixed-logrange raw FP32 outputs. The minimal counterexample is
+`1 + 1.5 * 2^-23`: CUDA RN-FMA gives `1 + 2^-22`, while the two-product MMA
+gives `1 + 2^-23`. Uniform-code and simple boundary tests had missed this.
+
+Four one-product MMAs plus explicit RN pair sums passed **35,776 finite raw
+FP32 comparisons**, including every finite-converted BF16 code, all 16 FP4
+codes, all 256 byte patterns, subnormals, signed zero and cancellation. The
+separate overflow report matched 32 output bit patterns on this GPU; no universal
+NaN/hardware equivalence is claimed.
+
+A captured hot component screen used 256 independent 32-K groups, N1152,
+32 calls per graph and six balanced quartets:
+
+| Members | Extracted native CUDA, us | Exact sparse MMA, us | Slowdown |
+| ---: | ---: | ---: | ---: |
+| 1 | 8.063 | 109.108 | 13.53x |
+| 2 | 15.220 | 108.539 | 7.13x |
+
+This prices only the group helper and layout work, not cold actual MoE or
+engine throughput. UE8M0 scales, four ordered full-K chains and the up/down
+epilogues are excluded. The sparse padded-MMA spelling has no measured case
+for a full-K extension, so the actual-weight/model campaign was skipped.
+Relayout remains a possible future direction; no serving kernel/default
+changed. The previously measured packed-head optimization remains separate.
+
+Artifacts: `results/fp4-group-tc-20261007/proof.json` (two-product failure),
+`single-products-proof.json` (passing raw gate and helper timing), qualified
+source and PTX snapshots. Reproduce with
+`tools/test_fp4_group_tc.py --single-products --timing --out <report.json>`;
+`tools/bench_fp4_sparse_tc.py` retains a gated cold driver for future qualified
+full-K candidates, but it was not run for this rejected prototype.
+

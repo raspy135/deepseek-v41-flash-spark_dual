@@ -7,10 +7,12 @@ two-lane TP scheduler batches independent speculative verification steps.
 Endpoints
     GET  /health
     GET  /expert-map           GET /v1/expert-map
+    GET  /decode-probe         (runtime decode dashboard)
     GET  /v1/models            GET /v1/models/{id}
     POST /v1/chat/completions  (stream and non-stream, tools, reasoning)
     POST /v1/completions       (raw prompt, stream and non-stream)
     POST /v1/debug/prompt      (render a chat request to prompt text + ids)
+    GET  /v1/decode-probe      POST /v1/decode-probe (arm, run, stop diagnostics)
 
 See README.md next to this file for the thinking/effort mapping.
 """
@@ -30,7 +32,8 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -71,6 +74,10 @@ class APIError(Exception):
     def body(self) -> dict:
         return {"error": {"message": self.message, "type": self.err_type,
                           "param": self.param, "code": self.code}}
+
+
+class ClientWriteError(Exception):
+    """A failed HTTP write, distinct from an engine or weight-file error."""
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +583,62 @@ class State:
     def request_context(self):
         return nullcontext() if self.scheduler is not None else self.lock
 
+    def _decode_probe_preflight(self, method):
+        if self.scheduler is not None:
+            raise APIError(501, 'Decode probe requires concurrency=1', code='decode_probe_unsupported')
+        if self.ep_fault:
+            raise APIError(503, f'Engine pair is faulted: {self.ep_fault}',
+                           err_type='server_error', code='engine_faulted')
+        call = getattr(self.engine, method, None)
+        if not callable(call):
+            raise APIError(501, 'Decode probe requires the native v41 engine',
+                           code='decode_probe_unsupported')
+        return call
+
+    def decode_probe_status(self):
+        """Cached metadata only: observer polls must never acquire the inference lock."""
+        call = self._decode_probe_preflight('decode_probe_status')
+        try:
+            return call()
+        except Exception as e:
+            raise APIError(500, f'Decode probe status failed: {e}',
+                           err_type='server_error', code='decode_probe_failed') from e
+
+    def decode_probe(self, body):
+        """Validate on the head, then dispatch one command to both ranks under the lock."""
+        call = self._decode_probe_preflight('decode_probe_command')
+        from engine.decode_probe import ProbeConfig
+        try:
+            opts = asdict(ProbeConfig.from_dict(body))
+            opts['names'] = list(opts['names'])
+            if opts['action'] == 'run':
+                # Omitted replay settings inherit the armed probe, rather than silently
+                # resetting its filters/budget to constructor defaults.
+                opts = {key: value for key, value in opts.items()
+                        if key == 'action' or key in body}
+        except (TypeError, ValueError) as e:
+            raise APIError(400, str(e), param='decode_probe', code='invalid_decode_probe') from e
+        if not self.lock.acquire(blocking=False):
+            raise APIError(409, 'Engine is busy; retry decode probe between requests',
+                           code='engine_busy')
+        try:
+            # A previous owner may have faulted the pair while this request was validating.
+            self._decode_probe_preflight('decode_probe_command')
+            if self.ep_active:
+                self.ep.broadcast_request({'cmd': 'decode_probe', 'body': opts})
+            # Expected local diagnostic failures are caught by the engine before its one
+            # unconditional rank gather. An exception here means that contract was broken.
+            return call(opts)
+        except APIError:
+            raise
+        except Exception as e:
+            self.ep_fault = f'decode probe command failed: {type(e).__name__}: {e}'
+            log.exception('decode probe command failed; engine is faulted')
+            raise APIError(503, self.ep_fault, err_type='server_error',
+                           code='engine_faulted') from e
+        finally:
+            self.lock.release()
+
     def cache_response(self, prompt_ids, result, *, thinking=False, vision=False):
         """Called only after a successful response is flushed, still under request_context.
 
@@ -989,6 +1052,11 @@ def _json_bytes(obj: Any) -> bytes:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dsv41-server/0.1"
+    # A disconnected harness once held the request lock in final SSE sendall for
+    # 902 seconds. Rank 1's idle collective expired at 600 seconds because the
+    # heartbeat could not acquire that lock. Bound socket I/O, not model runtime:
+    # a long prefill does no socket I/O and is unaffected by this timeout.
+    timeout = 30.0
 
     @property
     def state(self) -> State:
@@ -1001,6 +1069,14 @@ class Handler(BaseHTTPRequestHandler):
         log.info("%s %s", self.address_string(), fmt % args)
 
     # -- plumbing ----------------------------------------------------------
+    def _write_client(self, data: bytes) -> None:
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except OSError as e:
+            self.close_connection = True
+            raise ClientWriteError(str(e)) from e
+
     def _send_json(self, status: int, obj: Any, *, cache_control=None) -> None:
         data = _json_bytes(obj)
         self.send_response(status)
@@ -1010,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
         if cache_control is not None:
             self.send_header('Cache-Control', cache_control)
         self.end_headers()
-        self.wfile.write(data)
+        self._write_client(data)
 
     def _send_error(self, err: APIError) -> None:
         self._send_json(err.status, err.body())
@@ -1046,12 +1122,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _sse(self, obj: Any) -> None:
         payload = b"data: " + (obj if isinstance(obj, bytes) else _json_bytes(obj)) + b"\n\n"
-        self.wfile.write(f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n")
-        self.wfile.flush()
+        self._write_client(f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n")
 
     def _end_sse(self) -> None:
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        self._write_client(b"0\r\n\r\n")
 
     # -- routing -----------------------------------------------------------
     def do_OPTIONS(self) -> None:  # CORS preflight for browser clients
@@ -1066,21 +1140,24 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         st = self.state
         try:
-            if path == "/expert-map":
-                with open(os.path.join(HERE, 'expert_map.html'), 'rb') as page:
+            if path in ('/expert-map', '/decode-probe'):
+                filename = 'decode_probe.html' if path == '/decode-probe' else 'expert_map.html'
+                with open(os.path.join(HERE, filename), 'rb') as page:
                     data = page.read()
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                self._write_client(data)
             elif path == "/v1/expert-map":
                 from server.expert_map import snapshot
                 body = snapshot(st.engine, busy=st.lock.locked(), fault=st.ep_fault, model=st.model_name)
                 if body is None:
                     raise APIError(501, 'Expert map requires the native v41 engine')
                 self._send_json(200, body, cache_control='no-store')
+            elif path == '/v1/decode-probe':
+                self._send_json(200, st.decode_probe_status(), cache_control='no-store')
             elif path == "/health":
                 body = {"status": "degraded" if st.ep_fault else "ok",
                         "model": st.model_name, "engine": st.args.engine,
@@ -1099,7 +1176,7 @@ class Handler(BaseHTTPRequestHandler):
                         body["engine_config"] = cfg()
                     except Exception as e:  # never let introspection break the health probe
                         log.warning("engine.config() failed: %s", e)
-                self._send_json(200, body)
+                self._send_json(503 if st.ep_fault else 200, body)
             elif path == "/v1/models":
                 self._send_json(200, {"object": "list", "data": [self._model_card()]})
             elif path.startswith("/v1/models/"):
@@ -1110,6 +1187,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise APIError(404, f"no route for GET {path}")
         except APIError as e:
             self._send_error(e)
+
+        except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError):
+            log.info("client disconnected")
 
     def _model_card(self) -> dict:
         st = self.state
@@ -1126,11 +1206,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._completions(body)
             elif path == "/v1/debug/prompt":
                 self._debug_prompt(body)
+            elif path == '/v1/decode-probe':
+                self._send_json(200, self.state.decode_probe(body), cache_control='no-store')
             else:
                 raise APIError(404, f"no route for POST {path}")
         except APIError as e:
             self._send_error(e)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError):
             log.info("client disconnected")
         except Exception as e:  # anything else is a server bug
             log.exception("unhandled error")
@@ -1199,10 +1281,11 @@ class Handler(BaseHTTPRequestHandler):
             completed = False
             try:
                 self._sse(chunk({"role": "assistant", "content": ""}))
-                for kind, text in st.generate(prompt_ids, sampling, thinking=thinking, vl=vl,
-                                              detect_tool_calls=True, result=result, tools=tools,
-                                              user_prompt_ranges=focus.get('ranges')):
-                    self._sse(chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text}))
+                with closing(st.generate(prompt_ids, sampling, thinking=thinking, vl=vl,
+                                         detect_tool_calls=True, result=result, tools=tools,
+                                         user_prompt_ranges=focus.get('ranges'))) as events:
+                    for kind, text in events:
+                        self._sse(chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text}))
                 if result.tool_calls:
                     self._sse(chunk({"tool_calls": [dict(tc, index=i) for i, tc in enumerate(result.tool_calls)]}))
                 final_extra = {"usage": usage_dict(len(prompt_ids), result), "x_engine_stats": result.stats}
@@ -1213,8 +1296,8 @@ class Handler(BaseHTTPRequestHandler):
                 completed = True
             except APIError as e:
                 self._sse(e.body())
-            except (BrokenPipeError, ConnectionResetError):
-                log.info("client disconnected mid-stream after %d tokens", len(result.gen_ids))
+            except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+                log.info("client disconnected mid-stream after %d tokens (%s)", len(result.gen_ids), e)
                 return
             except Exception as e:
                 log.exception("engine error mid-stream")
@@ -1269,15 +1352,17 @@ class Handler(BaseHTTPRequestHandler):
             self._start_sse()
             completed = False
             try:
-                for _, text in st.generate(prompt_ids, sampling, thinking=False, detect_tool_calls=False, result=result):
-                    self._sse(obj(text, None))
+                with closing(st.generate(prompt_ids, sampling, thinking=False,
+                                         detect_tool_calls=False, result=result)) as events:
+                    for _, text in events:
+                        self._sse(obj(text, None))
                 self._sse(obj("", result.finish_reason,
                               {"usage": usage_dict(len(prompt_ids), result), "x_engine_stats": result.stats}))
                 completed = True
             except APIError as e:
                 self._sse(e.body())
-            except (BrokenPipeError, ConnectionResetError):
-                log.info("client disconnected mid-stream after %d tokens", len(result.gen_ids))
+            except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+                log.info("client disconnected mid-stream after %d tokens (%s)", len(result.gen_ids), e)
                 return
             except Exception as e:
                 log.exception("engine error mid-stream")
@@ -1379,8 +1464,18 @@ def run_worker(engine) -> None:
                 # This used to say "head stopped?" for every exception, which is how a plain idle
                 # timeout (600 s with no traffic) got reported as the head stopping, while rank 0
                 # was healthy and the next real request died on a closed gloo pair.
-                log.info("EP2 worker: broadcast failed (%s: %s) -- exiting", type(e).__name__, e)
-                break
+                log.error("EP2 worker: broadcast failed (%s: %s); communicator is unusable, exiting",
+                          type(e).__name__, e)
+                # A failed Gloo queue cannot be served again. Breaking here entered
+                # ep.destroy(), whose NCCL teardown can wait forever on an absent peer:
+                # the headless container stayed Up after its worker loop had stopped.
+                # Match the other fatal worker paths and let process exit reclaim resources.
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                os._exit(1)
             if req is None or req.get("cmd") == "shutdown":
                 break
             if req.get('cmd') == 'schedule':
@@ -1404,6 +1499,17 @@ def run_worker(engine) -> None:
                     engine.cache_response(req['prompt_ids'], req['response_ids'])
                 except Exception:
                     log.exception('post-response prefix worker failed; exiting')
+                    os._exit(1)
+                continue
+            if req.get('cmd') == 'decode_probe':
+                try:
+                    if runtime is not None:
+                        raise RuntimeError('decode probe requires concurrency=1')
+                    # The engine catches local diagnostic errors and both ranks reach its
+                    # final gather once, even when a replay/capture was rejected locally.
+                    engine.decode_probe_command(req['body'])
+                except Exception:
+                    log.exception('decode probe worker failed; pair is desynced, exiting')
                     os._exit(1)
                 continue
             if req.get("cmd") == "maintain":
@@ -1461,10 +1567,11 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
     while not stop.wait(interval):
         if state.ep_fault:
             return
-        try:
-            with state.lock:
-                if stop.is_set():
-                    return
+        with state.lock:
+            # A request may have faulted the pair while this tick waited for its lock.
+            if stop.is_set() or state.ep_fault:
+                return
+            try:
                 # The pair is idle here by construction: this holds the request lock, so no
                 # generate can be in flight, and the next one waits. That makes the keepalive
                 # tick the natural place to re-fit the resident experts to observed demand --
@@ -1473,9 +1580,12 @@ def _ep_heartbeat(state, interval: float, stop: threading.Event) -> None:
                 # with demand still unapplied (the last response's swaps were capped, say).
                 if not state.maintain_experts():
                     state.ep.broadcast_request({"cmd": "ping"})
-        except Exception as e:  # noqa: BLE001
-            log.warning("EP2 heartbeat failed (%s: %s); the pair is probably gone", type(e).__name__, e)
-            return
+            except Exception as e:  # noqa: BLE001
+                # Latch before releasing the request lock: otherwise a queued request can
+                # enter the broken collective, and /health still claims the pair is usable.
+                state.ep_fault = f"heartbeat failed: {type(e).__name__}: {e}"[:200]
+                log.warning("EP2 heartbeat failed (%s: %s); pair marked out of step", type(e).__name__, e)
+                return
 
 
 def _terminate(signum, frame):

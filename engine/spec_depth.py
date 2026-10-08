@@ -37,6 +37,14 @@ import statistics
 from collections import deque
 
 
+def verify_odd_enabled():
+    """Opt-in target widths 1/3/5, with the trained DSpark block unchanged."""
+    value = os.environ.get("DSV41_VERIFY_ODD", "0")
+    if value not in ("0", "1"):
+        raise ValueError("DSV41_VERIFY_ODD must be 0 or 1")
+    return value == "1"
+
+
 def confidence_depths(dynamic_depths=None):
     """Resolve the opt-in policy without importing CUDA."""
     value = os.environ.get("DSV41_BLOCK_CONFIDENCE", "0")
@@ -44,12 +52,16 @@ def confidence_depths(dynamic_depths=None):
         raise ValueError("DSV41_BLOCK_CONFIDENCE must be 0 or 1")
     if value == "0":
         return None
-    if dynamic_depths not in (None, (3, 5)):
-        raise ValueError("DSV41_BLOCK_CONFIDENCE requires DSV41_BLOCK_DYNAMIC=3,5 or unset")
+    odd = verify_odd_enabled()
+    allowed = tuple(range(1, 6)) if odd else (1, 3, 5)
+    if ((not odd and dynamic_depths not in (None, (3, 5)))
+            or (odd and dynamic_depths is not None and any(d not in allowed for d in dynamic_depths))):
+        raise ValueError("DSV41_BLOCK_CONFIDENCE requires depths in 1..5 with DSV41_VERIFY_ODD=1, "
+                         "otherwise DSV41_BLOCK_DYNAMIC=3,5 or unset")
     fixed = os.environ.get("DSV41_BLOCK", "").strip()
     if fixed not in ("", "off", "default", "5"):
         raise ValueError("DSV41_BLOCK_CONFIDENCE requires DSV41_BLOCK=5 or unset")
-    return (1, 3, 5)
+    return allowed
 
 
 class ConfidenceDepthPolicy:
@@ -68,11 +80,23 @@ class ConfidenceDepthPolicy:
     """
     depths = (1, 3, 5)
     priors = {1: .088, 3: .106, 5: .124}
-    VERSION = 2  # Sampled width selection is a proposal-prefix stopping rule.
+    VERSION = 4  # Opt-in intermediate depths preserve the sampled proposal-prefix rule.
 
     def __init__(self):
+        if verify_odd_enabled():
+            self.depths = (1, 2, 3, 4, 5)
+            # Interpolate the historical 1/3/5 priors only until this process
+            # measures the new widths. These are not claimed measurements.
+            self.priors = {1: .088, 2: .097, 3: .106, 4: .115, 5: .124}
         self._samples = {d: deque(maxlen=32) for d in self.depths}
         self.step_s = {d: None for d in self.depths}
+        self.refresh_interval = int(os.environ.get("DSV41_CONF_COST_REFRESH", "0"))
+        if self.refresh_interval < 0:
+            raise ValueError("DSV41_CONF_COST_REFRESH must be >= 0")
+        self._cost_age = dict.fromkeys(self.depths, 0)
+        self._refresh_depth = None
+        self._refresh_samples = 0
+        self.cost_refreshes = 0
         self.pinned = None  # qualification only
         self.reset_request()
 
@@ -95,8 +119,10 @@ class ConfidenceDepthPolicy:
         self.selection = "lookahead"
         if self.pinned is not None:
             if self.pinned not in self.depths:
-                raise ValueError("confidence depth must be 1, 3 or 5")
+                raise ValueError(f"confidence depth must be one of {self.depths}")
             target = self.pinned
+        elif (refresh := self._refresh_target()) is not None:
+            target = refresh
         elif len(logits) != 5 or any(not math.isfinite(x) for x in logits):
             self.invalid_confidence += 1
             target = 3
@@ -115,11 +141,11 @@ class ConfidenceDepthPolicy:
         return self._select(target)
 
     def choose_sampled(self, logits):
-        """Extend 1 -> 3 -> 5 using only a prefix already selected for verification.
+        """Extend the configured depths using an already selected proposal prefix.
 
         Confidence i depends on proposals BEFORE i (the Markov embedding), never
         proposal i. At depth d, confidence[d] is therefore safe to use when
-        deciding whether to include the NEXT two proposals. Estimate both added
+        deciding whether to include the next proposals. Estimate their added
         confidences from that boundary score instead of peeking at their tokens.
 
         This makes the block length a stopping time of the proposal prefix:
@@ -133,8 +159,11 @@ class ConfidenceDepthPolicy:
         self.selection = "prefix"
         if self.pinned is not None:
             if self.pinned not in self.depths:
-                raise ValueError("confidence depth must be 1, 3 or 5")
+                raise ValueError(f"confidence depth must be one of {self.depths}")
             return self._select(self.pinned)
+        refresh = self._refresh_target()
+        if refresh is not None:
+            return self._select(refresh)
         if len(logits) != 5:
             self.invalid_confidence += 1
             return self._select(3)
@@ -170,9 +199,36 @@ class ConfidenceDepthPolicy:
         self.depth = target
         return target
 
+    def _refresh_target(self):
+        """Occasionally remeasure an unselected width; never inspect draft tokens.
+
+        Three non-capture steps replace a stale estimate. Without this, an old
+        expensive depth 3 can block the sampled 1->3->5 policy indefinitely.
+        Opt-in: extra probes can cost throughput, so qualify before enabling.
+        """
+        if not self.refresh_interval:
+            return None
+        if self._refresh_depth is None:
+            depth = max(self.depths, key=lambda d: self._cost_age[d])
+            if self._cost_age[depth] < self.refresh_interval:
+                return None
+            self._refresh_depth = depth
+            self._refresh_samples = 0
+            self._samples[depth].clear()
+            self.step_s[depth] = None
+            self.cost_refreshes += 1
+        return self._refresh_depth
+
     def observe(self, depth, accepted, emitted, step_s):
         self.steps[depth] += 1
+        for d in self.depths:
+            self._cost_age[d] += 1
         if step_s is not None and math.isfinite(step_s) and step_s > 0:
+            self._cost_age[depth] = 0
+            if self._refresh_depth == depth:
+                self._refresh_samples += 1
+                if self._refresh_samples >= 3:
+                    self._refresh_depth = None
             samples = self._samples[depth]
             samples.append(step_s)
             self.step_s[depth] = statistics.median(samples) if len(samples) >= 3 else min(samples)
@@ -181,7 +237,8 @@ class ConfidenceDepthPolicy:
         return None  # per-step switches belong in aggregate stats, not the server log
 
     def report(self):
-        return {"policy": "confidence", "selection": self.selection, "depths": list(self.depths),
+        return {"policy": "confidence", "selection": self.selection,
+                "cost_refresh_interval": self.refresh_interval, "cost_refreshes": self.cost_refreshes, "depths": list(self.depths),
                 "steps": {str(d): n for d, n in self.steps.items()},
                 "switches": self.switches, "invalid_confidence": self.invalid_confidence,
                 "step_ms": {str(d): None if t is None else round(t * 1000, 1)

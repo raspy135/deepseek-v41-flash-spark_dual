@@ -551,6 +551,9 @@ def make_head(t: torch.Tensor):
     """`head.weight` in the format DSV41_HEAD_FMT asks for: a bf16 (or fp32) tensor, an FP8Weight
     or an FP4Weight. Every consumer goes through `head_logits` or `dense`, both of which dispatch
     on the object, so nothing else has to know which one it got."""
+    from engine.native_head import validate_config, make_packed_head
+    if validate_config() == 'packed':
+        return make_packed_head(t.to(torch.bfloat16).contiguous())
     if os.environ.get("DSV41_HEAD_FP32", "0") == "1":
         assert head_fmt() == "bf16", "DSV41_HEAD_FP32=1 and DSV41_HEAD_FMT are mutually exclusive"
         return t.float()
@@ -608,6 +611,8 @@ def head_logits(x: torch.Tensor, head) -> torch.Tensor:
     dequant + cuBLAS above it; DSV41_HEAD_PREFILL=kernel runs the kernel at every M instead."""
     if hasattr(head, 'tp_logits'):
         return head.tp_logits(x)
+    if hasattr(head, 'native_logits'):
+        return head.native_logits(x)
     quant = ((FP8Weight is not None and isinstance(head, FP8Weight))
              or (FP4Weight is not None and isinstance(head, FP4Weight)))
     if quant:
@@ -637,6 +642,8 @@ def mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
     if hasattr(w, 'tp_linear'):
         return w.tp_linear(x)
+    if hasattr(w, 'native_logits'):
+        return w.native_logits(x).to(torch.bfloat16)
     if (FP8Weight is not None and isinstance(w, FP8Weight)) or (FP4Weight is not None and isinstance(w, FP4Weight)):
         return dense(x, w)  # quantized-weight kernel; row-invariant by construction, not row-tiled
     B = MM_TILE
@@ -698,6 +705,8 @@ def dense(x: torch.Tensor, w) -> torch.Tensor:
     FP8Weight: the Triton kernel for decode-sized M, otherwise a transient bf16 dequant + cuBLAS.
     FP4Weight: the Triton kernel at every M (BLOCK_M 16 / 64); DSV41_FP4_DENSE_PREFILL=dequant
     restores the transient-dequant + cuBLAS shape of the fp8 path for M > 16."""
+    if hasattr(w, 'native_logits'):
+        return w.native_logits(x).to(torch.bfloat16)
     if FP4Weight is not None and isinstance(w, FP4Weight):
         if x.numel() // x.shape[-1] <= 16 or os.environ.get("DSV41_FP4_DENSE_PREFILL", "kernel") == "kernel":
             return fp4_linear(x, w)

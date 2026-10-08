@@ -20,6 +20,8 @@ checks torch.equal against the torch spellings on real shapes, in and out of CUD
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -176,6 +178,27 @@ def _router_post_kernel(WTS, SUM, OUT, SCALE, K: tl.constexpr, KB: tl.constexpr)
 
 
 @triton.jit
+def _router_gather_post_kernel(SCORES, IDX, OUT, E, SCALE):
+    """Exact six-way torch CUDA reduction: ((w0+w4)+w2)+((w1+w5)+w3).
+
+    Keep cuBLAS and torch.topk unchanged (including their near-ties). This only
+    removes the gathered tensor and two launches; random/adversarial and graph
+    tests must be rerun if PyTorch changes its small-row reduction geometry.
+    """
+    t = tl.program_id(0)
+    w0 = tl.load(SCORES + t * E + tl.load(IDX + t * 6))
+    w1 = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + 1))
+    w2 = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + 2))
+    w3 = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + 3))
+    w4 = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + 4))
+    w5 = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + 5))
+    denom = ((w0 + w4) + w2) + ((w1 + w5) + w3) + 1e-20
+    for j in tl.static_range(6):
+        w = tl.load(SCORES + t * E + tl.load(IDX + t * 6 + j))
+        tl.store(OUT + t * 6 + j, libdevice.div_rn(w, denom) * SCALE)
+
+
+@triton.jit
 def _softmax_pre_kernel(S, MASK, P, MX, H, N, s_t, s_h, s_n, SCALE, BN: tl.constexpr):
     """x = where(mask, s * scale, -inf); mx = max(amax(x), -1e30); p = exp(x - mx) -- the torch
     decode attention's elementwise ops; amax is exact in any order, exp is libdevice's."""
@@ -283,6 +306,30 @@ class LeanOps:
         self.hc_mm_tile = int(hc_mm_tile)
         self._bufs: dict = {}
         self._wf: dict = {}
+        self.fused_router_tail = os.environ.get("DSV41_ROUTER_FUSED_TAIL", "0") == "1"
+        value = os.environ.get("DSV41_ROUTER_BF16", "0")
+        if value not in ("0", "1"):
+            raise ValueError("DSV41_ROUTER_BF16 must be 0 or 1")
+        self.router_bf16 = value == "1"
+        self.router_weights = {}
+
+    def prepare_router_weights(self, weights):
+        """Validate/retain original BF16 gate values before any graph capture.
+
+        Opt-in arithmetic experiment: 60–61 -> 19 us per cold gate on GB10,
+        but its FP32 rounding is different and is not a quality-equivalence claim.
+        """
+        if not self.router_bf16:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("BF16 router weights must be prepared outside capture")
+        for w in weights:
+            if id(w) in self.router_weights:
+                continue
+            bf = w.to(torch.bfloat16)
+            if not torch.equal(w, bf.float()):
+                raise ValueError("BF16 router requires exactly BF16-representable checkpoint gates")
+            self.router_weights[id(w)] = bf
 
     def _buf(self, key, shape, dtype=torch.float32):
         b = self._bufs.get(key)
@@ -362,13 +409,20 @@ class LeanOps:
         """Model's decode router for `y` [T, dim] bf16 with the fp32 gate: top-k expert ids into
         `idx_out`, normalized weights into `w_out`. `keep` is the prune mask (or None) and
         `record(logits, scores)` the prune-miss accounting, fed the unmasked logits as before.
-        torch keeps what sets bits by order: the padded gate GEMM, topk, and the k-way sum."""
+        The default padded gate GEMM and topk stay unchanged. The optional six-way tail
+        reproduces torch's reduction order in one kernel; other k values keep torch.sum."""
         T = y.size(0)
         E = gate_w.shape[0]
-        pad = self._buf(("router", T), (self.mm_tile, gate_w.shape[1]))
-        pad[:T].copy_(y)
-        g = self._buf(("router_g", T), (self.mm_tile, E))
-        torch.mm(pad, gate_w.t(), out=g)
+        if self.router_bf16:
+            from router_bf16 import project
+            # BF16 is the checkpoint's value format, not a new quantization.
+            # Tensor-core FP32 accumulation still changes rounding versus cuBLAS.
+            g = project(y, self.router_weights[id(gate_w)], split=8)
+        else:
+            pad = self._buf(("router", T), (self.mm_tile, gate_w.shape[1]))
+            pad[:T].copy_(y)
+            g = self._buf(("router_g", T), (self.mm_tile, E))
+            torch.mm(pad, gate_w.t(), out=g)
         scores = torch.empty(T, E, dtype=torch.float32, device=y.device)
         logits = torch.empty_like(scores)
         masked = torch.empty_like(scores)
@@ -380,9 +434,13 @@ class LeanOps:
             record(logits, scores)
         vals = self._buf(("router_v", T, k), (T, k))
         torch.topk(masked, k, dim=-1, out=(vals, idx_out))
-        wts = scores.gather(1, idx_out)
-        _router_post_kernel[(T,)](wts, wts.sum(dim=-1, keepdim=True), w_out, float(route_scale), K=k,
-                                  KB=triton.next_power_of_2(k), num_warps=1, enable_fp_fusion=False, enable_reflect_ftz=False)
+        if self.fused_router_tail and k == 6:
+            _router_gather_post_kernel[(T,)](scores, idx_out, w_out, E, float(route_scale),
+                                             num_warps=1, enable_fp_fusion=False, enable_reflect_ftz=False)
+        else:
+            wts = scores.gather(1, idx_out)
+            _router_post_kernel[(T,)](wts, wts.sum(dim=-1, keepdim=True), w_out, float(route_scale), K=k,
+                                      KB=triton.next_power_of_2(k), num_warps=1, enable_fp_fusion=False, enable_reflect_ftz=False)
         return scores
 
     def attn_probs(self, s, mask, sink, scale: float):
@@ -415,14 +473,18 @@ class LeanOps:
         _block_null_kernel[(1,)](block_slot, n, int(null), NBB=triton.next_power_of_2(n), num_warps=1)
         return block_slot
 
-    def keys_f32(self, ring, slot_r, cache=None, idx=None):
+    def keys_f32(self, ring, slot_r, cache=None, idx=None, *, dtype=torch.float32):
         """The fp32 key block of the torch decode attention, [T, N1 (+ N2), D]: window rows
         ring[slot_r] and (optionally) the compressed rows gather(cache, idx), written in place
-        instead of gathered as bf16, concatenated and converted. 1-2 launches instead of 4."""
+        instead of gathered as bf16, concatenated and converted. 1-2 launches instead of 4.
+        Experimental tensor-core attention can request BF16 staging: all values were
+        BF16 before widening, so this only changes the scratch buffer's storage."""
+        if dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("key staging supports FP32 or BF16")
         T, n1 = slot_r.shape
         D = ring.shape[-1]
         n2 = 0 if idx is None else idx.shape[1]
-        out = torch.empty(T, n1 + n2, D, dtype=torch.float32, device=ring.device)
+        out = torch.empty(T, n1 + n2, D, dtype=dtype, device=ring.device)
         assert ring.dtype == torch.bfloat16 and ring.is_contiguous() and slot_r.is_contiguous()
         _ring_gather_f32_kernel[(T * n1,)](ring, slot_r, out, n1, n1 + n2, D=D, num_warps=4)
         if idx is not None:

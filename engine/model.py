@@ -306,6 +306,12 @@ class Weights:
         self.mtp = []
         for k in range(3 if load_mtp else 0):
             self.mtp.append(MTPWeights(get, k, args, device))
+            if os.environ.get('DSV41_TP_DRAFT_ATTN', '0') == '1':
+                from engine.tensor_parallel import shard_attention
+                if os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output') != 'output':
+                    raise ValueError('draft attention TP requires disjoint output layout')
+                shard_attention(self.mtp[-1], args, int(os.environ.get('RANK', '0')),
+                                int(os.environ.get('WORLD_SIZE', '1')))
         self.dspark_experts = None  # filled by the engine (arena of 3 x 128 experts)
         log(f"weights: all non-expert weights on GPU in {time.time() - t0:.0f}s")
 

@@ -291,6 +291,21 @@ __global__ void moe_down_bm16(
 #endif
 constexpr int kV2MaxGroups = 160;  // k <= 5120
 
+// Benchmark-only compile switch. 1 retains the deployed v2 kernels; 2 stages two routed
+// pairs' partials before replaying their independent ordered chains in parallel.
+// No loader/environment switch promotes this experimental spelling into serving.
+// Cold actual-weight TP-output screen (2026-10-07, rows 1/4/6): 84 intermediate/final
+// bit checks passed. At rows6/U6 up+down was 573.7 -> 518.1 us, but rows4/U14 was
+// 609.3 -> 620.0 us and rows6/U20 866.4 -> 884.3 us. Higher shared-memory occupancy
+// and workload mix prevent a general win; keep default 1. Even favorable cells imply
+// only a few milliseconds over 40 layers. tools/bench_fp4_pairbatch.py reproduces the
+// screen; results/fp4-pairbatch-20261007 preserves measurements and source snapshot.
+#ifndef FP4_V2_PAIR_BATCH
+#define FP4_V2_PAIR_BATCH 1
+#endif
+static_assert(FP4_V2_PAIR_BATCH == 1 || FP4_V2_PAIR_BATCH == 2,
+              "FP4_V2_PAIR_BATCH must be 1 or 2");
+
 __device__ __forceinline__ void load_activation32(const __nv_bfloat16 *p, float *xv) {
     // 32 consecutive BF16 activations with v1's load_activation4 conversion (BF16 -> FP16 -> FP32).
     const uint4 *q = reinterpret_cast<const uint4 *>(p);
@@ -480,6 +495,163 @@ __global__ void moe_down_bm16_v2(
     }
 }
 
+#if FP4_V2_PAIR_BATCH == 2
+// Keep group_partial and ordered_chain unchanged. The extra pair axis changes scheduling and
+// synchronization only: each pair keeps exactly v2's products, reduction tree, K-chain order,
+// and the same BF16 boundaries. Weights/scales are still loaded once per expert/output row.
+__global__ void moe_up_bm16_v2_pairbatch(
+    const __nv_bfloat16 *__restrict__ x,
+    const uint8_t *__restrict__ w1, const uint8_t *__restrict__ s1,
+    const uint8_t *__restrict__ w3, const uint8_t *__restrict__ s3,
+    __nv_bfloat16 *__restrict__ h, const float *__restrict__ route_weight,
+    const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
+    int64_t stride_x, int64_t stride_h, float limit,
+    int topk, int n, int k, int null_slot) {
+    constexpr int PB = 2, kPerLane = kV2MaxGroups / 32;
+    __shared__ float part_s[kWarps][PB][2][kV2MaxGroups];
+    __shared__ float scale_s[kWarps][2][kV2MaxGroups];
+    __shared__ float chain_s[kWarps][PB][8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0 || slot_i == null_slot) return;
+    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    if (out_n >= n) return;
+    const int groups = k >> 5;
+    const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+    const uint8_t *w1_row = w1 + row * (k >> 1), *w3_row = w3 + row * (k >> 1);
+    uint4 p1[kPerLane], p3[kPerLane];
+#pragma unroll
+    for (int r = 0; r < kPerLane; ++r) {
+        const int g = lane + 32 * r;
+        if (g < groups) {
+            p1[r] = reinterpret_cast<const uint4 *>(w1_row)[g];
+            p3[r] = reinterpret_cast<const uint4 *>(w3_row)[g];
+            scale_s[warp][0][g] = ue8m0(s1[row * groups + g]);
+            scale_s[warp][1][g] = ue8m0(s3[row * groups + g]);
+        }
+    }
+    for (int m = 0; m < kBlockM; m += PB) {
+        int routes[PB];
+#pragma unroll
+        for (int b = 0; b < PB; ++b)
+            routes[b] = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m + b];
+        if (routes[0] < 0) break;
+#pragma unroll
+        for (int b = 0; b < PB; ++b) {
+            if (routes[b] >= 0) {
+                const __nv_bfloat16 *xr = x + static_cast<int64_t>(routes[b] >> 16) * stride_x;
+#pragma unroll
+                for (int r = 0; r < kPerLane; ++r) {
+                    const int g = lane + 32 * r;
+                    if (g < groups) {
+                        float xv[32];
+                        load_activation32(xr + g * 32, xv);
+                        part_s[warp][b][0][g] = group_partial(p1[r], xv);
+                        part_s[warp][b][1][g] = group_partial(p3[r], xv);
+                    }
+                }
+            }
+        }
+        __syncwarp();
+        const int b = lane >> 3, c = lane & 7;
+        if (b < PB && routes[b] >= 0)
+            chain_s[warp][b][c] = ordered_chain(part_s[warp][b][c >> 2],
+                                               scale_s[warp][c >> 2], groups, c & 3);
+        __syncwarp();
+        if (b < PB && c == 0 && routes[b] >= 0) {
+            const float *v = chain_s[warp][b];
+            const float gate = ((v[0] + v[1]) + v[2]) + v[3];
+            const float up = ((v[4] + v[5]) + v[6]) + v[7];
+            float g = __bfloat162float(__float2bfloat16_rn(gate));
+            float u = __bfloat162float(__float2bfloat16_rn(up));
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+            const int pair = routes[b] & 0xffff;
+            const float value = silu_like_triton(g) * u * route_weight[pair];
+            h[static_cast<int64_t>(pair) * stride_h + out_n] = __float2bfloat16_rn(value);
+        }
+        __syncwarp();
+    }
+}
+
+__global__ void moe_down_bm16_v2_pairbatch(
+    const __nv_bfloat16 *__restrict__ h,
+    const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
+    float *__restrict__ y, const int32_t *__restrict__ block_slot,
+    const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    constexpr int PB = 2, kPerLane = kV2MaxGroups / 32;
+    __shared__ float part_s[kWarps][PB][kV2MaxGroups];
+    __shared__ float scale_s[kWarps][kV2MaxGroups];
+    __shared__ float chain_s[kWarps][PB][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0) return;
+    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    if (out_n >= n) return;
+    const int groups = k >> 5;
+    const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
+    const bool real = slot_i != null_slot;
+    uint4 pw[kPerLane];
+    if (real) {
+        const uint8_t *wr = w2 + row * (k >> 1);
+#pragma unroll
+        for (int r = 0; r < kPerLane; ++r) {
+            const int g = lane + 32 * r;
+            if (g < groups) {
+                pw[r] = reinterpret_cast<const uint4 *>(wr)[g];
+                scale_s[warp][g] = ue8m0(s2[row * groups + g]);
+            }
+        }
+    }
+    for (int m = 0; m < kBlockM; m += PB) {
+        int pairs[PB];
+#pragma unroll
+        for (int b = 0; b < PB; ++b)
+            pairs[b] = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m + b];
+        if (pairs[0] < 0) break;
+        if (real) {
+#pragma unroll
+            for (int b = 0; b < PB; ++b) {
+                if (pairs[b] >= 0) {
+                    const __nv_bfloat16 *hr = h + static_cast<int64_t>(pairs[b]) * stride_h;
+#pragma unroll
+                    for (int r = 0; r < kPerLane; ++r) {
+                        const int g = lane + 32 * r;
+                        if (g < groups) {
+                            float xv[32];
+                            load_activation32(hr + g * 32, xv);
+                            part_s[warp][b][g] = group_partial(pw[r], xv);
+                        }
+                    }
+                }
+            }
+            __syncwarp();
+            const int b = lane >> 2, c = lane & 3;
+            if (b < PB && pairs[b] >= 0)
+                chain_s[warp][b][c] = ordered_chain(part_s[warp][b], scale_s[warp], groups, c);
+            __syncwarp();
+        }
+        const int b = lane >> 2;
+        if (b < PB && (lane & 3) == 0 && pairs[b] >= 0) {
+            float value = 0.0f;
+            if (real) {
+                const float *v = chain_s[warp][b];
+                value = ((v[0] + v[1]) + v[2]) + v[3];
+            }
+            const int local_n = n / parts_world;
+            const int64_t out_row = static_cast<int64_t>(pairs[b] % topk) * ntok + pairs[b] / topk;
+            const int64_t offset = parts_world > 1
+                ? ((out_n / local_n) * static_cast<int64_t>(topk * ntok) + out_row) * local_n + out_n % local_n
+                : out_row * stride_y + out_n;
+            if (!partial) value = __bfloat162float(__float2bfloat16_rn(value));
+            y[offset] = value;
+        }
+        __syncwarp();
+    }
+}
+#endif
+
 __global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
                                  int32_t *block_pair, int32_t *block_route,
                                  int pairs, int topk) {
@@ -573,7 +745,11 @@ extern "C" int fp4_moe_cuda_up_v2(
     int null_slot) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+#if FP4_V2_PAIR_BATCH == 2
+    moe_up_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+#else
     moe_up_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+#endif
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
         static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
@@ -589,7 +765,11 @@ extern "C" int fp4_moe_cuda_down_v2(
     int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+#if FP4_V2_PAIR_BATCH == 2
+    moe_down_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+#else
     moe_down_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+#endif
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),

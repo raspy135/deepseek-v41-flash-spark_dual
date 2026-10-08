@@ -18,7 +18,11 @@ import triton
 import triton.language as tl
 
 MB = int(os.environ.get("DSV41_L2PF_MB", "2"))
-VERSION = 2  # Raw-byte loads: FP8 storage must not enter Triton's masked-load casts.
+MODE = os.environ.get("DSV41_L2PF_MODE", "touch")
+PACE_GBPS = int(os.environ.get("DSV41_L2PF_PACE_GBPS", "0"))
+if MODE not in ("touch", "bulk") or PACE_GBPS < 0:
+    raise ValueError("L2 prefetch mode must be touch/bulk and pace >= 0")
+VERSION = 3  # Raw-byte loads: FP8 storage must not enter Triton's masked-load casts.
 _SINK = None
 
 
@@ -28,6 +32,31 @@ def _touch(P, SINK, N, BLOCK: tl.constexpr):
     i = pid * BLOCK + tl.arange(0, BLOCK)
     v = tl.load(P + i, mask=i < N, other=0, eviction_policy="evict_last")
     tl.store(SINK + pid, tl.sum(v.to(tl.float32), 0))
+
+
+@triton.jit
+def _bulk_prefetch(P, N: tl.constexpr, PACE: tl.constexpr, PIECE: tl.constexpr):
+    # A cache hint only; no weight writes and no requirement that prefetch finish
+    # before the consumer. Two CTAs issue 32 KiB pieces, optionally rate-limited.
+    pid = tl.program_id(0)
+    start = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", constraints="=l",
+                                     args=[], dtype=tl.uint64, is_pure=False, pack=1)
+    for piece in range(pid, tl.cdiv(N, PIECE), 2):
+        if PACE > 0:
+            due = start + (piece * PIECE // PACE).to(tl.uint64)
+            now = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", constraints="=l",
+                                           args=[], dtype=tl.uint64, is_pure=False, pack=1)
+            while now < due:
+                tl.inline_asm_elementwise("nanosleep.u32 32; mov.u32 $0, 0;", constraints="=r",
+                                          args=[], dtype=tl.int32, is_pure=False, pack=1)
+                now = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", constraints="=l",
+                                               args=[], dtype=tl.uint64, is_pure=False, pack=1)
+        count = tl.minimum(PIECE, N - piece * PIECE).to(tl.int32)
+        tl.inline_asm_elementwise(
+            "{ .reg .pred p; .reg .u32 t; mov.u32 t, %tid.x; setp.eq.u32 p,t,0; "
+            "@p cp.async.bulk.prefetch.L2.global [$1], $2; mov.u32 $0,0; }",
+            constraints="=r,l,r", args=[P + piece * PIECE, count], dtype=tl.int32,
+            is_pure=False, pack=1)
 
 
 def enabled() -> bool:
@@ -51,9 +80,11 @@ def raw(weight):
     return None
 
 
-def touch(stream, tensors, budget: int):
+def touch(stream, tensors, budget: int, *, mode=None, pace=None):
     """Read up to `budget` bytes of `tensors` on `stream` with evict_last, into a private sink."""
     global _SINK
+    mode = MODE if mode is None else mode
+    pace = PACE_GBPS if pace is None else pace
     if _SINK is None:
         _SINK = torch.zeros(8192, dtype=torch.float32, device="cuda")
     left = budget
@@ -69,5 +100,8 @@ def touch(stream, tensors, budget: int):
             take = min(flat.numel(), left)
             left -= take
             blocks = min(triton.cdiv(take, 4096), _SINK.numel())
-            _touch[(blocks,)](flat[:take], _SINK[:blocks], take, BLOCK=4096, num_warps=4)
+            if mode == "bulk" and flat.data_ptr() % 16 == 0 and take % 16 == 0:
+                _bulk_prefetch[(2,)](flat, take, pace, 32768, num_warps=1)
+            else:
+                _touch[(blocks,)](flat[:take], _SINK[:blocks], take, BLOCK=4096, num_warps=4)
     return budget - left

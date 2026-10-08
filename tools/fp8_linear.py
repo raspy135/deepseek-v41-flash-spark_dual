@@ -5,7 +5,8 @@ block), x bf16 [M, K]. The weights are never dequantized to bf16 in memory, whic
 bytes read per decode step and the resident footprint of the dense layers.
 
 Two tile shapes: BLOCK_M=16 for decode-sized M (padded up to 16 rows) and BLOCK_M=64 for prefill.
-Accumulation is fp32; the block scale is applied to the fp32 partial of each 32-wide K step.
+Weights are dequantized to bf16 inside each tile using their 32x32 power-of-two scales;
+the dot product accumulates in fp32 over fixed 128-wide K tiles (64 for unaligned K).
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ from triton.language.extra import libdevice
 # Read at call time so a benchmark can A/B arms inside one process; the EP2 boot guard pins it.
 DECODE_BLOCK_N = os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto")
 DECODE_WARPS = int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4"))
+# Native-weight decode optimization. Read at call time for the frozen-map A/B driver;
+# changing it in a live process requires releasing/rebuilding captured graphs on both ranks.
+DECODE_PIPELINE = os.environ.get("DSV41_FP8_DECODE_PIPELINE", "0") == "1"
 _DECODE_BLOCK_N_CHOICES = ("16", "32", "64", "128", "auto")
 if DECODE_BLOCK_N not in _DECODE_BLOCK_N_CHOICES:
     raise ValueError(f"DSV41_FP8_DECODE_BLOCK_N={DECODE_BLOCK_N!r}; use one of {_DECODE_BLOCK_N_CHOICES}")
@@ -54,7 +58,8 @@ def decode_block_n(n_cols: int, groups: int, device, policy: str | None = None) 
 
 
 @triton.jit
-def _act_qdq_tile(x, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+def _act_qdq_tile(x, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+                  BIT_SCALE: tl.constexpr = False):
     """v41_ref.act_qdq_fp8 on a [BLOCK_M, BLOCK_K] bf16 tile whose K offset is a multiple of 32.
 
     Bit-identical to the torch spelling, which is why each step is spelled the way it is:
@@ -78,9 +83,19 @@ def _act_qdq_tile(x, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
     # x * 2^-e: s = 2^e is a power of two, so the quotient and the product are the same real
     # number and round identically. The first version divided per element with div_rn inside the
     # K loop and was 2.3x SLOWER than the torch spelling (wq_a 56 -> 129 us, 2026-09-23).
-    e = libdevice.ceil(libdevice.log2(libdevice.div_rn(amax, 448.0)))
-    s = libdevice.exp2(e)[:, :, None]
-    inv = libdevice.exp2(-e)[:, :, None]
+    if BIT_SCALE:
+        # 448 = 1.75 * 2^8. For finite BF16 amax, ceil(log2(amax/448)) is its
+        # exponent minus eight, plus one only when its mantissa exceeds 1.75.
+        # The clamp also has a safe margin from that boundary. e is in [-22,120],
+        # so both powers of two are normal FP32. No approximate log or division.
+        bits = amax.to(tl.int32, bitcast=True)
+        e = ((bits >> 23) & 255) - 135 + ((bits & 0x7fffff) > 0x600000).to(tl.int32)
+        s = ((e + 127) << 23).to(tl.float32, bitcast=True)[:, :, None]
+        inv = ((127 - e) << 23).to(tl.float32, bitcast=True)[:, :, None]
+    else:
+        e = libdevice.ceil(libdevice.log2(libdevice.div_rn(amax, 448.0)))
+        s = libdevice.exp2(e)[:, :, None]
+        inv = libdevice.exp2(-e)[:, :, None]
     q = tl.minimum(tl.maximum(xg * inv, -448.0), 448.0)
     q = q.to(tl.float8e4nv).to(tl.float32) * s
     return tl.reshape(q, (BLOCK_M, BLOCK_K)).to(tl.bfloat16)
@@ -90,7 +105,7 @@ def _act_qdq_tile(x, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
 def _fp8_linear_kernel(X, W, S, Y, M, N, K,
                        stride_xm, stride_wn, stride_sn, stride_ym,
                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                       ACT_QDQ: tl.constexpr = False):
+                       ACT_QDQ: tl.constexpr = False, BIT_SCALE: tl.constexpr = False):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -105,12 +120,17 @@ def _fp8_linear_kernel(X, W, S, Y, M, N, K,
         kk = k0 + rk
         x = tl.load(X + rm[:, None] * stride_xm + kk[None, :], mask=m_mask[:, None] & (kk[None, :] < K), other=0.0)
         if ACT_QDQ:
-            x = _act_qdq_tile(x, BLOCK_M, BLOCK_K)
+            x = _act_qdq_tile(x, BLOCK_M, BLOCK_K, BIT_SCALE)
         w = tl.load(W + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & (kk[None, :] < K), other=0.0)
         # one ue8m0 scale per 32-wide K group: exact in bf16 (3 mantissa bits, power-of-two scale)
         s = tl.load(S + n_scale_row[:, None] * stride_sn + (k0 // 32 + rs)[None, :],
                     mask=n_mask[:, None] & ((k0 // 32 + rs)[None, :] < (K + 31) // 32), other=127).to(tl.int32)
-        scale = tl.exp2((s - 127).to(tl.float32)).to(tl.bfloat16)  # [BLOCK_N, BLOCK_K // 32]
+        if BIT_SCALE:
+            # Same exponent bias in UE8M0 and BF16; zero matches ex2.ftz's
+            # underflow at 2^-127, and 255 matches its overflow to infinity.
+            scale = (s << 7).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        else:
+            scale = tl.exp2((s - 127).to(tl.float32)).to(tl.bfloat16)
         w3 = tl.reshape(w.to(tl.bfloat16), (BLOCK_N, BLOCK_K // 32, 32)) * scale[:, :, None]
         wb = tl.reshape(w3, (BLOCK_N, BLOCK_K))
         acc += tl.dot(x, tl.trans(wb), out_dtype=tl.float32)
@@ -120,7 +140,8 @@ def _fp8_linear_kernel(X, W, S, Y, M, N, K,
 @triton.jit
 def _fp8_grouped_kernel(X, W, S, Y, T, R, K,
                         stride_xt, stride_xg, stride_wn, stride_sn, stride_yt, stride_yg,
-                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                        BIT_SCALE: tl.constexpr = False):
     """Per group g: Y[:, g, :] = X[:, g, :] @ W[g*R:(g+1)*R, :]^T, with W in the stored fp8 format.
 
     Same tiling as `_fp8_linear_kernel` plus a third grid axis for the group; a group is nothing
@@ -149,7 +170,10 @@ def _fp8_grouped_kernel(X, W, S, Y, T, R, K,
                     mask=n_mask[:, None] & (kk[None, :] < K), other=0.0)
         s = tl.load(S + n_scale_row[:, None] * stride_sn + (k0 // 32 + rs)[None, :],
                     mask=n_mask[:, None] & ((k0 // 32 + rs)[None, :] < n_sk), other=127).to(tl.int32)
-        scale = tl.exp2((s - 127).to(tl.float32)).to(tl.bfloat16)  # exact: e4m3 -> bf16 is exact, scale is a power of two
+        if BIT_SCALE:
+            scale = (s << 7).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        else:
+            scale = tl.exp2((s - 127).to(tl.float32)).to(tl.bfloat16)
         w3 = tl.reshape(w.to(tl.bfloat16), (BLOCK_N, BLOCK_K // 32, 32)) * scale[:, :, None]
         wb = tl.reshape(w3, (BLOCK_N, BLOCK_K))
         acc += tl.dot(x, tl.trans(wb), out_dtype=tl.float32)
@@ -319,10 +343,13 @@ def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16, act_qdq:
     BLOCK_M = 16 if decode else 64
     BLOCK_N = decode_block_n(W.N, 1, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
+    pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
     _fp8_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K, x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, ACT_QDQ=act_qdq,
-                             num_warps=DECODE_WARPS if decode else 4, num_stages=3)
+                             BIT_SCALE=pipeline,
+                             num_warps=DECODE_WARPS if decode else 4,
+                             num_stages=5 if pipeline and W.K >= 4096 else 3)
     return y.view(*shape[:-1], W.N)
 
 
@@ -374,12 +401,15 @@ def fp8_grouped_linear(x: torch.Tensor, W: FP8GroupedWeight) -> torch.Tensor:
     BLOCK_M = 16 if decode else 64
     BLOCK_N = decode_block_n(W.R, W.G, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
+    pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.R, BLOCK_N), triton.cdiv(T, BLOCK_M), W.G)
     _fp8_grouped_kernel[grid](x, W.w, W.s, y, T, W.R, W.K,
                               x.stride(0), x.stride(1), W.w.stride(0), W.s.stride(0),
                               y.stride(0), y.stride(1),
                               BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                              num_warps=DECODE_WARPS if decode else 4, num_stages=3)
+                              BIT_SCALE=pipeline,
+                              num_warps=DECODE_WARPS if decode else 4,
+                              num_stages=5 if pipeline and W.K >= 4096 else 3)
     return y
 
 
