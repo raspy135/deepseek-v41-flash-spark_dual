@@ -59,48 +59,46 @@ precision or a lower miss rate as an answer-quality guarantee.
 
 ## Performance
 
-Measured on two DGX Sparks on **2026-10-06**, using the live TTS-sized profile:
-9,574 resident experts, 90.2 GB/node, 512K context allocation, native dense
-precision, abliteration enabled, speculative depth 3/5, and adaptation active.
-Predictive prefill was in shadow mode. TTS remained loaded; concurrent speech
-generation was not part of this benchmark.
+Measured on two DGX Sparks on **2026-10-08** with the `.env.example` profile: 9,574
+resident experts, 90.2 GB/node, 512K context allocation, native dense precision,
+abliteration enabled, dynamic speculative depth and adaptation active. TTS was not loaded.
 
 | Workload | Decode speed | Time to first token |
 | --- | ---: | ---: |
-| Python LRU cache with TTL, thread safety and tests | **26.9 tok/s** (26.5–27.3) | 0.89 s |
-| Coastal-ecosystem essay | **18.5 tok/s** (17.8–19.2) | 0.87 s |
-| Uncached random 8K prompt | **23.2 tok/s** | 21.36 s |
+| Python LRU cache with TTL, thread safety and tests | **38.4 tok/s** (38.0–38.7) | 0.69 s |
+| Coastal-ecosystem essay | **25.4 tok/s** (25.2–25.7) | 0.85 s |
+| Angry Birds single-file HTML game | **52.7 tok/s** (52.6–52.8) | 0.25 s* |
+| Uncached random 8K prompt (2026-10-06, older profile) | 23.2 tok/s | 21.36 s |
 
-The 8K input contained 8,177 tokens and prefilled at **383 tok/s**. All measured
-requests reused zero cached prefix tokens. Code/prose figures are medians of two
-256-token runs after one warmup each; 8K is one run with 128 output tokens.
-Thinking was off, temperature zero, and output length fixed. Decode speed excludes
-time to first token. These are short throughput checks, not answer-quality tests
-or measurements of the larger 9,800-expert example. Prompt content, draft acceptance,
-expert history and cache reuse affect speed. See [full results](RESULTS.md).
+Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
+fixed output length. Decode speed excludes time to first token. *The HTML prompt reused
+its 62 cached prompt tokens; the others reused none. These are short throughput checks,
+not answer-quality tests. Prompt content, draft acceptance, expert history and cache reuse
+affect speed. See [full results](RESULTS.md).
 
-**2026-10-08** — `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`, then
-FP8 draft head + split Markov chain (`DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`,
-`DSV41_DRAFT_MARKOV_TP=1`), all in `.env.example`. 512-token greedy runs, median of two:
+Change from the same benchmark earlier on 2026-10-08:
 
-| Workload | Before | Switches | + Draft |
+| Workload | Before | Arithmetic switches | + Draft head/Markov split |
 | --- | ---: | ---: | ---: |
 | Coastal-ecosystem essay | 21.9 tok/s | 23.1 tok/s | **25.4 tok/s** |
 | Angry Birds HTML | 43.3 tok/s | 50.3 tok/s | **52.7 tok/s** |
 | Python LRU cache with TTL | 32.3 tok/s | 37.4 tok/s | **38.4 tok/s** |
 
-Paired 22-prompt averages: **+9%** and **+2.3%** ([RESULTS.md](RESULTS.md)).
+Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`; draft:
+`DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`, `DSV41_DRAFT_MARKOV_TP=1`. Paired
+22-prompt averages: **+9%** and **+2.3%**.
 
 Optional `DSV41_HEAD_KERNEL=packed` losslessly packs the native BF16 vocabulary
 head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
 decode round speed about **2%**, with identical tested tokens and acceptance.
-It requires `DSV41_DRAFT_HEAD_FMT=off` (or `bf16`); the example now enables it.
+The draft head must be `off`/`bf16` unless `DSV41_TP_DRAFT_HEAD=1` builds a separate
+FP8 draft shard; the example enables both.
 
 Reproduce an individual workload against a running server:
 
 ```bash
-python3 bench/bench.py --model deepseek --workload code --osl 256 \
-  --warmup 1 --runs 2 --temperature 0 --ignore-eos --label readme-20261006-code
+python3 bench/bench.py --model deepseek --workload code --osl 512 \
+  --warmup 1 --runs 2 --temperature 0 --ignore-eos --label readme-20261008-code
 ```
 
 ## Setup
