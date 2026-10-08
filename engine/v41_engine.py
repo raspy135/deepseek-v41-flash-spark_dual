@@ -707,15 +707,18 @@ class V41Engine:
 
         exl3_cls = None
         exl3_moe_fn = None
+        self.exl3_cuda = False
         if self.expert_format == "exl3":
             import exl3_moe as X3
             assert not sim_bits, "--sim-bits simulates a low-bit format inside an FP4 arena; it is " \
                                  "meaningless with --expert-format exl3"
             assert not self.moe_fallback, "DSV41_MOE_FALLBACK dequantizes native FP4; it does not apply to exl3"
             exl3_cls = X3.Exl3Arena
-            exl3_moe_fn = X3.moe_forward_exl3_ref
-            self.kernel = "exl3-ref"
-            log("using the EXL3 reference MoE (torch) for the routed experts; the packed kernels are P3/P4")
+            exl3_moe_fn = X3.moe_forward_exl3
+            self.exl3_cuda = X3.cuda_available()
+            self.kernel = "exl3-cuda" if self.exl3_cuda else "exl3-ref"
+            log("EXL3 routed experts: " + ("JIT CUDA decode kernel + reference prefill"
+                                            if self.exl3_cuda else "torch reference (no JIT kernel)"))
 
         def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
                    null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None,
@@ -907,6 +910,10 @@ class V41Engine:
                                                 transient_slots=16, io_threads=2, read_threads=4)
             log(f"EXL3 pack rank {self.store.pack.rank}/{self.store.pack.world}, header "
                 f"{self.store.pack.header_sha256()[:16]}, {self.expert_bytes / 1e6:.2f} MB/slot")
+            if self.exl3_cuda:
+                import exl3_moe_cuda as _XC
+                _XC.warm(self.arena)   # JIT + per-slot pointer tables before any graph capture
+                log("EXL3 CUDA kernel warm")
         else:
             self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
                                         io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
@@ -1420,11 +1427,12 @@ class V41Engine:
             # layer-B graph (engine/fastdecode.py::_layer_b), so the pair gets the same graphed
             # decode as one box. DSV41_FAST=0 is the escape hatch back to eager.
             from engine.fastdecode import FastDecoder
-            # The reference MoE does a host sync per layer (torch.unique(...).tolist()); a captured
-            # graph cannot contain one, so EXL3 runs the eager step until the packed kernels land.
+            # The reference MoE host-syncs per layer and cannot be captured; the JIT CUDA kernel
+            # can. So graphs follow the kernel, not the format.
+            exl3_eager = exl3_cls is not None and not self.exl3_cuda
             self.fast = FastDecoder(self.model, self, use_graphs=(
-                os.environ.get("DSV41_GRAPHS", "1") == "1" and exl3_cls is None))
-            if exl3_cls is not None:
+                os.environ.get("DSV41_GRAPHS", "1") == "1" and not exl3_eager))
+            if exl3_eager:
                 log("EXL3: CUDA graphs disabled (the reference MoE is not capturable); eager step")
             # Resident (device slot LUT) mode: every routable expert is in the arena, so routing
             # is a device gather and the whole layer captures as one graph.

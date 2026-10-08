@@ -165,6 +165,13 @@ common_flags=(
     -v "$ROOT/results:/app/results"
     -v "$ROOT/.triton-cache:/app/.triton"
 )
+# Dev loop: run engine/tools/server from the checkout instead of the baked image, so a change
+# needs a source sync (a few MB) and a container restart, not an 11 GB rebuild+ship. Off by
+# default; the deploy path keeps using the image. Requires the repo at $ROOT on BOTH boxes.
+if [[ "${DSV41_DEV_SOURCE:-0}" == "1" ]]; then
+    common_flags+=(-v "$ROOT/engine:/app/engine:ro" -v "$ROOT/tools:/app/tools:ro"
+                   -v "$ROOT/server:/app/server:ro")
+fi
 common_env=(
     -e WORLD_SIZE=2
     -e MASTER_ADDR="$MASTER_ADDR"

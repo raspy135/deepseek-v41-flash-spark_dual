@@ -82,8 +82,8 @@ def _ptrs(arena):
     cached = getattr(arena, "_cuda_ptrs", None)
     if cached is not None:
         return cached
-    if arena.tp_world != 1:
-        raise NotImplementedError("exl3_moe_cuda v1 supports tp_world=1")
+    if arena.tp_world not in (1, 2):
+        raise NotImplementedError("exl3_moe_cuda supports tp_world=1 or 2")
     dev = arena.t1.device
     s = arena.slots
     out = {}
@@ -96,30 +96,46 @@ def _ptrs(arena):
     return out
 
 
+def warm(arena) -> None:
+    """Build the JIT library and the per-slot pointer tables at boot, not inside a capture."""
+    _lib()
+    _ptrs(arena)
+
+
 @torch.no_grad()
 def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
                 swiglu_limit: float = 10.0) -> torch.Tensor:
-    """x bf16 [T, K] (K=5120), slot ids int32 [T, 6], weights fp32 [T, 6] -> fp32 [T, DIM].
+    """x bf16 [T, DIM], slot ids int32 [T, 6], weights fp32 [T, 6] -> fp32 [T, DIM].
 
-    Uses the arena's tensors directly; every routed slot must be loaded (all-resident / LUT path).
+    Every routed slot must be loaded (all-resident / LUT path).  Under TP-output each rank owns half
+    the intermediate columns and half the hidden outputs; the intermediate is all-gathered before the
+    down projection and the per-token totals after it, at the same points fp4_moe does.
+
+    Decode-shaped only: TF's group_kernel caps at 16 members a slot, so P must be <= 16 per slot.
     """
-    assert arena.tp_world == 1, "v1 is single-rank"
     T, K = slots.shape
     P = T * K
-    dim, inter = arena.shapes["suh1"][0], arena.shapes["suh2"][0]
+    dim, inter, down_n = arena.shapes["suh1"][0], arena.inter, arena.down_n
+    world = arena.tp_world
     assert x.shape == (T, dim) and x.dtype == torch.bfloat16
     dev = x.device
     p = _ptrs(arena)
-    if any(int(arena.bits[int(s)]) not in (2, 3) for s in torch.unique(slots).tolist()):
-        raise ValueError("exl3_moe_cuda: unloaded or unsupported slot")
+    if slots.numel() > 64:
+        raise ValueError("exl3_moe_cuda is decode-shaped (P<=64); use the prefill kernel")
+    # no torch.unique/.tolist() or any device->host sync here: this runs inside graph capture.
+
+    group = None
+    if world > 1:
+        from engine.collective_rails import group as _g
+        group = _g()
 
     xh0 = torch.empty((P, dim), dtype=torch.float16, device=dev)
     xh1 = torch.empty((P, dim), dtype=torch.float16, device=dev)
     z = torch.empty((2, P, inter), dtype=torch.float32, device=dev)
     xd = torch.empty((P, inter), dtype=torch.float16, device=dev)
-    zd = torch.empty((1, P, dim), dtype=torch.float32, device=dev)
-    y = torch.empty((P, dim), dtype=torch.float32, device=dev)
-    out = torch.empty((T, dim), dtype=torch.float32, device=dev)
+    zd = torch.empty((1, P, down_n), dtype=torch.float32, device=dev)
+    y = torch.empty((P, down_n), dtype=torch.float32, device=dev)
+    local = torch.empty((T, down_n), dtype=torch.float32, device=dev)
     uids = torch.empty((P,), dtype=torch.int32, device=dev)
     ucount = torch.empty((1,), dtype=torch.int32, device=dev)
     members = torch.empty((P, 16), dtype=torch.int32, device=dev)
@@ -144,15 +160,24 @@ def moe_forward(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, are
                      ctypes.c_void_p(arena.svh1.data_ptr()), ctypes.c_void_p(arena.svh3.data_ptr()),
                      ctypes.c_void_p(arena.suh2.data_ptr()), ctypes.c_void_p(xd.data_ptr()),
                      int(T), int(P), int(inter), 1, int(K), int(arena.slots), float(swiglu_limit), 1, st)
+    if world > 1:
+        gathered = torch.empty((world * P, inter), dtype=torch.float16, device=dev)
+        torch.distributed.all_gather_into_tensor(gathered, xd, group=group)
+        xd = gathered.view(world, P, inter).transpose(0, 1).reshape(P, world * inter)
+    down_k = world * inter
     lib.exl3m_grouped(ctypes.c_void_p(xd.data_ptr()), ctypes.c_void_p(xd.data_ptr()),
                       ctypes.c_void_p(p["t2p"].data_ptr()), ctypes.c_void_p(p["t2p"].data_ptr()),
                       ctypes.c_void_p(p["k2"].data_ptr()), ctypes.c_void_p(p["k2"].data_ptr()),
                       ctypes.c_void_p(uids.data_ptr()), ctypes.c_void_p(ucount.data_ptr()),
                       ctypes.c_void_p(members.data_ptr()), ctypes.c_void_p(zd.data_ptr()),
-                      int(inter), int(dim), int(P), 1, 16, int(K), int(P), 1, NT, WARPS, PF, 2, 10, CB_MUL1, st)
+                      int(down_k), int(down_n), int(P), 1, 16, int(K), int(P), 1, NT, WARPS, PF, 2, 10, CB_MUL1, st)
     lib.exl3m_down_combine(ctypes.c_void_p(zd.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
                            ctypes.c_void_p(arena.svh2.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                            ctypes.c_void_p(weights.reshape(-1).float().contiguous().data_ptr()),
-                           ctypes.c_void_p(out.data_ptr()),
-                           int(T), int(P), int(dim), 1, int(K), int(arena.slots), st)
-    return out
+                           ctypes.c_void_p(local.data_ptr()),
+                           int(T), int(P), int(down_n), 1, int(K), int(arena.slots), st)
+    if world == 1:
+        return local
+    out = torch.empty((world * T, down_n), dtype=torch.float32, device=dev)
+    torch.distributed.all_gather_into_tensor(out, local, group=group)
+    return out.view(world, T, down_n).transpose(0, 1).reshape(T, dim)

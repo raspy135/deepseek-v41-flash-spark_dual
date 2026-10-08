@@ -133,6 +133,34 @@ class Exl3Arena:
         return w1, w2, w3
 
 
+def cuda_available() -> bool:
+    """Whether the JIT EXL3 decode kernel can be used (nvcc + arch). Cached."""
+    global _CUDA
+    if _CUDA is None:
+        try:
+            import exl3_moe_cuda  # noqa: F401
+            _CUDA = True
+        except Exception:  # noqa: BLE001 - no toolchain / build failure -> reference only
+            _CUDA = False
+    return _CUDA
+
+
+_CUDA = None
+
+
+@torch.no_grad()
+def moe_forward_exl3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
+                     swiglu_limit: float = 10.0, out_dtype: torch.dtype = torch.bfloat16, **kwargs):
+    """Engine entry point. The CUDA kernel handles decode-sized calls (the graph path); the torch
+    reference covers prefill until the P4 kernel lands. The reference is NOT graph-capturable, so
+    prefill must stay eager (it is).
+    """
+    if cuda_available() and slots.numel() <= 64:
+        import exl3_moe_cuda as XC
+        return XC.moe_forward(x, slots, weights, arena, swiglu_limit).to(out_dtype)
+    return moe_forward_exl3_ref(x, slots, weights, arena, swiglu_limit, out_dtype=out_dtype)
+
+
 @torch.no_grad()
 def moe_forward_exl3_ref(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
                          arena: Exl3Arena, swiglu_limit: float = 10.0,
