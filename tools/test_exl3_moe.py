@@ -67,7 +67,7 @@ def main():
         for slot, (L, E) in enumerate(CASES):
             bits = bits_map[L]
             arena.load_slot(slot, rd.read_expert(L, E), bits)
-            ok(float(arena.bits[slot].item()) == bits, f"slot {slot} layer {L} expert {E} bits {bits:g}")
+            ok(float(arena.bits[slot]) == bits, f"slot {slot} layer {L} expert {E} bits {bits:g}")
             rec = arena.read_slot(slot)
             ok(rec["t1"].shape[-1] == R.tile_words(bits),
                f"slot {slot} trellis cut to {rec['t1'].shape[-1]} words "

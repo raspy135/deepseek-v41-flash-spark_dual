@@ -84,14 +84,16 @@ class Exl3Arena:
                 src = torch.tensor(np.asarray(src))      # copies, so a read-only pack view is fine
             dst = getattr(self, name)[slot]
             if name.startswith("t"):
-                w = src.shape[-1]
-                if w == dst.shape[-1]:
-                    dst.copy_(src.to(dst.dtype), non_blocking=non_blocking)
-                else:
-                    if w > dst.shape[-1]:
-                        raise ValueError(f"{name}: record is {w} wide, slot is {dst.shape[-1]}")
-                    dst.zero_()
-                    dst[..., :w].copy_(src.to(dst.dtype), non_blocking=non_blocking)
+                # Store the trellis COMPACT: a 2-bit tile is 16 uint32, not the 24 a 3-bit slot
+                # has room for. The CUDA kernel's tile stride is 4*K2 words, so a padded 2-bit
+                # slot would be addressed wrongly; compaction makes K2=4 and K2=6 both exact, and
+                # the per-slot trellis pointer makes the different strides legal.
+                flat, n = dst.reshape(-1), src.numel()
+                if n > flat.numel():
+                    raise ValueError(f"{name}: record {src.shape} does not fit slot {tuple(dst.shape)}")
+                if n < flat.numel():
+                    flat[n:].zero_()
+                flat[:n].copy_(src.reshape(-1).to(dst.dtype), non_blocking=non_blocking)
             else:
                 dst.copy_(src.to(dst.dtype), non_blocking=non_blocking)
         self.bits[slot] = int(bits)
@@ -109,7 +111,11 @@ class Exl3Arena:
         out = {}
         for name in self._tensors:
             t = getattr(self, name)[slot]
-            out[name] = t[..., :w] if name.startswith("t") else t
+            if name.startswith("t"):
+                n = int(np.prod(t.shape[:-1])) * w          # compact: drop any 3-bit padding
+                out[name] = t.reshape(-1)[:n].view(*t.shape[:-1], w)
+            else:
+                out[name] = t
         return out
 
     @torch.no_grad()

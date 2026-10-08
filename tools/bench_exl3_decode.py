@@ -22,6 +22,12 @@ import exl3_moe as X3  # noqa: E402
 import fp4_moe as F4  # noqa: E402
 from pack_exl3_experts import SourceCheckpoint  # noqa: E402
 
+try:
+    import exl3_moe_cuda as XC  # noqa: E402
+except Exception as _e:  # noqa: BLE001 - nvcc/toolchain missing is not fatal for the reference column
+    XC = None
+    print(f"exl3_moe_cuda unavailable ({_e!r}); skipping the kernel column")
+
 SRC = os.environ.get("EXL3_SOURCE", os.path.expanduser("~/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw"))
 E = int(os.environ.get("EXPERTS", "8"))
 TOPK = 6
@@ -62,16 +68,17 @@ def main():
 
     print(f"FP4 slot {f4.bytes_per_slot / 1e6:.2f} MB | EXL3 slot {x3.bytes_per_slot / 1e6:.2f} MB "
           f"| EXL3/FP4 = {x3.bytes_per_slot / f4.bytes_per_slot:.3f}x")
-    print(f"{'T':>3} {'P':>4} | {'FP4 triton ms':>13} {'EXL3 ref ms':>12} {'ref/FP4':>8}")
+    print(f"{ 'T':>3} {'P':>4} | {'FP4 ms':>9} {'EXL3 cu ms':>10} {'cu/FP4':>7} {'EXL3 ref ms':>12}")
     for T in (int(v) for v in (sys.argv[1:] or ["1", "2", "4", "6"])):
         P = T * TOPK
         slots = torch.randint(0, E, (T, TOPK), dtype=torch.int32, device=dev)
         w = torch.rand(T, TOPK, device=dev)
         x = (torch.randn(T, X3.DIM, dtype=torch.float32, device=dev) * 0.1).to(torch.bfloat16)
         fp4 = timed(lambda: F4.moe_forward(x, slots, w, f4, 10.0))
+        cu = timed(lambda: XC.moe_forward(x, slots, w, x3, 10.0)) if XC is not None else float("nan")
         ref = timed(lambda: X3.moe_forward_exl3_ref(x, slots, w, x3, 10.0, out_dtype=torch.bfloat16),
                     iters=2)
-        print(f"{T:>3} {P:>4} | {fp4:>13.3f} {ref:>12.2f} {ref / fp4:>7.0f}x")
+        print(f"{T:>3} {P:>4} | {fp4:>9.3f} {cu:>10.3f} {cu / fp4:>6.2f}x {ref:>12.2f}")
 
     # where the reference spends it: full fp64 dequant of one expert
     t = timed(lambda: x3.dequant_slot(0), iters=3)
