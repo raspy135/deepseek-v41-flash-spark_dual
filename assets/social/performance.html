@@ -24,35 +24,36 @@
   main { display: grid; grid-template-columns: 690px 1fr; gap: 56px; padding-top: 50px; }
   h1 { margin: 0; font-size: 92px; line-height: 1.02; letter-spacing: -4.8px; font-weight: 600; }
   h1 span { display: block; color: var(--quiet); font-size: 80px; letter-spacing: -3.8px; margin-top: 4px; }
-  .claim { margin-top: 26px; }
+  .claim { margin-top: 44px; }
   .claim .label { font-size: 25px; color: var(--quiet); }
   h2 { font-size: 58px; line-height: 1.05; letter-spacing: -2.2px; font-weight: 500; margin: 10px 0 14px; }
   /* marker underline: the highlight sits under the text, so the text keeps the left margin */
   h2 b { font-weight: 700; background: linear-gradient(transparent 56%, var(--green) 56%, var(--green) 94%, transparent 94%); }
   .description { font-size: 30px; line-height: 1.3; margin: 0; color: var(--quiet); }
 
-  .capabilities { display: grid; grid-template-columns: 335px 335px; gap: 16px; margin-top: 22px; }
+  .capabilities { display: grid; grid-template-columns: 335px 335px; gap: 14px 16px; margin-top: 38px; }
   .capability { padding: 14px 18px 15px; border: 2px solid var(--ink); }
   .capability.native { background: var(--green); border-color: var(--green); }
-  .capability strong { display: block; font-size: 28px; line-height: 1.1; letter-spacing: -1.1px; font-weight: 600; }
+  .capability strong { display: block; font-size: 30px; line-height: 1.1; letter-spacing: -1.1px; font-weight: 700; }
+  .capability.native span { color: var(--ink); }
   .capability span { display: block; margin-top: 6px; font-size: 19px; color: var(--quiet);
                      font-family: 'Courier New', monospace; text-transform: uppercase; letter-spacing: .5px; }
 
   .chart-heading { display: flex; justify-content: space-between; font-size: 27px; color: var(--quiet); margin-bottom: 16px; }
-  .panel { border: 2px solid var(--ink); background: var(--panel); padding: 22px 26px 20px; }
-  .group + .group { margin-top: 18px; padding-top: 16px; border-top: 2px dashed var(--faint); }
-  .group-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
-  .group-title strong { font-size: 38px; letter-spacing: -.8px; }
+  .panel { border: 2px solid var(--ink); background: var(--panel); padding: 16px 26px 16px; }
+  .group + .group { margin-top: 12px; padding-top: 10px; border-top: 2px dashed var(--faint); }
+  .group-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
+  .group-title strong { font-size: 34px; letter-spacing: -.8px; }
   .group-title .mono { font-size: 25px; color: var(--quiet); }
-  .row { display: grid; grid-template-columns: 178px 1fr 88px; align-items: center; gap: 14px; margin-top: 8px; }
+  .row { display: grid; grid-template-columns: 150px 1fr 88px; align-items: center; gap: 14px; margin-top: 6px; }
   .row .name { font-size: 29px; color: var(--quiet); }
-  .track { height: 40px; }
+  .track { height: 32px; }
   .fill { height: 100%; background: var(--bar); }
   .row.after .fill { background: var(--green); }
   .row.after .name, .row.after .value { color: var(--ink); }
-  .value { font-size: 38px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; color: var(--quiet); }
+  .value { font-size: 34px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; color: var(--quiet); }
   .delta { font-size: 27px; font-weight: 700; color: var(--ink); }
-  .note { margin-top: 14px; font-size: 27px; color: var(--quiet); }
+  .note { margin-top: 12px; font-size: 24px; color: var(--quiet); }
 
   footer { position: absolute; left: 72px; right: 72px; bottom: 40px; display: flex; justify-content: space-between;
            align-items: center; border-top: 2px solid var(--line); padding-top: 22px; }
@@ -65,7 +66,7 @@
 <div class="viewport">
 <div class="poster" id="poster">
   <header>
-    <div class="eyebrow mono">Local inference / Dual DGX Spark</div>
+    <div class="eyebrow mono">Dual DGX Spark</div>
     <div class="tag"><i></i>Decode performance</div>
   </header>
 
@@ -73,36 +74,41 @@
     <section>
       <h1>DeepSeek V4.1<span>on two Sparks.</span></h1>
       <div class="claim">
-        <div class="label mono">512-token output / TP = 2 / thinking off</div>
-        <h2><b>+54% decode.</b><br>Same checkpoint.</h2>
-        <p class="description">8,457 → 3,557 kernels a step, dense FP4,<br>and the cross-node gather on one-shot RoCE.</p>
+        <h2><b>+21–25% decode.</b><br>Same native weights.</h2>
       </div>
       <div class="capabilities">
-        <div class="capability native"><strong>Native MXFP4</strong><span>Original checkpoint</span></div>
-        <div class="capability"><strong>Adaptive experts</strong><span>Weights follow demand</span></div>
+        <div class="capability native"><strong>4-bit experts</strong><span>Native MXFP4, as shipped</span></div>
+        <div class="capability native"><strong>Full dense</strong><span>FP8 + BF16, no requant</span></div>
+        <div class="capability"><strong>512K context</strong><span>524,288 tokens</span></div>
+        <div class="capability"><strong>Vision input</strong><span>Images over OpenAI API</span></div>
       </div>
     </section>
 
     <section>
-      <div class="chart-heading mono"><span>Decode tokens / s</span><span>TP = 2</span></div>
+      <div class="chart-heading mono"><span>Decode tokens / s</span><span>Oct 8 / TP = 2</span></div>
       <div class="panel">
         <div class="group">
-          <div class="group-title"><strong>Code</strong><span class="mono">Python module</span></div>
-          <div class="row"><span class="name mono">Sep 22</span><div class="track"><div class="fill" style="width:64.9%"></div></div><span class="value">24.2</span></div>
-          <div class="row after"><span class="name mono">Oct 1</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="value">37.3</span></div>
+          <div class="group-title"><strong>Code</strong><span class="delta">+25%</span></div>
+          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:60.5%"></div></div><span class="value">32.3</span></div>
+          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:75.7%"></div></div><span class="value">40.4</span></div>
         </div>
         <div class="group">
-          <div class="group-title"><strong>Prose</strong><span class="mono">Explanation</span></div>
-          <div class="row"><span class="name mono">Sep 22</span><div class="track"><div class="fill" style="width:42.9%"></div></div><span class="value">16.0</span></div>
-          <div class="row after"><span class="name mono">Oct 1</span><div class="track"><div class="fill" style="width:61.9%"></div></div><span class="value">23.1</span></div>
+          <div class="group-title"><strong>Prose</strong><span class="delta">+21%</span></div>
+          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:41.0%"></div></div><span class="value">21.9</span></div>
+          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:49.4%"></div></div><span class="value">26.4</span></div>
         </div>
-        <div class="note">Dense-projection change re-quantizes; kernel and transport changes are bit-identical.</div>
+        <div class="group">
+          <div class="group-title"><strong>HTML game</strong><span class="delta">+23%</span></div>
+          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:81.1%"></div></div><span class="value">43.3</span></div>
+          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="value">53.4</span></div>
+        </div>
+        <div class="note">Faster attention, router, HC mixes, FP8 tiles and draft pass. Paired 22-prompt estimate: +19%.</div>
       </div>
     </section>
   </main>
 
   <footer>
-    <div class="features">Native MXFP4<span>/</span>Adaptive expert loading<span>/</span>RoCE all-gather<span>/</span>OpenAI API</div>
+    <div class="features">Adaptive expert loading<span>/</span>RoCE all-gather<span>/</span>OpenAI API</div>
     <div class="stack mono">PyTorch / Triton / CUDA</div>
   </footer>
 </div>

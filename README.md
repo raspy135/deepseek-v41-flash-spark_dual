@@ -65,9 +65,9 @@ abliteration enabled, dynamic speculative depth and adaptation active. TTS was n
 
 | Workload | Decode speed | Time to first token |
 | --- | ---: | ---: |
-| Python LRU cache with TTL, thread safety and tests | **38.4 tok/s** (38.0–38.7) | 0.69 s |
-| Coastal-ecosystem essay | **25.4 tok/s** (25.2–25.7) | 0.85 s |
-| Angry Birds single-file HTML game | **52.7 tok/s** (52.6–52.8) | 0.25 s* |
+| Python LRU cache with TTL, thread safety and tests | **40.4 tok/s** (39.2–41.6) | 0.74 s |
+| Coastal-ecosystem essay | **26.4 tok/s** (26.4–26.5) | 1.18 s |
+| Angry Birds single-file HTML game | **53.4 tok/s** (52.0–54.9) | 0.23 s* |
 | Uncached random 8K prompt (2026-10-06, older profile) | 23.2 tok/s | 21.36 s |
 
 Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
@@ -78,15 +78,17 @@ affect speed. See [full results](RESULTS.md).
 
 Change from the same benchmark earlier on 2026-10-08:
 
-| Workload | Before | Arithmetic switches | + Draft head/Markov split |
-| --- | ---: | ---: | ---: |
-| Coastal-ecosystem essay | 21.9 tok/s | 23.1 tok/s | **25.4 tok/s** |
-| Angry Birds HTML | 43.3 tok/s | 50.3 tok/s | **52.7 tok/s** |
-| Python LRU cache with TTL | 32.3 tok/s | 37.4 tok/s | **38.4 tok/s** |
+| Workload | Before | Arithmetic switches | + Draft | + Kernels |
+| --- | ---: | ---: | ---: | ---: |
+| Coastal-ecosystem essay | 21.9 tok/s | 23.1 tok/s | 25.4 tok/s | **26.4 tok/s** |
+| Angry Birds HTML | 43.3 tok/s | 50.3 tok/s | 52.7 tok/s | **53.4 tok/s** |
+| Python LRU cache with TTL | 32.3 tok/s | 37.4 tok/s | 38.4 tok/s | **40.4 tok/s** |
 
-Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`; draft:
-`DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`, `DSV41_DRAFT_MARKOV_TP=1`. Paired
-22-prompt averages: **+9%** and **+2.3%**.
+Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`. Draft:
+`DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`, `DSV41_DRAFT_MARKOV_TP=1`,
+`DSV41_TP_DRAFT_ATTN=1`. Kernels: `DSV41_FP8_DECODE_BLOCK_N=32`, `DSV41_FP8_DECODE_BLOCK_K=256`,
+`DSV41_LEAN_RMS_FUSED=1`, `DSV41_HC_FRONT_FUSED=1`. Paired 22-prompt averages: **+9%**,
+**+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**.
 
 Optional `DSV41_HEAD_KERNEL=packed` losslessly packs the native BF16 vocabulary
 head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
