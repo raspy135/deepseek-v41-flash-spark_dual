@@ -552,18 +552,6 @@ class V41Engine:
         if self.user_prompt_max_loads < 0:
             raise ValueError('DSV41_USER_PROMPT_MAX_LOADS must be nonnegative (0 is unlimited)')
         self.dynamic_experts = os.environ.get('DSV41_DYNAMIC_EXPERTS', '0') == '1'
-        if (expert_format or "fp4").lower() == "exl3":
-            # Adaptive residency (global swaps, request-unit adaptation, the predictive shadow) is
-            # native-FP4 only right now: it drives store.resolve() and the sector streams, which are
-            # not wired to the EXL3 pack yet. Serve the static pruned set instead. Rank-invariant
-            # (both ranks see expert_format=exl3) and recorded in the boot guard. The features stay
-            # on for fp4 and return for exl3 with the P3/P4 kernels.
-            if self.dynamic_experts:
-                log("EXL3: DSV41_DYNAMIC_EXPERTS is native-FP4 only; booting static pruned residency")
-                self.dynamic_experts = False
-            for _k in ("DSV41_RESIDENT_EXPERTS",):
-                if os.environ.pop(_k, None):
-                    log(f"EXL3: ignoring {_k} (it is a dynamic-residency budget)")
         from engine.expert_budget import resident_budget
         self.resident_budget = resident_budget(os.environ.get('DSV41_RESIDENT_EXPERTS', ''),
             dynamic=self.dynamic_experts, layers=self.args.n_layers,
@@ -636,9 +624,6 @@ class V41Engine:
         self.prefill_budget_last = {}
         from engine.predictive_prefill import PredictivePrefill
         self.predictive = PredictivePrefill(self.args.n_layers, self.args.n_routed_experts)
-        if (expert_format or "fp4").lower() == "exl3" and self.predictive.mode != 'off':
-            # predictive prefill requires dynamic_experts, which exl3 does not support yet
-            self.predictive.mode = 'off'
         # Serving preference, independent of the checkpoint's reference value (512).
         # Wider attention is experimental: no measured hallucination reduction is claimed.
         self.args.index_topk = int(os.environ.get("DSV41_INDEX_TOPK", "1024"))
@@ -1139,7 +1124,8 @@ class V41Engine:
         from engine.user_prompt import UserPrompt
         self.user_prompt = UserPrompt(self.user_prompt_stream, self.args.n_layers,
                                       self.args.n_routed_experts, device, self.user_prompt_max_loads, self.dynamic_experts)
-        if self.dynamic_experts and (not self.ep.tensor_parallel or self.kernel != 'triton-fp4'):
+        if self.dynamic_experts and (not self.ep.tensor_parallel
+                                    or (self.kernel != 'triton-fp4' and exl3_cls is None)):
             raise ValueError('dynamic expert allocation requires native FP4 tensor parallelism')
         if self.predictive.mode != 'off':
             if (not self.dynamic_experts or not self.ep.tensor_parallel or not ADAPT.request_unit
@@ -2070,8 +2056,6 @@ class V41Engine:
 
         Returns [(layer, expert_out, expert_in, gain), ...], best gain first.
         """
-        if getattr(self, "expert_format", "") == "exl3":
-            return []
         import numpy as np
         focus = getattr(self, 'user_prompt', None)
         if self._prune_trace is None or not getattr(self, "model_prune_mask", None):
@@ -2319,6 +2303,9 @@ class V41Engine:
         if not getattr(self.ep, 'tensor_parallel', False):
             raise RuntimeError('cross-layer sector transfers require TP')
         focus, st = self.user_prompt, self.store
+        # Under TP there is no null slot (that is an EP concept); a swapped-out expert is masked out
+        # of the routable set below, so -1 is only a placeholder the router can never gather.
+        null = st.null_slot if getattr(st, "null_slot", None) is not None else -1
         counts = {L:int(mask.sum()) for L,mask in self.model_prune_mask.items()}
         outgoing, incoming = set(), set()
         # Validate the complete plan against the original directory before I/O.
@@ -2344,7 +2331,7 @@ class V41Engine:
                 raise RuntimeError('global expert load failed; TP pair must stop') from exc
             st.lru[(Li,ei)] = slot
             st.slot_key[slot] = (Li,ei)
-            self.fast.lut[Lo,eo] = st.null_slot
+            self.fast.lut[Lo,eo] = null
             self.fast.lut[Li,ei] = slot
             self.model_prune_mask[Lo][eo] = False
             self.model_prune_mask[Li][ei] = True
@@ -2358,7 +2345,7 @@ class V41Engine:
                 ids = torch.full_like(routes[L][0], len(owned))
                 for i,(e,_) in enumerate(owned):
                     ids[e] = i
-                slots = torch.tensor([s for _,s in owned]+[st.null_slot],
+                slots = torch.tensor([s for _,s in owned]+[null],
                                      dtype=torch.int32, device=ids.device)
                 routes[L] = (ids,slots)
         if torch.cuda.is_available():
@@ -2381,10 +2368,6 @@ class V41Engine:
         be captured too; once per idle tick is often enough for a half-life measured in millions
         of slots, and it keeps the hot path untouched.
         """
-        if getattr(self, "expert_format", "") == "exl3":
-            # EXL3 runs the static pruned set; the swap machinery is native-FP4 (null/sector
-            # semantics, FP4 kernels) and is not wired to the pack yet. Rank-invariant.
-            return False
         if not ADAPT.swap:
             return False
         rep = self.model.prune_miss_report()
