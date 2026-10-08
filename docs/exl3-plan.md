@@ -1,6 +1,7 @@
 # Plan: EXL3 routed experts with adaptive residency
 
-Status: plan only (2026-10-08). Nothing here is implemented. Written for an agent working in this
+Status: P0-P2 implemented and unit-tested (2026-10-08); the P3/P4 packed kernels and the P5
+boot/measurement gates are still pending. Written for an agent working in this
 repository; read `CLAUDE.md`, `docs/gotchas.md` (especially the 2026-10-07/08 entries) and the
 last `RESULTS.md` sections first.
 
