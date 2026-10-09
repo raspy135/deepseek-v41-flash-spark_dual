@@ -1,11 +1,17 @@
 # DeepSeek-V4.1-Flash on two DGX Sparks
 
-A fork of [0xBakeer's engine](https://github.com/0xBakeer/deepseek-v41-flash-spark)
-with **two-node tensor parallelism (TP2)** and adaptive expert loading. Routed
-experts default to an **EXL3 2.9 bpw** pack that fits 1.4x as many experts in the same
-memory; the checkpoint's **native MXFP4** experts remain a supported profile on the same
-image and scripts. The OpenAI-compatible API supports streaming responses, thinking,
-tool calls and images.
+Serves DeepSeek-V4.1-Flash across two DGX Sparks with **adaptive expert residency** and a
+**negotiable memory budget**. The 15,360 routed experts do not all fit; which ones stay
+resident is learned from live router demand and re-planned while the server runs, and
+one shared arena lets busy layers take slots from quiet ones. The arena's size is a single
+knob you trade against context length and whatever else shares the boxes.
+
+The pair runs **two-node tensor parallelism (TP2)** over RoCE. Routed experts default to an
+**EXL3 2.9 bpw** pack that fits 1.4x as many experts in the same memory; the checkpoint's
+**native MXFP4** experts remain a supported profile on the same image and scripts. The
+OpenAI-compatible API supports streaming responses, thinking, tool calls and images.
+The engine began as [0xBakeer's single-Spark engine](https://github.com/0xBakeer/deepseek-v41-flash-spark);
+see [lineage](#lineage-and-credits) for what is inherited and what changed.
 
 | Default EXL3 profile, 2026-10-08 | |
 | --- | --- |
@@ -302,5 +308,36 @@ another model, so disabling it does not free an extra expert arena.
   and [speculative decoding](docs/decode-dynamic-depth.md)
 - Decode dashboard at `/decode-probe`: [timing, buffer reuse and local replay controls](docs/decode-probe.md)
 
-Original engine by 0xBakeer; see [credits](CREDITS.md). Repository code is
+## Lineage and credits
+
+This engine is a fork of [0xBakeer's deepseek-v41-flash-spark](https://github.com/0xBakeer/deepseek-v41-flash-spark),
+and its foundation is his: the insight that a model too large for one box can be served
+from a resident hot set of experts, and the engine that proves it — the expert arena and
+transient ring, the `O_DIRECT` streaming path, the Triton FP4 grouped-MoE kernel, the
+chunk-invariant port of DeepSeek's reference, the stdlib server and the benchmark harness.
+His documentation is the intellectual backbone of the approach: the routing traces and
+coverage curves, the keep-set analysis, saliency ranking, the topic profiles and the
+REAP-style pruning sweep in [NOTES.md](NOTES.md) and [RESULTS.md](RESULTS.md). This fork
+would not exist without it.
+
+What this fork changed, compared with upstream at
+[`45a0caff`](https://github.com/0xBakeer/deepseek-v41-flash-spark/tree/45a0caffc8f080f8fd32d22f4e3d4e9122e25e5f):
+
+| | Upstream | This fork |
+| --- | --- | --- |
+| Hardware | One DGX Spark | Two DGX Sparks, TP2 over RoCE |
+| Expert residency | **Static** keep-set, ranked offline from routing traces (frequency or saliency, per topic) | **Adaptive**: router-score demand history, re-planned after prefill, during long answers, on urgent misses and between requests; persists across restarts |
+| Memory budget | Fixed per-layer keep counts | One shared arena; layers trade slots above a six-expert routing minimum, sized by `ARENA_GB` |
+| A missing router pick | Replaced by a resident expert, permanently | Replaced by a resident expert for that token; its load is **deferred** to the next adaptation pass |
+| Routed expert weights | CB3 requantization in the headline configuration | EXL3 2.9 bpw (default) or the checkpoint's native MXFP4 |
+| Launch | `start.sh` on one box | Containerised pair launcher; boot-time guard that both ranks agree on configuration |
+
+Both the static topic profiles and maxmin ranker remain available here, ported with exact
+parity, as [an optional fixed profile](docs/expert-profiles.md); in a small comparison they did not
+beat adaptive residency ([gotchas](docs/gotchas.md#the-authors-broad-topic-profiles-are-not-a-demonstrated-quality-default)).
+
+The RoCE all-gather is ported from [TensorFold](https://github.com/ashhart/TensorFold), which
+adapted b12x's; the EXL3 expert kernels port TensorFold's ExLlamaV3-derived device code; the
+EXL3 checkpoint is [Mia-AiLab's](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw).
+Full attributions and licences are in [CREDITS.md](CREDITS.md). Repository code is
 [MIT-licensed](LICENSE); model use is governed by the checkpoint's own license.
