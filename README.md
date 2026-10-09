@@ -36,7 +36,7 @@ arena, and busier layers have taken slots from quieter ones.*
 - **Flexible memory configuration, including room for other small services.** Adjust the resident
   expert count, context allocation and each node's Engram cache to fit your setup.
 - **EXL3 experts by default, native MXFP4 when you want it.** EXL3 trades a
-  requantization (2.9 bpw) for 90% residency and 18-31% faster decode; the FP4 profile
+  requantization (2.9 bpw) for 90% residency and 19-31% faster decode; the FP4 profile
   keeps the checkpoint's expert weights. Switch by restarting with the other example
   profile; nothing is rebuilt.
 - **Let your workload shape memory allocation.** Router-score history learns which

@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DeepSeek V4.1 on two Sparks: decode performance</title>
+<title>DeepSeek V4.1 on two Sparks: adaptive expert residency</title>
 <style>
   /* Same system as dual-spark.html / adaptive-depth.html: paper, ink, lime; 1600 x 900 (16:9, X large card).
      Sized for phones: X shows this ~400 px wide (x0.25), so no text below ~22 px here. */
   :root { color-scheme: light; --paper: #f2f1eb; --ink: #20241f; --quiet: #5b6057; --faint: #9a9e93;
-          --line: #cecec4; --green: #b7df54; --panel: #e9e9e0; --bar: #cfd1c5; }
+          --line: #cecec4; --green: #b7df54; --panel: #e9e9e0; }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--paper); }
   body { font-family: Arial, Helvetica, sans-serif; }
@@ -21,18 +21,18 @@
   .eyebrow { font-size: 28px; }
   .tag { display: flex; align-items: center; gap: 14px; font-size: 30px; font-weight: 600; }
   .tag i { width: 16px; height: 16px; background: var(--ink); display: block; }
-  main { display: grid; grid-template-columns: 690px 1fr; gap: 56px; padding-top: 50px; }
-  h1 { margin: 0; font-size: 92px; line-height: 1.02; letter-spacing: -4.8px; font-weight: 600; }
-  h1 span { display: block; color: var(--quiet); font-size: 80px; letter-spacing: -3.8px; margin-top: 4px; }
-  .claim { margin-top: 44px; }
+  main { display: grid; grid-template-columns: 690px 1fr; gap: 56px; padding-top: 40px; }
+  h1 { margin: 0; font-size: 84px; line-height: 1.02; letter-spacing: -4.4px; font-weight: 600; }
+  h1 span { display: block; color: var(--quiet); font-size: 73px; letter-spacing: -3.4px; margin-top: 2px; }
+  .claim { margin-top: 22px; }
   .claim .label { font-size: 25px; color: var(--quiet); }
   h2 { font-size: 58px; line-height: 1.05; letter-spacing: -2.2px; font-weight: 500; margin: 10px 0 14px; }
   /* marker underline: the highlight sits under the text, so the text keeps the left margin */
   h2 b { font-weight: 700; background: linear-gradient(transparent 56%, var(--green) 56%, var(--green) 94%, transparent 94%); }
   .description { font-size: 30px; line-height: 1.3; margin: 0; color: var(--quiet); }
 
-  .capabilities { display: grid; grid-template-columns: 335px 335px; gap: 14px 16px; margin-top: 38px; }
-  .capability { padding: 14px 18px 15px; border: 2px solid var(--ink); }
+  .capabilities { display: grid; grid-template-columns: 335px 335px; gap: 12px 16px; margin-top: 20px; }
+  .capability { padding: 11px 18px 12px; border: 2px solid var(--ink); }
   .capability.native { background: var(--green); border-color: var(--green); }
   .capability strong { display: block; font-size: 30px; line-height: 1.1; letter-spacing: -1.1px; font-weight: 700; }
   .capability.native span { color: var(--ink); }
@@ -46,13 +46,12 @@
   .group-title strong { font-size: 34px; letter-spacing: -.8px; }
   .group-title .mono { font-size: 25px; color: var(--quiet); }
   .row { display: grid; grid-template-columns: 150px 1fr 88px; align-items: center; gap: 14px; margin-top: 6px; }
-  .row .name { font-size: 29px; color: var(--quiet); }
+  .row .name { font-size: 29px; color: var(--ink); }
   .track { height: 32px; }
-  .fill { height: 100%; background: var(--bar); }
-  .row.after .fill { background: var(--green); }
-  .row.after .name, .row.after .value { color: var(--ink); }
-  .value { font-size: 34px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; color: var(--quiet); }
-  .delta { font-size: 27px; font-weight: 700; color: var(--ink); }
+  /* Both expert profiles are first-class options on the same image, so neither row is
+     styled as the loser: same bar, same label weight. Only the measured lengths differ. */
+  .fill { height: 100%; background: var(--green); }
+  .value { font-size: 34px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
   .note { margin-top: 12px; font-size: 24px; color: var(--quiet); }
 
   footer { position: absolute; left: 72px; right: 72px; bottom: 40px; display: flex; justify-content: space-between;
@@ -67,48 +66,59 @@
 <div class="poster" id="poster">
   <header>
     <div class="eyebrow mono">Dual DGX Spark</div>
-    <div class="tag"><i></i>Decode performance</div>
+    <div class="tag"><i></i>TP2 over RoCE</div>
   </header>
 
   <main>
     <section>
       <h1>DeepSeek V4.1<span>on two Sparks.</span></h1>
       <div class="claim">
-        <h2><b>+21–25% decode.</b><br>Same native weights.</h2>
+        <h2><b>Adaptive expert loading</b><br>fits your memory budget.</h2>
       </div>
       <div class="capabilities">
-        <div class="capability native"><strong>4-bit experts</strong><span>Native MXFP4, as shipped</span></div>
-        <div class="capability native"><strong>Full dense</strong><span>FP8 + BF16, no requant</span></div>
-        <div class="capability"><strong>512K context</strong><span>524,288 tokens</span></div>
-        <div class="capability"><strong>Vision input</strong><span>Images over OpenAI API</span></div>
+        <div class="capability native"><strong>90% resident</strong><span>13,813 of 15,360</span></div>
+        <div class="capability native"><strong>31–64 tok/s</strong><span>Prose to HTML decode</span></div>
+        <div class="capability"><strong>512K context</strong><span>ARENA_GB + MAX_SEQ</span></div>
+        <div class="capability"><strong>All 15,360</strong><span>98.4 GB, 200K ctx</span></div>
+        <div class="capability"><strong>MXFP4 or EXL3</strong><span>Pick your weights</span></div>
+        <div class="capability"><strong>Abliterated</strong><span>Optional model overlay</span></div>
       </div>
     </section>
 
     <section>
       <div class="chart-heading mono"><span>Decode tokens / s</span><span>Oct 8 / TP = 2</span></div>
+      <!-- Card framing: the claim is adaptive residency and a negotiable memory budget, not a
+           before/after recipe. The two profile rows stay equal in weight and the per-group
+           "+X%" badges are gone on purpose: the chart is a choice between supported profiles,
+           not a scoreboard. The six-chip grid is why the h1 is 84px, not 92px -- the third
+           chip row needs the vertical space (chips end at y=768, footer starts at y=804).
+           Numbers: results/readme-20261008, the run RESULTS.md publishes as the FP4-vs-EXL3
+           comparison (3 workloads, warmup + 2 x 512 tokens, temperature 0). Caveat recorded
+           there: FP4 ran straight after the profile switch, so its residency carried the
+           EXL3-shaped demand history and its prefill arm shows the re-planning stalls. -->
       <div class="panel">
         <div class="group">
-          <div class="group-title"><strong>Code</strong><span class="delta">+25%</span></div>
-          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:60.5%"></div></div><span class="value">32.3</span></div>
-          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:75.7%"></div></div><span class="value">40.4</span></div>
+          <div class="group-title"><strong>Code</strong></div>
+          <div class="row"><span class="name mono">MXFP4</span><div class="track"><div class="fill" style="width:61.2%"></div></div><span class="value">39.4</span></div>
+          <div class="row"><span class="name mono">EXL3</span><div class="track"><div class="fill" style="width:72.5%"></div></div><span class="value">46.7</span></div>
         </div>
         <div class="group">
-          <div class="group-title"><strong>Prose</strong><span class="delta">+21%</span></div>
-          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:41.0%"></div></div><span class="value">21.9</span></div>
-          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:49.4%"></div></div><span class="value">26.4</span></div>
+          <div class="group-title"><strong>Prose</strong></div>
+          <div class="row"><span class="name mono">MXFP4</span><div class="track"><div class="fill" style="width:39.8%"></div></div><span class="value">25.6</span></div>
+          <div class="row"><span class="name mono">EXL3</span><div class="track"><div class="fill" style="width:48.1%"></div></div><span class="value">31.0</span></div>
         </div>
         <div class="group">
-          <div class="group-title"><strong>HTML game</strong><span class="delta">+23%</span></div>
-          <div class="row"><span class="name mono">Before</span><div class="track"><div class="fill" style="width:81.1%"></div></div><span class="value">43.3</span></div>
-          <div class="row after"><span class="name mono">After</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="value">53.4</span></div>
+          <div class="group-title"><strong>HTML game</strong></div>
+          <div class="row"><span class="name mono">MXFP4</span><div class="track"><div class="fill" style="width:76.6%"></div></div><span class="value">49.3</span></div>
+          <div class="row"><span class="name mono">EXL3</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="value">64.4</span></div>
         </div>
-        <div class="note">Faster attention, router, HC mixes, FP8 tiles and draft pass. Paired 22-prompt estimate: +19%.</div>
+        <div class="note">One image, 92.3 GB a node, 512K context: only the routed experts differ. EXL3 (2.9 bpw) is the default at 19–31% more decode; MXFP4 serves the checkpoint's own weights.</div>
       </div>
     </section>
   </main>
 
   <footer>
-    <div class="features">Adaptive expert loading<span>/</span>RoCE all-gather<span>/</span>OpenAI API</div>
+    <div class="features">One shared arena<span>/</span>Vision input<span>/</span>OpenAI API</div>
     <div class="stack mono">PyTorch / Triton / CUDA</div>
   </footer>
 </div>
