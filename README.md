@@ -1,3 +1,10 @@
+# Notice
+
+**This is old repo. Please use https://github.com/raspy135/deepseek-v41-flash-dgx-spark-dual-adaptive .**
+
+
+
+
 # DeepSeek-V4.1-Flash on two DGX Sparks
 
 Serves DeepSeek-V4.1-Flash across two DGX Sparks with **adaptive expert residency** and a
