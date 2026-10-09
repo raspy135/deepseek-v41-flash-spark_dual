@@ -1,10 +1,8 @@
 # DeepSeek-V4.1-Flash on two DGX Sparks
 
 Serves DeepSeek-V4.1-Flash across two DGX Sparks with **adaptive expert residency** and a
-**negotiable memory budget**. All 15,360 routed experts can be resident: the
-[all-weights profile](#example-profiles) keeps every one, with a 200K context. The default
-gives about 6 GB/node of that back for a 512K context and faster prefill, keeping 90% of the
-experts resident; which ones is learned from live router demand and re-planned while the server
+**negotiable memory budget**. The default profile keeps 90% of the 15,360 routed experts
+resident; which ones is learned from live router demand and re-planned while the server
 runs, and one shared arena lets busy layers take slots from quiet ones. The arena's size is a
 single knob you trade against context length and whatever else shares the boxes.
 
@@ -22,8 +20,7 @@ see [lineage](#lineage-and-credits) for what is inherited and what changed.
 | Resident routed experts at 92.3 GB/node | **13,813 of 15,360 (90%)** (FP4: 9,793, 64%) |
 
 At the default arena not every routed expert is resident; residency follows demand and is
-shared across layers (the all-weights profile below removes misses entirely). Adaptation
-improves coverage; it does not guarantee full-model quality.
+shared across layers. Adaptation improves coverage; it does not guarantee full-model quality.
 
 <p align="center"><img src="assets/expert-map.png" width="820"
   alt="The live expert map: 40 layers by 384 experts, resident experts in green, missing ones dark"></p>
