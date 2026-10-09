@@ -16,6 +16,7 @@ models/
 !env.example
 !.env.example.fp4
 !.env.example.exl3
+!.env.example.exl3.allweight
 
 # New runtime and benchmark output stays local. Existing tracked historical
 # results remain in Git; routing profiles are the only newly allowed artifacts.

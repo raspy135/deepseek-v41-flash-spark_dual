@@ -3276,3 +3276,30 @@ prefill budget halved the chunk to 1,024 rows: 8K 7.36 s. The first request afte
 one-time warm-up (3,755 tokens: 10.8 s cold vs ~2.3 s for the next cold prompts).
 Artifacts: `results/readme-20261008/` (`exl3-923*`, `fp4-923*`, `exl3-953-contaminated*`: that
 run overlapped an outside request and is not used).
+
+### 2026-10-08 — All routed experts resident: exact-size EXL3 slots
+
+Every EXL3 arena slot was sized for a 3-bit expert (6.67 MB a node); the 1,920 2-bit experts of
+layers 18-22 (4.46 MB) wasted 4.25 GB a node, so holding all 15,360 needed 102.6 GB.
+`DSV41_EXL3_EXACT_SLOTS=1` gives `Exl3Arena` a narrow pool for them (the kernels already address
+slots through a per-slot pointer table); the store assigns 2-bit experts to narrow slots, and the
+mode is refused unless every expert is resident, since a narrow slot cannot take a swapped-in 3-bit
+expert. `tools/test_exl3_moe_cuda.py` runs decode and prefill against the reference on both layouts
+and checks that a narrow slot refuses a 3-bit expert.
+
+`.env.example.exl3.allweight` (98.4 GB arena, 200K context, 256 MiB worker Engram cache), booted
+on the pair: 1,920 2-bit + 13,464 3-bit slots = 98.37 GB, **15,360 of 15,360 resident**, warm start
+98.2 GB read in 26 s; MemAvailable after boot 8.0 / 8.6 GB (node 0 / 1).
+
+| | EXL3 92.3 GB (13,813, 90%) | all weights (15,360) |
+| --- | ---: | ---: |
+| Essay / HTML / Python decode, tok/s | 31.0 / 64.4 / 46.7 | 30.2 / 64.9 / 43.7 |
+| 8K prefill (median of 5) | 5.67 s | 7.26 s |
+| 32K prefill | 23.5 s | 35.4 s (40.2, 30.6) |
+| prefill chunk (budget) | 2,048 rows | 512 rows |
+
+Stress: two 32K prompts with 1,024-token answers completed (decode 51.9 tok/s on the random-word
+continuation); MemAvailable never fell below 5.6 / 4.6 GB, against the 2.5 GB watchdog. The prefill
+slowdown is the budget's arithmetic (2 MiB a row estimated plus a 4 GiB floor), not a measured
+shortage: with 512-row chunks 4.6 GB stayed free. Artifacts: `results/readme-20261008/` (`exl3-allweight*`,
+`allweight-stress*`, `allweight-mem.txt`, `run_allweight.sh`).

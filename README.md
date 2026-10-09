@@ -212,6 +212,14 @@ running the engine on its own. They differ only in `EXPERT_FORMAT` and the predi
 | Prompt cache | RAM reuse enabled; disk and post-response caching disabled |
 | Generation | Speculative depth 3/5; thinking off by default, effort 75 when enabled |
 
+**All weights resident:** [.env.example.exl3.allweight](.env.example.exl3.allweight) keeps every
+routed expert in memory (15,360 of 15,360, no expert misses) by giving the 1,920 2-bit EXL3 experts
+slots of their own size (`DSV41_EXL3_EXACT_SLOTS=1`: 98.37 GB/node instead of 102.6), with a 200K
+context and a 256 MiB worker Engram cache. Measured 2026-10-08: decode 30.2 / 64.9 / 43.7 tok/s
+(essay / HTML / Python), cold prefill 8K 7.3 s and 32K 35.4 s. The ~7 GB left per node makes the
+prefill budget choose 512-row chunks, so prefill is 22-34% slower than the 92.3 GB profile; the
+lowest free memory under a 32K-prompt stress run was 4.6 GB. Use it when nothing else shares the boxes.
+
 For **TTS alongside the engine**, use `ARENA_GB=90.2`, as on the development pair; the
 resident expert count follows the arena (every slot but 16). The engine-only
 example adds about 2.1 GB per node. Its slot capacity is checked,
