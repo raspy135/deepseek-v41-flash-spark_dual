@@ -61,13 +61,17 @@ MIT-licensed **ExLlamaV3** trellis format (Copyright (c) 2025 Turboderp). It is 
 numpy oracle for `tools/test_exl3_ref.py` and is not on the serving path. The torch decoder
 (`tools/exl3_ref.py`), the pack format and `tools/pack_exl3_experts.py` are this repo's.
 
-Future CUDA expert kernels are intended as a port of TensorFold's ExLlamaV3-derived
-`decode.cuh` and `experts_grouped.cuh` (same licences). TensorFold's DeepSeek-V4.1 fast load
+The CUDA expert kernels (`tools/exl3_moe_cuda.cu`) port the device arithmetic of TensorFold's
+ExLlamaV3-derived `decode.cuh`, `experts_grouped.cuh` and `experts.cu` (same licences): the tile
+decode, codebook, mma and 128-point Walsh-Hadamard butterfly. The launchers, arena-slot routing,
+the prefill tile kernel and the C ABI are this repo's. TensorFold's DeepSeek-V4.1 fast load
 path (`x3ld.cu`/`loads.py`, "our GLM patch 0580") is deliberately **not** ported: its lineage is
 the Mia's AI Lab GLM kit after 2026-09-07 (AGPL-3.0), which this repo takes no code from.
 
 TensorFold's prepared EXL3 packs are for its "dsv41-uncensored-2.9bpw" model; we build our own
-pack from the base `DeepSeek-V4.1-Flash-EXL3-2.9bpw` checkpoint.
+pack (`scripts/exl3-packs.sh`) from the base checkpoint
+[`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw),
+quantized with ExLlamaV3 from `deepseek-ai/DeepSeek-V4.1-Flash`.
 
 ## The platform and the tools
 

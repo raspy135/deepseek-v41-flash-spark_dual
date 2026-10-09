@@ -1,7 +1,7 @@
 # Dynamic speculative depth
 
 `DSV41_BLOCK_DYNAMIC=3,5` lets the engine choose the draft depth per request, as acceptance
-changes. Code off by default; `.env.example` enables it. It is in the EP2 boot guard, and it
+changes. Code off by default; both `.env.example.*` profiles enable it. It is in the EP2 boot guard, and it
 cannot be combined with `DSV41_BLOCK` or with `DSV41_MAX_CONCURRENCY` > 1.
 
 ## Why

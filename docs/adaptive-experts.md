@@ -9,7 +9,7 @@ processed.
 
 Two settings control it; the engine derives the rest and logs what it chose at startup:
 
-| Setting | Default in `.env.example` | Meaning |
+| Setting | Default in `.env.example.fp4` / `.exl3` | Meaning |
 | --- | --- | --- |
 | `DSV41_ADAPT_SENSITIVITY` | `high` | How far one request moves the resident set. See the levels below. |
 | `DSV41_ADAPT_PRIOR` | `4` | Weight of the shipped routing trace, in requests. Lower lets this server's own traffic dominate sooner. |
@@ -98,10 +98,10 @@ layers. Startup fills the global budget from normalized demand, then latest-user
 admission and later adaptive swaps can transfer a sector between layers.
 Unset fixed layer counts and discounts. The only minimum is the router's top-k
 (six residents per layer), while the total resident count and arena size stay
-fixed. An optional `DSV41_RESIDENT_EXPERTS` selects an exact global startup
-budget (for example, 9500), overriding the count derived from `PRUNE_KEEP`.
-It requires dynamic allocation and enough arena space on both ranks, including
-the transient reserve and null slot; it does not resize memory automatically.
+fixed. The global startup budget is the arena's: every LRU slot less 16, capped at
+all routed experts (`engine/expert_budget.py::auto_budget`), so it follows `ARENA_GB`
+and `EXPERT_FORMAT`. `DSV41_RESIDENT_EXPERTS=<n>` pins an exact count instead (for
+experiments); it still needs enough arena space on both ranks and does not resize memory.
 Discovery batches complete token rows so their cold experts fit the
 transient ring; both TP ranks receive the same batch plan. Decode lookup tables
 and masks update in place; changed layers' eager prefill directories are rebuilt.

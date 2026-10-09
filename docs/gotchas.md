@@ -2150,3 +2150,69 @@ GLM-kit lineage, AGPL-3.0 after 2026-09-07 -- and the `experts.py` that front-ru
 copy. The math (`decode.cuh`, `experts_grouped.cuh`, `experts.cu`) is ExLlamaV3/TensorFold,
 permissive; `format.py` is vendored as the oracle. Their fast load path is the one file we cannot
 port, so it is the known performance risk versus TensorFold.
+
+## EXPERT_FORMAT=exl3 inherited FP4's resident budget; a quarter of the arena sat empty (2026-10-08)
+
+`DSV41_RESIDENT_EXPERTS` is an absolute count. The live `.env` kept FP4's 9,574 when the format
+became EXL3, whose 6.67 MB slots give the same 90.2 GB arena 13,514 LRU slots: the expert map
+showed 9,574 resident, exactly the FP4 number, and ~26 GB of allocated slots held nothing.
+Raising it to 13,500 (87% of all routed experts routable instead of 62%) cost no measurable
+decode speed: distinct experts a verify step moved 21.1 -> 21.5 a layer (python) and
+17.2 -> 16.0 (explain). Re-derive the budget from `lru_slots` in `/health` whenever the
+format or `ARENA_GB` changes.
+
+## One boot per arm cannot resolve a 2 ms decode change (2026-10-08)
+
+The early-verify/draft A/B as three separate gate boots (on, off, on) gave explain 64.5 / 68.7 /
+67.5 ms per step: the two "on" boots differed by 3 ms, as much as the effect. The same change in
+`tools/bench_accept_ab_tp.py` -- one boot, 24 prompts, arms switched at runtime and interleaved
+per prompt, depth pinned -- measured -2.03 ± 0.49 ms. Prefer runtime switches and the paired
+harness for anything under ~5%; the single-boot `run.py` live bench moves ±5% on prose
+between boots by acceptance alone.
+
+## A per-step GPU read at the loop top undoes host/GPU overlap (2026-10-08)
+
+`DSV41_EARLY_DRAFT` queues the next draft before the host reads the verify result, so the host's
+bookkeeping, token emission and `control()` run while the drafter does. With urgent adaptation on
+(live; the gate freezes the map), `_decode_adapt_due` read the decode miss counters with
+`.tolist()` at the top of every step -- a stream sync that waited for the queued draft. Live
+wall time per step went UP (64-65 -> 68 ms prose) while the depth policy's own timer, which no
+longer saw the draft, went down. The counters are now staged into pinned memory with the verify
+readback (`Model.stage_decode_miss`). Any new device read in the decode loop needs the same
+treatment, and "policy step_ms" is not wall time once work moves across the loop boundary --
+compare `decode_s / steps`.
+
+## EXL3 dense attention: a third of the microbenchmark's saving, and the drafter disagrees (2026-10-08)
+
+`DSV41_EXL3_DENSE=1` (default off) serves decode's wq_a/wkv/wq_b/wo_a/wo_b and shared expert from
+the EXL3 checkpoint's 5-bit matrices. L2-cold the grouped kernel beats the FP8 GEMVs on every shape
+(273 vs 394 µs a layer). In the engine it saved 1.30 ± 0.53 ms a step: each matrix is three
+launches (input rotation, GEMV, output rotation) and wq_a/wkv stop being one merged GEMV. And
+acceptance fell 0.071 ± 0.024 tokens a step: DSpark was trained against the FP8 target, and the
+changed target agrees with FP8 greedy only 97.6% teacher-forced. Net -0.22 ± 0.53 tok/s. Do not
+retry this as "fewer bytes = faster" without (a) the rotations fused into the GEMV and (b) a plan
+for the acceptance loss; the 2.4% top-1 change is a quality question of its own.
+
+The one reusable finding: the abliteration overlay (`DSV41_ABLIT_WOB`) is rank-1 against the base
+wo_b in every layer 10-35 (σ1 6.8-9.5, then ≤ 0.62 and flat at FP8 rounding), so any re-quantized
+wo_b can carry it as u (v · x) instead of a second matrix.
+
+## A decode kernel reused for prefill re-reads the weights every 16 rows (2026-10-08)
+
+EXL3's first prefill path fed `build_routing`'s 64-row blocks to the decode kernel, which gives
+each 16-row m-tile its own program and splits K across warps. Each m-tile program decoded and read
+the expert's whole N slice again, and the K split needed a shared-memory reduction: 52.8 ms a layer
+at 2,048 rows vs 25.5 for `exl3m_prefill` (one decode per tile for the block's rows, warps on N).
+Bigger blocks were not the fix -- BM 64 with 4 m-tiles was slower than BM 32 (accumulator
+registers cut occupancy) -- splitting N instead of K was. The same branch also called
+`torch.unique` with a host sync on every layer because the FP4-only static routes were skipped
+for an arena without a null slot; a -1 null entry makes them work for TP EXL3 (bit-identical).
+
+## dual-up.sh runs the image's code; dual-dev.sh runs the working tree (2026-10-08)
+
+A restart with `scripts/dual-up.sh` brought the pair back healthy but unusable: `/health` said
+`"kernel": "exl3-ref"` and a request took minutes. The `exl3-ref` image predates the EXL3 CUDA
+kernel, and only `scripts/dual-dev.sh` bind-mounts `engine/ tools/ server/` from the checkout --
+every EXL3 measurement since the kernel landed ran that way. Check `kernel` (and `DSV41_DEV_SOURCE`
+in `docker inspect`) after any restart, and rebuild the image (`scripts/dual-build.sh`) whenever
+the serving code should survive a plain `dual-up.sh`.

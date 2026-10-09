@@ -1,7 +1,7 @@
 # Historical serving measurements
 
 These measurements retain their original configurations. They are not claims about
-the current `.env.example` profile; newer experiments are recorded in
+the current `.env.example.fp4` / `.env.example.exl3` profiles; newer experiments are recorded in
 [RESULTS.md](../RESULTS.md).
 
 

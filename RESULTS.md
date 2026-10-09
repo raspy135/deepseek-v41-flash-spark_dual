@@ -3116,3 +3116,163 @@ TensorFold publishes 2,028 / 2,310; we are now at 0.70x / 0.62x.
 
 Artifacts: `results/prefill-trace-20261008/scaled-ab/`, `decode-prefill-ab/`,
 `results/prefill-live-20261008/v5-*.json`, `results/bench-switches-20261008/prefill-v5/`.
+
+## 2026-10-08 — EXL3 decode tuning: merged collectives, draft-ahead, resident budget; dense EXL3 rejected
+
+Starting point (live, `EXPERT_FORMAT=exl3`, FP4's residency settings): prose / HTML / code
+27.6 / 59.8 / 42.9 tok/s, 68 ms per depth-3 step, prefill 8K 8.09 s and 32K 32.8 s (FP4 on
+`prefill-v5`: 5.58 / 22.8 s). A decode step's GPU is busy 96% of the time
+(`tools/bench_decode_kernels_tp.py`, python workload): routed experts 35 ms, FP8 dense 25 ms,
+collectives 8 ms, then ~2,700 small kernels; the EXL3 kernel itself reaches 185–213 GB/s
+L2-cold against a ~205–240 GB/s plain read (`tools/bench_exl3_moe_decode.py`), so the routed
+experts are bytes, not kernel quality.
+
+| Change | Measured | Exact? |
+| --- | --- | --- |
+| `DSV41_EXL3_MERGED` (default on): the shared-expert and routed EXL3 intermediates in one RoCE gather, outputs summed before one gather, next-layer L2 prefetch under it (FP4's `_moe_merged`); decode grouping kernel parallel (48 → 11 µs a layer) | html 73.97 → 71.92, python 75.77 → 73.96, explain 71.02 → 68.82 ms/step; NCCL 3.1 → 0.7 ms/step | token hashes identical (3/3) |
+| `DSV41_RESIDENT_EXPERTS` 9,574 → 13,500 (the EXL3 arena's 13,514 LRU slots; was FP4's count, leaving ~26 GB of slots empty) | distinct experts a layer 21.1 → 21.5 (python), 17.2 → 16.0 (explain); tok/s within noise | routing changes (87% of experts routable instead of 62%) |
+| `DSV41_EARLY_VERIFY` + `DSV41_EARLY_DRAFT` (default on): hash ids leave on a side stream and layer 0 is queued before the host waits; the next greedy draft is queued from the device-side accept count before the host reads it | paired 24 prompts, depth 3: **-2.03 ± 0.49 ms/step, +1.24 ± 0.29 tok/s (+2.9%)** | 24/24 outputs identical |
+| Urgent-adaptation counters staged with the verify readback | removes a per-step `.tolist()` that waited for the queued draft (live only: the gate's map is frozen) | same values |
+
+Live after all of them (single-boot, 3 requests a workload, depth policy free): prose 29.1–31.3,
+HTML 61.3–63.0, code 45.1–45.6 tok/s. Prose moves ±5% between boots with acceptance
+(1.90–2.06 tokens a step) as the learned residency drifts; the paired gate numbers above are the
+ones to trust. Prose step time is 63–65 ms.
+
+**Rejected: EXL3 dense attention + shared expert (`DSV41_EXL3_DENSE=1`, default off).** The
+checkpoint stores wq_a/wkv/wq_b/wo_a/wo_b at 5 bits (one layer at 6) and the shared experts at
+4–5; `tools/pack_exl3_dense.py` slices a rank's 2.1 GB the way `engine/tensor_parallel.py`
+shards FP8, and the routed experts' grouped kernel runs them as GEMVs (split-K per shape).
+Microbenchmark, T = 4, L2-cold: 273 vs 394 µs a layer against the FP8 kernels' engine times
+(-4.9 ms a step if it all landed). Unit test: 1.6–1.7e-3 relative to the fp64 reference,
+row-invariant. The abliteration overlay is rank-1 against the base wo_b (σ = 6.8–9.5, then
+≤ 0.62 and flat, FP8 rounding), so the pack carries that term and the projection adds it.
+In the engine (paired, 24 prompts, both weight sets resident and switched at runtime):
+
+| | FP8 dense | EXL3 dense | paired |
+| --- | ---: | ---: | ---: |
+| ms/step | 65.29 | 63.99 | -1.30 ± 0.53 |
+| accepted tokens/step | 2.89 | 2.82 | **-0.071 ± 0.024** |
+| tok/s | 44.16 | 43.94 | -0.22 ± 0.53 |
+
+Teacher-forced on the FP8 arm's greedy continuations (12 prompts, 1,152 positions, each arm's
+own KV, `tools/bench_exl3_dense_quality_tp.py`): top-1 agreement **0.976**, KL mean 0.0094
+nats, p99 0.17, max 0.66; the FP8 arm reproduced its own reference 1.000. Only a third of the
+microbenchmark's saving survived (three launches a matrix, wq_a/wkv no longer one GEMV), and the
+FP8-trained drafter agrees less with the changed target. No throughput gain for a 2.4% top-1
+change: off.
+
+Prefill is unchanged by this work (EXL3 prefill 866–1,012 tok/s at 8K vs FP4's 1,423–1,471):
+the decode-shaped grouped kernel decodes each weight tile once per 16 rows; a prefill tile
+kernel is still owed (`tools/bench_exl3_prefill.py` times its stages per rank).
+
+Artifacts: `results/exl3-tune-20261008/` (live runs `exl3-live-v1..v5`, `live-v1-{8k,32k}.json`,
+kernel profiles `kern-exl3*`, `early-*`, paired `ab-early/`, `ab-x3/`, `q-x3/`, the runner
+scripts). Drivers: `tools/bench_decode_kernels_tp.py`, `tools/bench_accept_ab_tp.py`
+(`early_off/early_on`, `x3_off/x3_on`), `tools/bench_exl3_moe_decode.py`,
+`tools/bench_exl3_dense_decode.py`, `tools/bench_exl3_dense_quality_tp.py`,
+`tools/test_exl3_dense.py`, `tools/test_exl3_moe_cuda.py` (grouping vs the serial scan).
+
+### 2026-10-08 — EXL3 prefill at FP4 parity: a prefill tile kernel and static routes
+
+EXL3 prefill ran the decode kernel (`exl3::grouped_kernel`): one program per 16 rows of a
+routing block, K split over four warps and reduced in shared memory, so every 16 rows re-decoded
+-- and re-read -- the expert's trellis. `exl3m_prefill` (`tools/exl3_moe_cuda.cu`) gives a warp
+NT n-tiles over the whole K and applies each decoded tile to all MT 16-row m-tiles of its block;
+warps split N, nothing is reduced. One layer, rank shapes, T = 2,048, 384 real experts, Zipf
+routing (`tools/bench_exl3_prefill.py`):
+
+| kernel | gate/up ms | down ms | layer ms |
+| --- | ---: | ---: | ---: |
+| grouped (decode kernel), BM 64 | 33.0 | 14.8 | 52.8 |
+| tile, BM 64 (4 m-tiles), best of 5 shapes | 18.8 | 9.0 | 32.6 |
+| **tile, BM 32, 4 n-tiles x 2 warps** (default) | 13.7 | 6.9 | **25.5** |
+| tile, BM 16 | 14.4 | 6.5 | 25.8 |
+
+Every BM 32/16 shape landed at 25.5–27.5 ms: occupancy (BM 64 holds 128 accumulators a thread)
+mattered more than decodes per row. Output vs the grouped kernel 7.6e-5 relative (K summed in one
+chain instead of four warp partials); BM 16 and BM 32 give identical bits.
+
+The EXL3 branch of `Model.moe` also grouped each layer with `torch.unique` and a host sync; it now
+takes the engine's static per-layer compact routes as FP4 does (`prefill_routes`, -1 for the TP
+null entry): bit-identical, -0.22 s per 8K prompt.
+
+Gate, frozen map, 2,048-row chunks, the 9 prompts of `scaled-ab` above (3 random 8K + 6 natural):
+
+| arm | mean prefill s |
+| --- | ---: |
+| EXL3 grouped kernel (separate run, other natural texts) | 6.10 |
+| EXL3 tile, unique() routing | 5.321 |
+| **EXL3 tile, static routes** | **5.103** |
+| FP4 `all_sct` (serving prefill), same boot harness | 5.061 |
+
+Logits tile vs grouped: KL mean 0.074, top-1 8/9 (FP4's chunk-size noise 0.042, the accepted
+scaled change 0.119). Live (`.env`, adaptation on, 13,500 residents): **8K 5.32–5.35 s
+(1,533 tok/s), 32K 21.4 s (1,528 tok/s)**, against EXL3's 8.09 s / 32.8 s before and FP4's
+5.56–5.74 s / 22.5–23.0 s on `prefill-v5`. Decode unchanged: prose / HTML / code 30.5 / 64.3 /
+45.3 tok/s, prose 62.4–62.7 ms a step.
+
+Artifacts: `results/exl3-tune-20261008/prefill-ab/`, `prefill-parity-{exl3,fp4}/`,
+`live-v2-{8k,32k}.json`, `exl3-live-v6/`.
+
+
+### 2026-10-08 — EXL3 CUDA quality against saved Mia Q3 runs
+
+Served `exl3-cuda`, 92.3 GB arena, 13,813 resident budget, **90.1% residency**;
+EXL3 dense off, dynamic expert adaptation on. Replayed the 244 item IDs from
+`llm_benchmark/mia-q3.json` and `mia-q3-pass2.json` (October 5, both identical
+per-item scores), using `quality_quant3.py`, temperature 0, thinking disabled
+with both template keys, and original per-family token caps. Source, prompts,
+responses, image identity and per-request health snapshots are saved.
+
+| Family | Current EXL3 CUDA | Saved Mia |
+| --- | ---: | ---: |
+| MMLU | 179/200 | 179/200 |
+| Executable code | 9/10 | 9/10 |
+| Arithmetic | 12/12 | 12/12 |
+| Retrieval, ~2K/8K/32K | 3/3 | 3/3 |
+| Strict JSON | 3/3 | 3/3 |
+| Nested JSON | 4/4 | 4/4 |
+| Exact word-count constraints | **7/12** | **10/12** |
+
+**305.8 s**, all 244 requests completed normally, none truncated. MMLU has
+2 current-only correct and 2 Mia-only correct items; code's shared failure is
+`parse_kv`. Three extra word-count misses were manually verified. A separate
+12-item constraint repeat scored **8/12**, with different misses. Mean constraint
+partial credit: 79.73% first pass / 79.58% repeat vs Mia's 88.33% on both runs.
+The first run remains the primary comparison; the repeat is diagnostic.
+
+Six category scores match; exact word-count compliance is lower in these samples.
+This is not isolated quantization or residency loss: these are different served
+configurations and the current expert map adapts. Historical Mia files omit full
+request/configuration provenance; item IDs and MMLU answer keys match, but exact
+historical source/template parity is not established. The 12-item constraint
+sample is small (paired exact p=0.25 first pass), not a broad quality verdict.
+
+Artifacts: `results/exl3-mia-quality-cuda-20261008/REPORT.md`, `current.json`,
+`answers.jsonl`, `paired-differences.json`, `constraint-repeat.json`, and the
+copied baselines/runner. The stopped `exl3-ref` attempt in
+`results/exl3-mia-quality-20261008/` is excluded.
+
+### 2026-10-08 — FP4 and EXL3 profiles side by side (README numbers)
+
+Same image (`deepseek-v41-flash-spark:20261008`), same `.env` except `EXPERT_FORMAT` and the
+predictor database, `ARENA_GB=92.3`, resident count automatic (`auto_budget`: every LRU slot but
+16). Decode: `results/readme-20261008/run.py` (3 workloads, warmup + 2 x 512 tokens, temperature
+0); prefill: `bench/bench.py --workload random`, 8K x5 and 32K x2, cold.
+
+| | FP4 | EXL3 |
+| --- | ---: | ---: |
+| Residents | 9,793 (63.9%) | 13,813 (90.1%) |
+| Essay / HTML / Python decode, tok/s | 25.6 / 49.3 / 39.4 | 31.0 / 64.4 / 46.7 |
+| 8K prefill, median (runs) | 6.15 s (6.15, 6.85, 5.78, 5.49, 18.35) | 5.67 s (8.93, 7.55, 5.67, 5.45, 5.33) |
+| 32K prefill | 22.73 s (23.3, 22.16) | 23.51 s (23.62, 23.39) |
+
+FP4 ran directly after the profile switch: its residency had to move from the EXL3-shaped
+demand history, two decode requests waited 16 and 24 s behind idle-time re-planning (their
+prefill took under 1 s) and one 8K run 18.4 s. Steady-state prefill is at parity between the
+formats within this noise. A 95.3 GB arena (93% EXL3 residents) left node 1 7.2 GB and the
+prefill budget halved the chunk to 1,024 rows: 8K 7.36 s. The first request after a boot pays a
+one-time warm-up (3,755 tokens: 10.8 s cold vs ~2.3 s for the next cold prompts).
+Artifacts: `results/readme-20261008/` (`exl3-923*`, `fp4-923*`, `exl3-953-contaminated*`: that
+run overlapped an outside request and is not used).

@@ -1,7 +1,8 @@
 # Plan: EXL3 routed experts with adaptive residency
 
-Status: P0-P2 implemented and unit-tested (2026-10-08); the P3/P4 packed kernels and the P5
-boot/measurement gates are still pending. Written for an agent working in this
+Status (2026-10-08): P0-P5 done -- EXL3 is a serving profile (`.env.example.exl3`, packs from
+`scripts/exl3-packs.sh`), decode 31.0 / 64.4 / 46.7 tok/s and prefill at FP4 parity (README).
+P6 (two-tier arena) and exact-size slots for the 2-bit layers remain. Written for an agent working in this
 repository; read `CLAUDE.md`, `docs/gotchas.md` (especially the 2026-10-07/08 entries) and the
 last `RESULTS.md` sections first.
 
@@ -39,6 +40,16 @@ last `RESULTS.md` sections first.
   unaccounted 40%. The 35 tok/s prose goal is an engine-wide Engram/draft target, not an EXL3 one.
 - **Re-enabled on exl3 (graphs are back)**: variable spec depth, predictive prefill, adaptive
   residency. Still FP4-only: critical prefill, layer streaming, the `_moe_merged` fusions.
+- **Decode tuning (2026-10-08, RESULTS.md)**: EXL3's routed MoE joined the merged decode collectives
+  (`DSV41_EXL3_MERGED`, exact, ~-2 ms/step), the grouping kernel went parallel (48 -> 11 us a
+  layer), draft-ahead + early verify (exact, -2.03 +- 0.49 ms/step paired), and the live resident
+  budget was re-derived for EXL3 slots (9,574 -> 13,500, no speed cost). Live prose/HTML/code
+  29-31 / 61-63 / 45 tok/s (FP4: 26.0 / 51.5 / 38.7). The routed kernel runs at 185-213 GB/s
+  L2-cold, ~the plain-read ceiling. EXL3 dense attention + shared experts were built, measured and
+  turned off: -1.3 ms/step but -0.07 accepted tokens/step, net zero, top-1 0.976 vs FP8.
+- **Prefill at FP4 parity (2026-10-08)**: `exl3m_prefill` (one trellis decode per tile for a
+  block's rows, warps split N) + the static per-layer routes FP4 uses. Same 9 prompts, same
+  harness: EXL3 5.103 s vs FP4 5.061 s; live 8K 1,533 tok/s, 32K 1,528 (FP4 live 1,423-1,471).
 - **Pending, needs serving stopped + both nodes**: nothing for P2. P3/P4 kernels and the paired
   A/B measurements remain. Measure kernels with the `tools/bench_*` microbenchmarks, not by
   rebooting the engine; `tools/generation_gate.py` is a floor test only.

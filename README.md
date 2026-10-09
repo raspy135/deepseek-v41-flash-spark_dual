@@ -2,20 +2,29 @@
 
 A fork of [0xBakeer's engine](https://github.com/0xBakeer/deepseek-v41-flash-spark)
 with **two-node tensor parallelism (TP2)** and adaptive expert loading. Routed
-experts keep the checkpoint's native MXFP4 weights. The OpenAI-compatible API
-supports streaming responses, thinking, tool calls and images.
+experts default to an **EXL3 2.9 bpw** pack that fits 1.4x as many experts in the same
+memory; the checkpoint's **native MXFP4** experts remain a supported profile on the same
+image and scripts. The OpenAI-compatible API supports streaming responses, thinking,
+tool calls and images.
 
-The model does not fit fully in memory. The engine-only example selects **9,800 of
-15,360 routed experts**, sharing their memory across layers as demand changes.
-Adaptation improves coverage; it does not guarantee full-model quality.
+| Default EXL3 profile, 2026-10-08 | |
+| --- | --- |
+| Decode, essay / HTML game / Python | **31.0 / 64.4 / 46.7 tok/s** (FP4: 25.6 / 49.3 / 39.4) |
+| Cold prefill, 8K / 32K | **1,445 / 1,394 tok/s** (FP4: 1,332 / 1,441) |
+| Resident routed experts at 92.3 GB/node | **13,813 of 15,360 (90%)** (FP4: 9,793, 64%) |
+
+The routed experts do not all fit in memory; residency follows demand and is shared
+across layers. Adaptation improves coverage; it does not guarantee full-model quality.
 
 ## Why use this engine?
 
 - **Vision support.** Send images and text through the same chat API. 
 - **Flexible memory configuration, including room for other small services.** Adjust the resident
   expert count, context allocation and each node's Engram cache to fit your setup.
-- **Keep the original expert weights.** Routed experts use native MXFP4 from the
-  checkpoint, with no additional EXL3 conversion or separate quantized weight pack.
+- **EXL3 experts by default, native MXFP4 when you want it.** EXL3 trades a
+  requantization (2.9 bpw) for 90% residency and 18-31% faster decode; the FP4 profile
+  keeps the checkpoint's expert weights. Switch by restarting with the other example
+  profile; nothing is rebuilt.
 - **Let your workload shape memory allocation.** Router-score history learns which
   experts to keep, and persists across restarts. This changes residency, not model
   weights. A bundled learned seed gives fresh installs a starting distribution.
@@ -29,53 +38,66 @@ Adaptation improves coverage; it does not guarantee full-model quality.
   and arena ownership. Request statistics expose both routing-count and
   router-score-weighted misses, making selection changes inspectable.
 
-TP2 output sharding, native FP4 kernels, RoCE communication, speculative decoding
+TP2 output sharding, EXL3 and native FP4 kernels, RoCE communication, speculative decoding
 and RAM prefix reuse support this design. The distinctive feature is their
 combination with a persistent, observable, globally adaptive expert working set.
 
-## Compared with an EXL3 recipe
+## EXL3 (default) or FP4 experts
 
-The main difference is **where the memory saving comes from**:
+Both profiles serve the same model: dense layers, attention, the vocabulary head, Engram,
+shared experts and the DSpark drafter always come from the native checkpoint. Only the
+384 x 40 routed experts differ.
 
-| | This engine's example profile | A fully resident EXL3 configuration |
+| At `ARENA_GB=92.3` per node | **EXL3** (`.env.example.exl3`, default) | FP4 (`.env.example.fp4`) |
 | --- | --- | --- |
-| Expert weights | Original MXFP4; only a selected subset stays resident | Additional compression, such as the tested 2.9 bpw pack |
-| Routing coverage | Missing experts can affect answers, even after adaptation | All routed experts available when the compressed set fits |
-| Workload adaptation | Changes which experts occupy the fixed memory budget | Weight quantization stays fixed; memory policy depends on the runtime |
-| Main tradeoff | Preserve stored expert precision while accepting residency misses | Accept requantization error to fit more expert weights |
+| Routed expert weights | [Mia-AiLab's](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) EXL3, 2.9 bpw average (2-bit in layers 18-22), 6.67 MB/node each | Checkpoint MXFP4, 9.4 MB/node each |
+| Resident experts | **13,813 (90%)** | 9,793 (64%) |
+| Decode, essay / HTML / Python | **31.0 / 64.4 / 46.7 tok/s** | 25.6 / 49.3 / 39.4 tok/s |
+| Cold prefill, 8K / 32K | 1,445 / 1,394 tok/s | 1,332 / 1,441 tok/s (parity within noise) |
+| Extra disk | 98 GB pack per node, built once from the 198 GB EXL3 checkpoint | none |
 
-Choose this engine when you want image input, flexible memory allocation for
-services such as TTS, and checkpoint expert precision with residency tailored
-to your own traffic. It is especially useful for experimenting with expert selection and
-seeing the effect directly in the map and routing statistics.
-
-EXL3 remains a strong alternative: fitting all experts avoids this engine's
-residency misses, and lower-bit compression can be less damaging than missing an
-important expert. Our tests do **not** establish general quality superiority over
-Mia's recipe or the official API. Speed, context capacity, vision and concurrent
-serving depend on the particular EXL3 runtime; this profile serves one request at
-a time. See [recorded experiments](RESULTS.md) rather than treating native weight
-precision or a lower miss rate as an answer-quality guarantee.
+EXL3 reads fewer bytes per expert, which is most of a decode step, and leaves fewer
+experts missing; that is why it is the default. The cost is requantization error in the
+routed experts: choose FP4 to serve the checkpoint's own expert weights. Our tests
+do **not** establish that either profile answers better; they are throughput checks
+plus the engine's floor tests. See [the 2026-10-08 measurements](RESULTS.md) and
+[the EXL3 design notes](docs/exl3-plan.md).
 
 ## Performance
 
-Measured on two DGX Sparks on **2026-10-08** with the `.env.example` profile: 9,574
-resident experts, 90.2 GB/node, 512K context allocation, native dense precision,
-abliteration enabled, dynamic speculative depth and adaptation active. TTS was not loaded.
+Measured on two DGX Sparks on **2026-10-08**, both profiles on the same image at 92.3 GB/node:
+512K context allocation, native dense precision, abliteration enabled, dynamic speculative
+depth and adaptation active. TTS was not loaded.
 
-| Workload | Decode speed | Time to first token |
-| --- | ---: | ---: |
-| Python LRU cache with TTL, thread safety and tests | **40.4 tok/s** (39.2–41.6) | 0.74 s |
-| Coastal-ecosystem essay | **26.4 tok/s** (26.4–26.5) | 1.18 s |
-| Angry Birds single-file HTML game | **53.4 tok/s** (52.0–54.9) | 0.23 s* |
+| Workload | EXL3 decode | EXL3 time to first token | FP4 decode |
+| --- | ---: | ---: | ---: |
+| Python LRU cache with TTL, thread safety and tests | **46.7 tok/s** (45.8–47.7) | 0.47 s | 39.4 tok/s (38.6–40.2) |
+| Coastal-ecosystem essay | **31.0 tok/s** (30.3–31.6) | 0.55 s | 25.6 tok/s (25.5–25.7) |
+| Angry Birds single-file HTML game | **64.4 tok/s** (63.9–65.0) | 0.24 s* | 49.3 tok/s (49.1–49.5) |
 
 Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
 fixed output length. Decode speed excludes time to first token. *The HTML prompt reused
-its 62 cached prompt tokens; the others reused none. These are short throughput checks,
-not answer-quality tests. Prompt content, draft acceptance, expert history and cache reuse
-affect speed. See [full results](RESULTS.md).
+its 62 cached prompt tokens; the others reused none. FP4's first-token times were 0.7–0.9 s
+except two requests that queued 16–24 s behind idle-time expert re-planning right after the
+profile switch. These are short throughput checks, not answer-quality tests. Prompt content,
+draft acceptance, expert history and cache reuse affect speed. See [full results](RESULTS.md).
 
-Change from the same benchmark earlier on 2026-10-08:
+Cold prefill (uncached random-word prompts; medians of 5 at 8K and 2 at 32K):
+
+| Prompt | EXL3 | FP4 | FP4 before 2026-10-08 |
+| --- | ---: | ---: | ---: |
+| 8K | **1,445 tok/s** (5.7 s) | 1,332 tok/s (6.2 s) | 390–470 tok/s (17–21 s) |
+| 32K | **1,394 tok/s** (23.5 s) | 1,441 tok/s (22.7 s) | 470 tok/s (70 s) |
+
+The first requests after a boot or profile switch run 1.5–3x slower while adaptation moves
+experts and kernels warm up. Prefill switches: `DSV41_ENGRAM_DIRECT=prefill`,
+`DSV41_PREFILL_CHUNK=2048`, `DSV41_PREFILL_ATTN_INDEXED=1`, `DSV41_HC_PREFILL_FUSED=1`,
+`DSV41_INDEX_FUSED=1`, `DSV41_FP4_PREFILL_DOT_SCALED=1`, `DSV41_FP4_PREFILL_SCALED_TILES=1`;
+EXL3 adds its prefill tile kernel (`DSV41_EXL3_PREFILL_KERNEL=tile`, the default).
+A larger `ARENA_GB` leaves less memory for prefill scratch: at 95.3 GB the engine halved its
+prefill chunk and 8K took 7.4 s.
+
+Decode history (FP4, same benchmark on 2026-10-08):
 
 | Workload | Before | Arithmetic switches | + Draft | + Kernels |
 | --- | ---: | ---: | ---: | ---: |
@@ -87,24 +109,15 @@ Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`. Dra
 `DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`, `DSV41_DRAFT_MARKOV_TP=1`,
 `DSV41_TP_DRAFT_ATTN=1`. Kernels: `DSV41_FP8_DECODE_BLOCK_N=32`, `DSV41_FP8_DECODE_BLOCK_K=256`,
 `DSV41_LEAN_RMS_FUSED=1`, `DSV41_HC_FRONT_FUSED=1`. Paired 22-prompt averages: **+9%**,
-**+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**.
+**+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**. Both profiles also queue the next draft
+before the host reads each verify result (`DSV41_EARLY_DRAFT`/`DSV41_EARLY_VERIFY`, on by
+default): -2.0 ± 0.5 ms a step, outputs bit-identical.
 
 Optional `DSV41_HEAD_KERNEL=packed` losslessly packs the native BF16 vocabulary
 head. The short TP2 code/prose comparison saved **146 MiB/node** and improved
 decode round speed about **2%**, with identical tested tokens and acceptance.
 The draft head must be `off`/`bf16` unless `DSV41_TP_DRAFT_HEAD=1` builds a separate
-FP8 draft shard; the example enables both.
-
-Prefill, **2026-10-08**, cold (uncached random-word prompts):
-
-| Prompt | Before | After |
-| --- | ---: | ---: |
-| 8K | 390–470 tok/s (17–21 s) | **1,423–1,471 tok/s** (5.6 s) |
-| 32K | 470 tok/s (70 s) | **1,426–1,454 tok/s** (23 s) |
-
-Switches: `DSV41_ENGRAM_DIRECT=prefill`, `DSV41_PREFILL_CHUNK=2048`, `DSV41_PREFILL_ATTN_INDEXED=1`,
-`DSV41_HC_PREFILL_FUSED=1`, `DSV41_INDEX_FUSED=1`, `DSV41_FP4_PREFILL_DOT_SCALED=1`,
-`DSV41_FP4_PREFILL_SCALED_TILES=1`. Decode is unchanged within paired noise (22 prompts).
+FP8 draft shard; the examples enable both.
 
 Reproduce an individual workload against a running server:
 
@@ -120,11 +133,13 @@ and roughly 600 GB of local NVMe space per node for the checkpoint. Clone this
 repo to the same absolute path on both nodes and enable head-to-worker SSH.
 
 ```bash
-cp .env.example .env
+cp .env.example.exl3 .env      # default; .env.example.fp4 for the native MXFP4 experts
 ```
 
 Set `MODEL_DIR`, `PEER`, `MASTER_ADDR`, `NCCL_SOCKET_IFNAME` and
-`GLOO_SOCKET_IFNAME`. Keep credentials in `.env`. Use your existing checkpoint;
+`GLOO_SOCKET_IFNAME`. Keep credentials in `.env`. Both profiles need the native
+checkpoint on both nodes; the default EXL3 profile also needs its expert packs, built
+once below before the first `dual-up.sh`. Use your existing checkpoint;
 if it is missing, run the download script on each node (requires Python 3 and
 `huggingface_hub`):
 
@@ -143,7 +158,28 @@ bash scripts/dual-up.sh
 Startup takes several minutes. The template binds to localhost; set `HOST` to
 a trusted interface to allow remote clients. The API has no authentication.
 Optional dual-rail networking needs both interfaces/subnets configured as described
-in `.env.example`.
+in the example profiles.
+
+`dual-up.sh` refuses an image built from different engine code than the checkout (rebuild
+with `dual-build.sh`, or boot the checkout directly with `scripts/dual-dev.sh` while
+developing), and refuses to report success if an EXL3 profile came up without its CUDA
+kernel (`/health` must show `"kernel": "exl3-cuda"`).
+
+### EXL3 expert packs (once, for the default profile)
+
+Only the head needs the EXL3 checkpoint (about 198 GB). After `dual-build.sh`:
+
+```bash
+hf download Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw \
+  --local-dir /path/to/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw   # next to the native checkpoint
+bash scripts/exl3-packs.sh --check
+bash scripts/exl3-packs.sh       # ~8 min a rank, then copies rank 1's pack to the worker
+```
+
+This writes one 98 GB pack per node to `<models>/exl3-packs/`, where the engine looks for it.
+The EXL3 checkpoint and the head's copy of rank 1's pack can then be deleted. Switch
+profiles by copying the other example over `.env` (keeping your edits), then
+`dual-down.sh` and `dual-up.sh`; nothing is rebuilt.
 
 ## Use
 
@@ -162,12 +198,13 @@ See the [API reference](server/README.md) for requests, thinking and tool calls.
 
 ## Example profiles
 
-[.env.example](.env.example) targets running the engine on its own:
+[.env.example.exl3](.env.example.exl3) (default) and [.env.example.fp4](.env.example.fp4) target
+running the engine on its own. They differ only in `EXPERT_FORMAT` and the predictor database:
 
 | Setting | Profile |
 | --- | --- |
 | Context allocation | 524,288 tokens, including the answer |
-| Expert memory | 92.3 GB/node; 9,800 residents; 8 transient slots |
+| Expert memory | 92.3 GB/node; residents follow the arena (EXL3 13,813, FP4 9,793); 8 transient slots |
 | Expert selection | Global dynamic allocation, router-score ranking, high sensitivity, prior 4 |
 | Adaptation | After prefill, during long answers, on urgent misses, and between requests |
 | Vision | Tower on the second node; embeddings shared with both ranks |
@@ -175,9 +212,9 @@ See the [API reference](server/README.md) for requests, thinking and tool calls.
 | Prompt cache | RAM reuse enabled; disk and post-response caching disabled |
 | Generation | Speculative depth 3/5; thinking off by default, effort 75 when enabled |
 
-For **TTS alongside the engine**, use `ARENA_GB=90.2` and
-`DSV41_RESIDENT_EXPERTS=9574`, as on the development pair. The engine-only
-example adds 226 residents and about 2.1 GB per node. Its slot capacity is checked,
+For **TTS alongside the engine**, use `ARENA_GB=90.2`, as on the development pair; the
+resident expert count follows the arena (every slot but 16). The engine-only
+example adds about 2.1 GB per node. Its slot capacity is checked,
 but sustained peak-memory headroom has not yet been validated. Both TP nodes
 need room for the increase, even when TTS runs on only one.
 
@@ -192,7 +229,7 @@ optional experiment: `shadow` learns and evaluates without moving experts;
 `apply` makes predicted swaps before prefill. Actual post-prefill adaptation stays
 active. The template leaves prediction off until you choose to collect examples.
 
-Memory headroom depends on other services. Lower the resident budget and arena,
+Memory headroom depends on other services. Lower the arena (the resident count follows)
 or context allocation, if needed. Full-length 512K quality is not established.
 Keep demand databases, predictor banks and prompt caches private and out of Git.
 
@@ -204,7 +241,8 @@ refer to the example profile, not every engine fallback default.
 
 | Setting | What it controls |
 | --- | --- |
-| `DSV41_RESIDENT_EXPERTS=9800` + `ARENA_GB=92.3` | Expert count and allocated GB **per node**. Change together; a lower count alone does not shrink the arena. The exact count overrides `PRUNE_KEEP`. Use `9574` / `90.2` for the TTS profile. |
+| `EXPERT_FORMAT=exl3` | `exl3` (default profile; needs the packs, see Setup) or `fp4` (the checkpoint's native MXFP4 experts). Same image; restart to switch. |
+| `ARENA_GB=92.3` | Expert arena GB **per node**; the resident count follows it (every slot but 16, at most all 15,360 experts, logged at boot) for either `EXPERT_FORMAT`. Use `90.2` for the TTS profile. `DSV41_RESIDENT_EXPERTS=<n>` pins a count for experiments. |
 | `MAX_SEQ=524288` | Context allocation including generated tokens. Lower it to reduce cache memory needs. |
 | `DSV41_ADAPT_SENSITIVITY=high` | How quickly new traffic changes expert ranking: `low`, `medium`, `high`, `max`; `off` freezes adaptation. Higher follows changes faster but can displace useful experts sooner. |
 | `DSV41_ADAPT_PRIOR=4` | Weight of the shipped routing trace. Lower values let your observed traffic dominate sooner. |
