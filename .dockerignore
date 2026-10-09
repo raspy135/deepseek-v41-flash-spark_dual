@@ -41,6 +41,7 @@ results/**
 results/prefix-cache*/
 results/captured_request*.pt
 .triton-cache/
+.triton/
 
 # docs travel with the repo, not with the runtime
 docs/

@@ -26,8 +26,12 @@ err()  { echo "ERROR: $*" >&2; exit 1; }
 IMAGE="${IMAGE:-deepseek-v41-flash-spark:local}"
 PEER="${PEER:-}"
 
-info "building $IMAGE (this pulls the CUDA 13 devel base and the cu130 torch wheel)"
-docker build -t "$IMAGE" .
+# The engine code this image will run (scripts/code_digest.sh), stamped as a label so dual-up.sh
+# can refuse to boot an image built from older code than the checkout.
+CODE_SHA=$("$ROOT/scripts/code_digest.sh" "$ROOT")
+GIT_DESC=$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)
+info "building $IMAGE from $GIT_DESC, code $CODE_SHA (this pulls the CUDA 13 devel base and the cu130 torch wheel)"
+docker build --label "dsv41.code_sha=$CODE_SHA" --label "dsv41.git=$GIT_DESC" -t "$IMAGE" .
 LOCAL_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 info "built $IMAGE  $LOCAL_ID"
 

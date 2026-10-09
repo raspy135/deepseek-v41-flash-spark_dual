@@ -43,7 +43,8 @@ for v in IMAGE PEER MASTER_ADDR MASTER_PORT PORT BIND_HOST MIN_FREE_GIB NAME0 NA
          NCCL_IB_ROCE_VERSION_NUM NCCL_IB_MERGE_NICS NCCL_CROSS_NIC \
          MODELS_DIR MODEL_DIR MODEL_NAME SERVED_MODEL_NAME MAX_SEQ SPEC ARENA_GB TRACE_STATS \
          PRUNE_KEEP PRUNE_SELECT TRANSIENT_SLOTS KEEP_FREE_GB EXPERT_FORMAT EXTRA_FLAGS \
-         DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S STOP_TIMEOUT; do
+         DEFAULT_THINKING DEFAULT_EFFORT DSV41_DIST_TIMEOUT_S HEALTH_TIMEOUT_S STOP_TIMEOUT \
+         ALLOW_STALE_IMAGE; do
     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
 done
 # ...and every DSV41_* the caller set. The named list above cannot keep up with the engine's
@@ -129,6 +130,29 @@ clone it there too (git clone <url> $ROOT), or set a path that exists on both."
 }
 check_box "rank 0 (local)" ""
 check_box "rank 1 ($PEER)" "$PEER"
+
+# Same image on both ranks: two builds of one tag are not one image (dual-build.sh), and a pair
+# running different engine code wedges on a mismatched collective instead of failing.
+id0=$(docker image inspect -f '{{.Id}}' "$IMAGE")
+id1=$(ssh_peer "docker image inspect -f '{{.Id}}' '$IMAGE'")
+[[ "$id0" == "$id1" ]] || err "image '$IMAGE' differs between the boxes ($id0 vs $id1): run scripts/dual-build.sh"
+
+# The image must run the checkout's engine code, unless the checkout is mounted over it
+# (dual-dev.sh sets DSV41_DEV_SOURCE=1). A stale image boots "healthy" and can be minutes per
+# request: an image built before the EXL3 CUDA kernel serves the torch reference MoE.
+CODE_SHA=$("$ROOT/scripts/code_digest.sh" "$ROOT")
+IMAGE_SHA=$(docker image inspect -f '{{index .Config.Labels "dsv41.code_sha"}}' "$IMAGE" 2>/dev/null || true)
+IMAGE_GIT=$(docker image inspect -f '{{index .Config.Labels "dsv41.git"}}' "$IMAGE" 2>/dev/null || true)
+if [[ "${DSV41_DEV_SOURCE:-0}" == "1" ]]; then
+    info "engine code: the checkout ($CODE_SHA), bind-mounted over the image"
+elif [[ "$IMAGE_SHA" == "$CODE_SHA" ]]; then
+    info "engine code: image $IMAGE matches the checkout ($CODE_SHA, built from ${IMAGE_GIT:-?})"
+elif [[ "${ALLOW_STALE_IMAGE:-0}" == "1" ]]; then
+    info "WARNING: image $IMAGE runs engine code ${IMAGE_SHA:-unlabelled}, the checkout is $CODE_SHA (ALLOW_STALE_IMAGE=1)"
+else
+    err "image $IMAGE was built from other engine code (image ${IMAGE_SHA:-unlabelled}${IMAGE_GIT:+ from $IMAGE_GIT}, checkout $CODE_SHA). \
+Rebuild it (scripts/dual-build.sh), boot the checkout (scripts/dual-dev.sh), or ALLOW_STALE_IMAGE=1 to run it anyway."
+fi
 
 # Each box's own GID index, resolved here purely so a mismatch is a message rather than a
 # QP failure 100 GB into the load. The containers resolve their own again at start.
@@ -266,7 +290,15 @@ for _ in $(seq 1 "$HEALTH_TIMEOUT_S"); do
         # broken-pipe exit 23 after a healthy launch when /health grows.
         _health_display=$(curl -sf "http://${BIND_HOST/0.0.0.0/127.0.0.1}:$PORT/health")
         printf '%s\n' "${_health_display:0:400}"
-        info "EP2 pair serving on http://$BIND_HOST:$PORT/v1"
+        # Healthy is not the same as on the fast path: the EXL3 arena falls back to the torch
+        # reference MoE (minutes per request) when its CUDA kernel did not build or load.
+        _kernel=$(printf '%s' "$_health_display" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin).get("engine_config", {}).get("kernel", ""))' 2>/dev/null || true)
+        if [[ "${EXPERT_FORMAT:-fp4}" == "exl3" && "$_kernel" != "exl3-cuda" ]]; then
+            err "EXPERT_FORMAT=exl3 came up on kernel '${_kernel:-?}', not exl3-cuda: the routed experts run the \
+torch reference. Check the image's code (scripts/dual-build.sh) and rank 0's log for the nvcc build."
+        fi
+        info "EP2 pair serving on http://$BIND_HOST:$PORT/v1 (kernel ${_kernel:-?})"
         exit 0
     fi
     sleep 1
