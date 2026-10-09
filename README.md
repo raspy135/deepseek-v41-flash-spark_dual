@@ -25,6 +25,14 @@ At the default arena not every routed expert is resident; residency follows dema
 shared across layers (the all-weights profile below removes misses entirely). Adaptation
 improves coverage; it does not guarantee full-model quality.
 
+<p align="center"><img src="assets/expert-map.png" width="820"
+  alt="The live expert map: 40 layers by 384 experts, resident experts in green, missing ones dark"></p>
+
+*The live expert map (`/expert-map`) on the head node of the default EXL3 profile: 40 layers
+by 384 experts, 13,813 resident (green) and 1,547 missing from the arena (dark). The right
+edge counts each layer's residents. They range from 326 to 367 because the layers share one
+arena, and busier layers have taken slots from quieter ones.*
+
 ## Why use this engine?
 
 - **Vision support.** Send images and text through the same chat API. 
@@ -43,7 +51,7 @@ improves coverage; it does not guarantee full-model quality.
 - **Adapt while answering.** Normal adaptation runs after prefill and during long
   answers. An urgent trigger can replace experts when recent decode misses rise;
   it does not require streaming every missing expert from disk.
-- **See what the engine is doing.** The live expert map shows loading, residency
+- **See what the engine is doing.** The live expert map (above) shows loading, residency
   and arena ownership. Request statistics expose both routing-count and
   router-score-weighted misses, making selection changes inspectable.
 
