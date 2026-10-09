@@ -35,8 +35,19 @@ class Exl3Arena:
     """GPU-resident slots of one rank's EXL3 expert slices (see tools/exl3_ref.py for the layout)."""
 
     def __init__(self, slots: int, device: torch.device | str = "cuda", tp_rank: int = 0,
-                 tp_world: int = 1, bits: float = 3.0, codebook: str = "mul1"):
+                 tp_world: int = 1, bits: float = 3.0, codebook: str = "mul1", narrow_slots: int = 0,
+                 narrow_bits: float = 2.0):
+        """`narrow_slots` > 0 (DSV41_EXL3_EXACT_SLOTS): slots [0, narrow_slots) are sized for
+        `narrow_bits` trellis and the rest for `bits`, so an all-resident arena of 2-bit and 3-bit
+        experts costs their exact bytes instead of 3-bit slots for everything (the 1,920 2-bit
+        experts of layers 18-22 waste 2.2 MB each, 4.25 GB a node). Only an all-resident store may
+        use it: a narrow slot cannot take a 3-bit expert, so slots stop being interchangeable for
+        swaps (load_slot refuses an expert wider than its slot)."""
         self.slots = int(slots)
+        self.narrow_slots = int(narrow_slots)
+        self.narrow_bits = float(narrow_bits)
+        if not 0 <= self.narrow_slots <= self.slots:
+            raise ValueError("narrow_slots out of range")
         self.device = torch.device(device)
         if tp_world not in (1, 2) or not 0 <= tp_rank < tp_world:
             raise ValueError("EXL3 expert TP supports world=1 or 2")
@@ -48,9 +59,16 @@ class Exl3Arena:
         self.down_n = self.shapes["svh2"][0]         # hidden outputs this rank holds
         dev = self.device
         i16, f16 = dict(dtype=torch.int16, device=dev), dict(dtype=torch.float16, device=dev)
-        self.t1 = torch.empty((slots, *self.shapes["t1"]), **i16)
-        self.t3 = torch.empty((slots, *self.shapes["t3"]), **i16)
-        self.t2 = torch.empty((slots, *self.shapes["t2"]), **i16)
+        # Trellis pools: wide slots [narrow_slots, slots) in t1/t3/t2, narrow ones in t1n/t3n/t2n.
+        # Uniform arenas have no narrow pool and t1[i] is slot i, as before.
+        wide = self.slots - self.narrow_slots
+        self.t1 = torch.empty((wide, *self.shapes["t1"]), **i16)
+        self.t3 = torch.empty((wide, *self.shapes["t3"]), **i16)
+        self.t2 = torch.empty((wide, *self.shapes["t2"]), **i16)
+        nshape = R.record_shapes(self.narrow_bits, tp_rank, tp_world)
+        self.t1n = torch.empty((self.narrow_slots, *nshape["t1"]), **i16)
+        self.t3n = torch.empty((self.narrow_slots, *nshape["t3"]), **i16)
+        self.t2n = torch.empty((self.narrow_slots, *nshape["t2"]), **i16)
         self.suh1 = torch.empty((slots, *self.shapes["suh1"]), **f16)
         self.suh3 = torch.empty((slots, *self.shapes["suh3"]), **f16)
         self.suh2 = torch.empty((slots, *self.shapes["suh2"]), **f16)
@@ -63,19 +81,42 @@ class Exl3Arena:
         # fills self.slots, so the table is still zeros -- and it matches the FP4 arena's null slot.
         for _n in ("suh1", "suh3", "suh2", "svh1", "svh3", "svh2"):
             getattr(self, _n).zero_()
-        self.bits = [int(self.slot_bits)] * self.slots
+        # A narrow slot starts at its own width: an unloaded slot decodes as zeros (scales are zero),
+        # but at the wide stride the kernel would read past the end of the narrow pool.
+        self.bits = [int(self.narrow_bits)] * self.narrow_slots + [int(self.slot_bits)] * wide
         self._loaded = set()
         # K2 per slot for the CUDA kernel: 2*bits (3-bit -> 6, 2-bit -> 4). A device tensor, updated
         # by load_slot, because a slot's width CHANGES when a swap loads a different expert -- a
         # host-side array snapshotted at boot would decode every 2-bit expert at the wrong stride.
-        self.bits_gpu = torch.full((slots,), 2 * int(self.slot_bits), dtype=torch.int32, device=dev)
+        self.bits_gpu = torch.tensor(self.bits, dtype=torch.int32, device=dev) * 2
         self._tensors = ("t1", "t3", "t2", "suh1", "suh3", "suh2", "svh1", "svh3", "svh2")
 
     @property
     def bytes_per_slot(self) -> int:
-        """Bytes copied per expert -- the 9 record tensors, not the per-slot `bits` metadata."""
+        """Bytes of a wide slot -- the 9 record tensors, not the per-slot `bits` metadata. The most
+        one expert can need, which is what staging buffers size for."""
 
-        return sum(getattr(self, n)[0].numel() * getattr(self, n).element_size() for n in self._tensors)
+        return sum((getattr(self, n)[0].numel() * getattr(self, n).element_size()) for n in self._tensors)
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(getattr(self, n).numel() * getattr(self, n).element_size()
+                   for n in self._tensors + ("t1n", "t3n", "t2n"))
+
+    def trellis(self, name: str, slot: int) -> torch.Tensor:
+        """Slot `slot`'s trellis tensor `name` (t1/t3/t2), from whichever pool holds it."""
+        if slot < self.narrow_slots:
+            return getattr(self, name + "n")[slot]
+        return getattr(self, name)[slot - self.narrow_slots]
+
+    def slot_ptrs(self, name: str) -> list[int]:
+        """Device address of every slot's trellis `name`, slot order (the kernels' pointer table)."""
+        out = []
+        for pool, n in ((getattr(self, name + "n"), self.narrow_slots), (getattr(self, name), self.slots - self.narrow_slots)):
+            if n:
+                stride = pool[0].numel() * pool.element_size()
+                out.extend(pool.data_ptr() + i * stride for i in range(n))
+        return out
 
     def load_slot(self, slot: int, record: dict, bits: float, non_blocking: bool = False) -> None:
         """Copy one pack record's 9 tensors into `slot`, zero-padding a 2-bit trellis to the slot width.
@@ -86,7 +127,7 @@ class Exl3Arena:
             src = record[name]
             if not isinstance(src, torch.Tensor):
                 src = torch.tensor(np.asarray(src))      # copies, so a read-only pack view is fine
-            dst = getattr(self, name)[slot]
+            dst = self.trellis(name, slot) if name.startswith("t") else getattr(self, name)[slot]
             if name.startswith("t"):
                 # Store the trellis COMPACT: a 2-bit tile is 16 uint32, not the 24 a 3-bit slot
                 # has room for. The CUDA kernel's tile stride is 4*K2 words, so a padded 2-bit
@@ -115,7 +156,7 @@ class Exl3Arena:
         w = R.tile_words(b)
         out = {}
         for name in self._tensors:
-            t = getattr(self, name)[slot]
+            t = self.trellis(name, slot) if name.startswith("t") else getattr(self, name)[slot]
             if name.startswith("t"):
                 n = int(np.prod(t.shape[:-1])) * w          # compact: drop any 3-bit padding
                 out[name] = t.reshape(-1)[:n].view(*t.shape[:-1], w)

@@ -530,7 +530,9 @@ class ExpertStore:
             if done % 500 == 0:
                 log(f"warm start {done}/{len(jobs)} experts, {self.stats['bytes_read'] / 1e9:.1f} GB, {time.time() - t0:.0f}s")
         per_slot = getattr(self.arena, "bytes_per_slot", EXPERT_BYTES)
-        log(f"warm start done: {len(jobs)} experts resident ({len(jobs) * per_slot / 1e9:.1f} GB, "
+        # an exact-slot EXL3 arena's slots differ in size: report what it holds, not slots x the widest
+        held = (self.arena.total_bytes if getattr(self.arena, "narrow_slots", 0) else len(jobs) * per_slot)
+        log(f"warm start done: {len(jobs)} experts resident ({held / 1e9:.1f} GB, "
             f"{self.stats['bytes_read'] / 1e9:.1f} GB read) in {time.time() - t0:.0f}s")
 
     def hit_rate(self):

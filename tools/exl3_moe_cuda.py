@@ -100,12 +100,10 @@ def _ptrs(arena):
     if arena.tp_world not in (1, 2):
         raise NotImplementedError("exl3_moe_cuda supports tp_world=1 or 2")
     dev = arena.t1.device
-    s = arena.slots
     out = {}
-    for name, tens in (("t1p", arena.t1), ("t3p", arena.t3), ("t2p", arena.t2)):
-        stride = tens[0].numel() * tens.element_size()
-        base = tens.data_ptr()
-        out[name] = torch.tensor([base + i * stride for i in range(s)], dtype=torch.int64, device=dev)
+    for key, name in (("t1p", "t1"), ("t3p", "t3"), ("t2p", "t2")):
+        # per slot, so an exact-slot arena's narrow and wide pools both work (Exl3Arena.slot_ptrs)
+        out[key] = torch.tensor(arena.slot_ptrs(name), dtype=torch.int64, device=dev)
     out["k2"] = arena.bits_gpu   # device tensor, updated by load_slot (widths change on swaps)
     # w2's width when it can differ from w1/w3's (engine/exl3_dense.py's shared experts: one layer
     # stores gate/up at 4 bits and down at 5); the routed pack has one width per expert

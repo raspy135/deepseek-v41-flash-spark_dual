@@ -773,9 +773,11 @@ class V41Engine:
 
         def make_expert_arena(n_slots):
             if exl3_cls is not None:
+                narrow = self.exl3_exact[0] if getattr(self, "exl3_exact", None) else 0
                 if self.ep.tensor_parallel:
-                    return exl3_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
-                return exl3_cls(n_slots, device)
+                    return exl3_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world,
+                                    narrow_slots=narrow)
+                return exl3_cls(n_slots, device, narrow_slots=narrow)
             if cb3_cls is None:
                 if self.ep.tensor_parallel:
                     return fp4_arena_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
@@ -890,6 +892,26 @@ class V41Engine:
         auto = arena_gb is None
         if auto:
             arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82)
+        # DSV41_EXL3_EXACT_SLOTS=1: every routed expert resident in a slot of its own width (2-bit
+        # experts in 4.46 MB slots instead of 6.67 MB ones: 4.25 GB a node), plus the auto budget's
+        # margin and the transient ring at full width. The arena is exactly that size; ARENA_GB
+        # only has to be large enough, and a cap below it is an error, not a smaller arena.
+        self.exl3_exact = None
+        if exl3_cls is not None and os.environ.get("DSV41_EXL3_EXACT_SLOTS", "0") == "1":
+            import exl3_ref as _XR
+            from engine.expert_budget import AUTO_MARGIN
+            _tw = self.ep.world if self.ep.tensor_parallel else 1
+            _tr = self.ep.rank if self.ep.tensor_parallel else 0
+            _hdr = _XR.PackReader(exl3_pack_path(model_dir, _tr, _tw))
+            narrow = sum(1 for m in _hdr.records.values() if float(m["bits"]) <= 2.0)
+            n_wide = len(_hdr.records) - narrow + AUTO_MARGIN + transient_slots
+            exact_bytes = (narrow * _XR.record_nbytes(2.0, _tr, _tw)
+                           + n_wide * _XR.record_nbytes(3.0, _tr, _tw))
+            if not auto and arena_gb * 1e9 < exact_bytes:
+                raise ValueError(f"DSV41_EXL3_EXACT_SLOTS holds every routed expert: ARENA_GB must be at least "
+                                 f"{exact_bytes / 1e9:.2f} (have {arena_gb})")
+            arena_gb = exact_bytes / 1e9
+            self.exl3_exact = (narrow, n_wide)
         if host_avail is not None:
             cap = (host_avail - keep_free_gb * 1e9 - replica_bytes) / 1e9
             if cap < 10.0:
@@ -904,6 +926,10 @@ class V41Engine:
                     f"Wait for the previous engine's memory to be reclaimed (watch MemAvailable in "
                     f"/proc/meminfo) or lower --arena-gb/KEEP_FREE_GB.")
             if arena_gb > cap:
+                if self.exl3_exact:
+                    raise RuntimeError(f"DSV41_EXL3_EXACT_SLOTS needs a {arena_gb:.2f} GB arena but only {cap:.1f} GB "
+                                       f"is free above keep_free {keep_free_gb} GB (MemAvailable "
+                                       f"{host_avail / 1e9:.1f} GB): free memory (context, caches, vision) or turn it off")
                 log(f"arena {arena_gb:.1f} GB capped to {cap:.1f} GB (MemAvailable {host_avail / 1e9:.1f} GB, "
                     f"keep_free {keep_free_gb} GB)")
                 arena_gb = max(10.0, cap)
@@ -927,6 +953,10 @@ class V41Engine:
                     f"{(need - host_avail) / 1e9:.1f} GB, or stop whatever else holds memory "
                     f"(on this box a boot-time vLLM container used to take 85 GB).")
         slots = int(arena_gb * 1e9 / self.expert_bytes)
+        if self.exl3_exact:
+            slots = sum(self.exl3_exact)
+            log(f"DSV41_EXL3_EXACT_SLOTS: {self.exl3_exact[0]} 2-bit + {self.exl3_exact[1]} 3-bit slots "
+                f"(incl. {transient_slots} transient) = {arena_gb:.2f} GB, every routed expert resident")
         self.arena_gb, self.slots = round(arena_gb, 1), slots
         log(f"CUDA free {free / 1e9:.1f} GB of {total / 1e9:.1f}; host MemAvailable "
             f"{(host_avail or 0) / 1e9:.1f} GB; arena {arena_gb:.1f} GB = {slots} {self.expert_format} "
@@ -965,6 +995,11 @@ class V41Engine:
             total = self.args.n_layers * self.args.n_routed_experts
             log(f"DSV41_RESIDENT_EXPERTS=auto: {self.resident_budget} of {total} routed experts resident "
                 f"({100 * self.resident_budget / total:.1f}%) in {self.store.lru_slots} LRU slots")
+        if self.exl3_exact and self.resident_budget != self.args.n_layers * self.args.n_routed_experts:
+            # A narrow slot cannot take a 3-bit expert, so slots are not interchangeable: only a store
+            # that never swaps (everything resident) may use them.
+            raise ValueError("DSV41_EXL3_EXACT_SLOTS requires every routed expert resident: leave "
+                             "DSV41_RESIDENT_EXPERTS unset (auto)")
         # load the DSpark experts (all 3 x 128 resident in their own arena)
         for k in range(3):
             for e in range(128):
@@ -1375,6 +1410,7 @@ class V41Engine:
                                         if self.expert_format == "exl3" else None),
                 "early_verify": EARLY_VERIFY,
                 "early_draft": EARLY_DRAFT,
+                "exl3_exact_slots": list(self.exl3_exact) if self.exl3_exact else None,
                 "exl3_dense": (self.exl3_dense.source_sha256 if self.exl3_dense is not None else None),
                 "exl3_dense_version": 1,
                 "attn_staged": os.environ.get("DSV41_ATTN_STAGED", "0"),
@@ -3432,7 +3468,9 @@ class V41Engine:
             "arena_slots": self.slots,
             "lru_slots": self.store.lru_slots,
             "transient_slots": self.store.transient_slots,
-            "resident_expert_pct": round(self.slots / (self.args.n_layers * self.args.n_routed_experts) * 100, 1),
+            # experts the arena holds, not slots: exact-slot arenas carry margin/transient slots too
+            "resident_expert_pct": round(min(len(self.store.lru), self.args.n_layers * self.args.n_routed_experts)
+                                         / (self.args.n_layers * self.args.n_routed_experts) * 100, 1),
             "max_seq": self.max_context,
             "index_topk": self.args.index_topk,
             "candidate_topk_blocks": self.args.candidate_topk_blocks,

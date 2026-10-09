@@ -59,6 +59,27 @@ def check_grouping():
     ok(True, "decode grouping == serial scan (T 1-10, pools 3-1000, -1 picks)")
 
 
+def check_kernels(arena, tag):
+    torch.manual_seed(0)
+    for T in (1, 2, 4, 6):
+        x = (torch.randn(T, X3.DIM, dtype=torch.float32, device="cuda") * 0.1).to(torch.bfloat16)
+        slots = torch.randint(0, E, (T, 6), dtype=torch.int32, device="cuda")
+        w = torch.rand(T, 6, device="cuda")
+        ref = X3.moe_forward_exl3_ref(x, slots, w, arena, 10.0, out_dtype=torch.float32)
+        got = XC.moe_forward(x, slots, w, arena, 10.0)
+        rel = float((got - ref).norm() / ref.norm())
+        ok(rel < 2e-2, f"{tag}: T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
+    # prefill shapes go through build_routing + the same pipeline
+    for T in (128, 512):
+        x = (torch.randn(T, X3.DIM, dtype=torch.float32, device="cuda") * 0.1).to(torch.bfloat16)
+        slots = torch.randint(0, E, (T, 6), dtype=torch.int32, device="cuda")
+        w = torch.rand(T, 6, device="cuda")
+        ref = X3.moe_forward_exl3_ref(x, slots, w, arena, 10.0, out_dtype=torch.float32)
+        got = XC.moe_forward_prefill(x, slots, w, arena, 10.0)
+        rel = float((got - ref).norm() / ref.norm())
+        ok(rel < 2e-2, f"{tag}: prefill T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no CUDA")
@@ -69,31 +90,25 @@ def main():
     l3 = [L for L in range(40) if bits[L] == 3][: max(1, E // 2)]
     l2 = [L for L in range(40) if bits[L] == 2][: E - len(l3)]
     layers = l3 + l2                       # mixed 3-bit and 2-bit slots
-    arena = X3.Exl3Arena(E, device="cuda", tp_rank=0, tp_world=1, bits=3.0)
-    for i, L in enumerate(layers):
-        arena.load_slot(i, src.record(L, 0, 0, 1), bits[L])
-    print(f"layers {layers} bits {[bits[L] for L in layers]}")
-
-    torch.manual_seed(0)
-    for T in (1, 2, 4, 6):
-        x = (torch.randn(T, X3.DIM, dtype=torch.float32, device="cuda") * 0.1).to(torch.bfloat16)
-        slots = torch.randint(0, E, (T, 6), dtype=torch.int32, device="cuda")
-        w = torch.rand(T, 6, device="cuda")
-        ref = X3.moe_forward_exl3_ref(x, slots, w, arena, 10.0, out_dtype=torch.float32)
-        got = XC.moe_forward(x, slots, w, arena, 10.0)
-        rel = float((got - ref).norm() / ref.norm())
-        ok(rel < 2e-2, f"T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
-
-    # prefill shapes go through build_routing + the same pipeline
-    for T in (128, 512):
-        x = (torch.randn(T, X3.DIM, dtype=torch.float32, device="cuda") * 0.1).to(torch.bfloat16)
-        slots = torch.randint(0, E, (T, 6), dtype=torch.int32, device="cuda")
-        w = torch.rand(T, 6, device="cuda")
-        ref = X3.moe_forward_exl3_ref(x, slots, w, arena, 10.0, out_dtype=torch.float32)
-        got = XC.moe_forward_prefill(x, slots, w, arena, 10.0)
-        rel = float((got - ref).norm() / ref.norm())
-        ok(rel < 2e-2, f"prefill T={T} kernel vs reference rel L2 {rel:.3e}  ({tuple(got.shape)})")
-
+    # uniform 3-bit-sized slots, then an exact-slot arena (DSV41_EXL3_EXACT_SLOTS): 2-bit experts in
+    # the narrow pool [0, len(l2)), 3-bit ones in the wide pool after it
+    for narrow in (0, len(l2)):
+        arena = X3.Exl3Arena(E, device="cuda", tp_rank=0, tp_world=1, bits=3.0, narrow_slots=narrow)
+        order = (l2 + l3) if narrow else layers
+        for i, L in enumerate(order):
+            arena.load_slot(i, src.record(L, 0, 0, 1), bits[L])
+        tag = f"exact slots ({narrow} narrow)" if narrow else "uniform slots"
+        print(f"{tag}: layers {order} bits {[bits[L] for L in order]}, {arena.total_bytes / 1e6:.1f} MB")
+        if narrow:
+            try:
+                arena.load_slot(0, src.record(l3[0], 0, 0, 1), bits[l3[0]])
+                ok(False, "a narrow slot accepted a 3-bit expert")
+            except ValueError:
+                ok(True, "a narrow slot refuses a 3-bit expert")
+            arena.load_slot(0, src.record(order[0], 0, 0, 1), bits[order[0]])
+            back = arena.read_slot(0)["t1"].cpu().numpy()
+            ok((back == np.asarray(src.record(order[0], 0, 0, 1)["t1"])).all(), "narrow slot round-trips its trellis")
+        check_kernels(arena, tag)
     print(f"\n{'FAIL: ' + str(len(fails)) if fails else 'all checks passed'}")
     return 1 if fails else 0
 

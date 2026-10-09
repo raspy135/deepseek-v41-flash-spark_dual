@@ -52,6 +52,30 @@ class Exl3ExpertStore(ExpertStore):
         size = self.expert_bytes + 8 * ALIGN
         self.stage = [torch.empty(size, dtype=torch.uint8, pin_memory=True) for _ in range(self.io_threads)]
         self.stage_mv = [memoryview(b.numpy()) for b in self.stage]
+        # Exact-size slots (Exl3Arena.narrow_slots): free slots by width. The base class's single
+        # free list is emptied so nothing else hands out a slot without looking at the width; the
+        # mode is all-resident only (the engine checks), so the eviction path is never needed.
+        self._exact = getattr(arena, "narrow_slots", 0) > 0
+        if self._exact:
+            self._free_narrow = [s for s in self.free_lru if s < arena.narrow_slots]
+            self._free_wide = [s for s in self.free_lru if s >= arena.narrow_slots]
+            self.free_lru = []
+
+    def _lru_slot_for(self, key: tuple, used=frozenset()) -> int:
+        if not self._exact:
+            return super()._lru_slot_for(key, used)
+        meta = self.pack.records.get(tuple(key))
+        if meta is None:
+            raise KeyError(f"pack has no record for {key}")
+        narrow = float(meta["bits"]) <= self.arena.narrow_bits
+        pool = self._free_narrow if narrow and self._free_narrow else self._free_wide
+        if not pool:
+            raise RuntimeError(f"DSV41_EXL3_EXACT_SLOTS: no free {'narrow' if narrow else 'wide'} slot for {key}; "
+                               "exact slots hold every expert once and never evict")
+        slot = pool.pop()
+        self.lru[key] = slot
+        self.slot_key[slot] = key
+        return slot
 
     # -- the read path ---------------------------------------------------------------------------
     def _read_leased(self, layer: int, expert: int, prefix, sink):
