@@ -74,7 +74,8 @@ EXL3 reads fewer bytes per expert, which is most of a decode step, and leaves fe
 experts missing; that is why it is the default. The cost is requantization error in the
 routed experts: choose FP4 to serve the checkpoint's own expert weights. Our tests
 do **not** establish that either profile answers better; they are throughput checks
-plus the engine's floor tests. See [the 2026-10-08 measurements](RESULTS.md) and
+plus the engine's floor tests. In use, FP4 has sometimes answered specialised prompts
+better ([FP4 profile](#fp4-profile-native-mxfp4-experts)). See [the 2026-10-08 measurements](RESULTS.md) and
 [the EXL3 design notes](docs/exl3-plan.md).
 
 ## Performance
@@ -143,43 +144,60 @@ python3 bench/bench.py --model deepseek --workload code --osl 512 \
 ## Setup
 
 You need two DGX Sparks, Docker with NVIDIA GPU support, a working RoCE link,
-and roughly 600 GB of local NVMe space per node for the checkpoint. Clone this
-repo to the same absolute path on both nodes and enable head-to-worker SSH.
+and roughly 600 GB of local NVMe space per node for the checkpoint (the EXL3 profile
+adds a 98 GB pack per node). Enable head-to-worker SSH, and clone this repo to the
+same absolute path on both nodes:
 
 ```bash
-cp .env.example.exl3 .env      # default; .env.example.fp4 for the native MXFP4 experts
+git clone https://github.com/raspy135/deepseek-v41-flash-spark_dual.git
+```
+
+**1. Pick a profile** (on the head):
+
+```bash
+cp .env.example.exl3 .env      # EXL3 experts (default): faster decode, 90% resident
+cp .env.example.fp4 .env       # or FP4: the checkpoint's own expert weights, no packs
 ```
 
 Set `MODEL_DIR`, `PEER`, `MASTER_ADDR`, `NCCL_SOCKET_IFNAME` and
-`GLOO_SOCKET_IFNAME`. Keep credentials in `.env`. Both profiles need the native
-checkpoint on both nodes; the default EXL3 profile also needs its expert packs, built
-once below before the first `dual-up.sh`. Use your existing checkpoint;
-if it is missing, run the download script on each node (requires Python 3 and
-`huggingface_hub`):
+`GLOO_SOCKET_IFNAME`. Keep credentials in `.env`.
+
+**2. Checkpoint.** Both profiles need the native checkpoint on both nodes. Use your
+existing checkpoint; if it is missing, run the download script on each node (requires
+Python 3 and `huggingface_hub`). It exits at once if the checkpoint is already complete:
 
 ```bash
 (set -a; source .env; set +a; bash scripts/download-model.sh)
 ```
 
-Then run on the head:
+**3. Build the image** on the head. It builds once and copies the image to the worker;
+both profiles use the same image:
 
 ```bash
-bash scripts/dual-build.sh       # builds once and copies the image to the worker
+bash scripts/dual-build.sh
+```
+
+**4. EXL3 packs** (EXL3 profile only, once; skip for FP4) — see
+[below](#exl3-expert-packs-once-for-the-exl3-profile).
+
+**5. Start** on the head:
+
+```bash
 bash scripts/dual-up.sh --check
 bash scripts/dual-up.sh
 ```
 
-Startup takes several minutes. The template binds to localhost; set `HOST` to
-a trusted interface to allow remote clients. The API has no authentication.
-Optional dual-rail networking needs both interfaces/subnets configured as described
-in the example profiles.
+Startup takes several minutes, and the first request after a boot is slower while kernels
+warm up. The template binds to localhost; set `HOST` to a trusted interface to allow
+remote clients. The API has no authentication. Optional dual-rail networking needs both
+interfaces/subnets configured as described in the example profiles.
 
 `dual-up.sh` refuses an image built from different engine code than the checkout (rebuild
 with `dual-build.sh`, or boot the checkout directly with `scripts/dual-dev.sh` while
 developing), and refuses to report success if an EXL3 profile came up without its CUDA
 kernel (`/health` must show `"kernel": "exl3-cuda"`).
 
-### EXL3 expert packs (once, for the default profile)
+### EXL3 expert packs (once, for the EXL3 profile)
 
 Only the head needs the EXL3 checkpoint (about 198 GB). After `dual-build.sh`:
 
@@ -191,9 +209,32 @@ bash scripts/exl3-packs.sh       # ~8 min a rank, then copies rank 1's pack to t
 ```
 
 This writes one 98 GB pack per node to `<models>/exl3-packs/`, where the engine looks for it.
-The EXL3 checkpoint and the head's copy of rank 1's pack can then be deleted. Switch
-profiles by copying the other example over `.env` (keeping your edits), then
-`dual-down.sh` and `dual-up.sh`; nothing is rebuilt.
+Re-running keeps packs that already exist (`--force` rebuilds them). The EXL3 checkpoint
+and the head's copy of rank 1's pack can then be deleted.
+
+### FP4 profile (native MXFP4 experts)
+
+The FP4 profile serves the routed experts exactly as DeepSeek ships them, so it needs
+nothing beyond the native checkpoint: no EXL3 download, no packs.
+
+```bash
+cp .env.example.fp4 .env         # then set the same five values as in step 1
+bash scripts/dual-build.sh       # skip if the image is already built
+bash scripts/dual-up.sh
+```
+
+`/health` shows `"expert_format": "fp4"` and `"kernel": "triton-fp4"`. At the same
+`ARENA_GB=92.3`, FP4 keeps 9,793 experts resident (64%) where EXL3 keeps 13,813, and
+decodes 16-23% slower ([table](#exl3-default-or-fp4-experts)). In exchange, the experts
+are the checkpoint's own weights rather than a 2.9 bpw requantization (2-bit in layers
+18-22). **In our own use FP4 has sometimes given better answers**, for example on
+detailed security questions. That is an observation, not a measured result: our quality
+suite has not compared the two profiles head to head. If answer quality in your domain
+matters more than decode speed, try FP4.
+
+**Switching profiles:** copy the other example over `.env` (keeping your edits), then
+`scripts/dual-down.sh` and `scripts/dual-up.sh`. Nothing is rebuilt. Switching to EXL3
+needs its packs.
 
 ## Use
 
