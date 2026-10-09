@@ -49,11 +49,31 @@ class ExactResidentBudgetTest(unittest.TestCase):
     def test_invalid_budget_and_fixed_mode_rejected(self):
         from engine.expert_budget import resident_budget
         args=dict(dynamic=True,layers=40,experts=384,topk=6,fraction=.61)
-        self.assertIsNone(resident_budget('',**args))
+        self.assertEqual(resident_budget('',**args),'auto')   # unset = auto under dynamic allocation
         for raw in ('239','15361','9500.5'):
             with self.assertRaises(ValueError):resident_budget(raw,**args)
         args['dynamic']=False
         with self.assertRaises(ValueError):resident_budget('9500',**args)
+        self.assertIsNone(resident_budget('',**args))         # static profiles: PRUNE_KEEP decides
+
+
+class AutoResidentBudgetTest(unittest.TestCase):
+    def test_auto_follows_the_arena(self):
+        from engine.expert_budget import resident_budget, auto_budget, AUTO_MARGIN
+        args = dict(dynamic=True, layers=40, experts=384, topk=6, fraction=.61)
+        self.assertEqual(resident_budget('auto', **args), 'auto')
+        self.assertEqual(resident_budget(' AUTO ', **args), 'auto')
+        kw = dict(layers=40, experts=384, topk=6)
+        self.assertEqual(auto_budget(13514, **kw), 13514 - AUTO_MARGIN)   # EXL3 at ARENA_GB=90.2
+        self.assertEqual(auto_budget(9586, **kw), 9586 - AUTO_MARGIN)     # FP4 at ARENA_GB=90.2
+        self.assertEqual(auto_budget(20000, **kw), 15360)                 # everything fits: all of it
+        with self.assertRaises(ValueError):
+            auto_budget(40 * 6 + AUTO_MARGIN - 1, **kw)
+
+    def test_auto_still_needs_dynamic_allocation(self):
+        from engine.expert_budget import resident_budget
+        with self.assertRaises(ValueError):
+            resident_budget('auto', dynamic=False, layers=40, experts=384, topk=6, fraction=.61)
 
 
 if __name__ == '__main__':

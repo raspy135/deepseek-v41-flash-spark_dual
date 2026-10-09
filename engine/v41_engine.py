@@ -77,6 +77,12 @@ PREFILL_SWAP_MIN_MISS = ADAPT.swap_prefill_min_miss
 # Sampling semantics are untouched: the temperature > 0 path is the ORIGINAL code, RNG draw for RNG
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
+# Queue the verify's first (Engram-free) segment before the host waits for the hash ids
+# (_engram_rows_async). Host ordering only: the GPU runs the same kernels in the same order.
+EARLY_VERIFY = os.environ.get("DSV41_EARLY_VERIFY", "1") == "1"
+# Greedy decode: queue the next draft right after the verify, from the accept count on the GPU
+# (FastDecoder.draft_ahead), instead of after the host has read it. Same draft inputs, same graph.
+EARLY_DRAFT = os.environ.get("DSV41_EARLY_DRAFT", "1") == "1"
 
 # Experiments stay off until their two-rank gates and representative A/Bs pass.
 LOOKUP_DRAFT_ENABLED = os.environ.get("DSV41_LOOKUP_DRAFT_ENABLED", "0") == "1"
@@ -518,12 +524,16 @@ class V41Engine:
         # Whether the EXL3 JIT decode kernel is usable. Decided here, not later, because the
         # graph-gated features below need it; cuda_available() triggers the one nvcc build.
         self.exl3_cuda = False
+        self.exl3_cuda_source = None
         if (expert_format or "fp4").lower() == "exl3":
             try:
                 import exl3_moe as _X3
                 self.exl3_cuda = _X3.cuda_available()
             except Exception:  # noqa: BLE001
                 self.exl3_cuda = False
+            if self.exl3_cuda:
+                import exl3_moe_cuda as _XC
+                self.exl3_cuda_source = _XC.source_digest()
         if (expert_format or "fp4").lower() == "exl3" and not self.exl3_cuda and self.draft_bypass_enabled:
             log("EXL3: DSV41_DRAFT_BYPASS needs a capturable MoE; disabled with the reference")
             self.draft_bypass_enabled = False
@@ -736,7 +746,8 @@ class V41Engine:
             `out_dtype` is the EP2 hook (engine/model.py::moe): fp32 keeps this rank's HALF of
             the k-sum unrounded until after the all-reduce. Both arena formats take it now."""
             if exl3_cls is not None and isinstance(arena, exl3_cls):
-                return exl3_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype)
+                return exl3_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
+                                   routing_ids=routing_ids, routing_slot_map=routing_slot_map)
             if cb3_cls is not None and isinstance(arena, cb3_cls):
                 # out_dtype/slots_repeat are the EP2 hooks, same meaning as the FP4 path below.
                 # null_slot is not passed: the CB3 kernels have no skip, so a pair routed at the
@@ -831,6 +842,28 @@ class V41Engine:
                     f" where expert % {self.ep.world} == {self.ep.rank}, unowned ones map to its null slot")
 
         self.W = Weights(model_dir, index, self.args, device, log=log, act_quant=act_quant)
+        # DSV41_EXL3_DENSE: the decode graph's attention + shared-expert matrices from the EXL3
+        # dense pack (engine/exl3_dense.py). Loaded before the arena so its ~2.1 GB is counted.
+        self.exl3_dense = None
+        from engine import exl3_dense as _X3D
+        if _X3D.enabled():
+            if self.expert_format != "exl3" or not self.exl3_cuda or not self.ep.tensor_parallel or self.ep.world != 2:
+                raise ValueError("DSV41_EXL3_DENSE needs EXPERT_FORMAT=exl3 with its CUDA kernel under TP2")
+            if (os.environ.get("DSV41_TP_ATTN", "0") != "1"
+                    or os.environ.get("DSV41_TP_LINEAR_LAYOUT", "output") != "output"
+                    or os.environ.get("DSV41_TP_DENSE", "0") != "1"):
+                raise ValueError("the EXL3 dense pack is sliced for TP attention/dense with the output layout")
+            _t0 = time.perf_counter()
+            self.exl3_dense = _X3D.Exl3Dense(_X3D.pack_path(model_dir, self.ep.rank, self.ep.world), device,
+                                             self.ep.rank, self.ep.world, self.args.n_layers)
+            have = ((self.exl3_dense.ablit_meta or {}).get("sha256") or "")[:16]
+            if have != R_ablit.digest():
+                raise ValueError(f"EXL3 dense pack ablit term {have or 'none'} != DSV41_ABLIT_WOB "
+                                 f"{R_ablit.digest() or 'none'}: rebuild the pack with the overlay in use")
+            self.exl3_dense.attach(self.W.layers)
+            log(f"EXL3 dense decode matrices: {self.exl3_dense.bytes / 2**30:.2f} GiB in "
+                f"{time.perf_counter() - _t0:.1f}s, source {self.exl3_dense.source_sha256[:16]}, "
+                f"ablit {'rank-1 term' if have else 'off'}")
         if R.dense_fp4_groups():
             # the load-time fp8 -> fp4 re-quantization leaves ~2.4 GB of fp32 scratch blocks in the
             # caching allocator; hand them back before the expert arena asks for its 90 GB.
@@ -924,6 +957,14 @@ class V41Engine:
             self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
                                         io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
             self.dspark_reader = self.store
+        if self.resident_budget == 'auto':
+            from engine.expert_budget import auto_budget
+            self.resident_budget = auto_budget(self.store.lru_slots, layers=self.args.n_layers,
+                                               experts=self.args.n_routed_experts,
+                                               topk=self.args.n_activated_experts)
+            total = self.args.n_layers * self.args.n_routed_experts
+            log(f"DSV41_RESIDENT_EXPERTS=auto: {self.resident_budget} of {total} routed experts resident "
+                f"({100 * self.resident_budget / total:.1f}%) in {self.store.lru_slots} LRU slots")
         # load the DSpark experts (all 3 x 128 resident in their own arena)
         for k in range(3):
             for e in range(128):
@@ -1326,6 +1367,16 @@ class V41Engine:
                 "decode_lean_softmax": os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1",
                 "decode_lean_moe": os.environ.get("DSV41_DECODE_LEAN_MOE", "1") == "1",
                 "decode_lean_attn": os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1",
+                "exl3_merged": (os.environ.get("DSV41_EXL3_MERGED", "1") == "1"
+                                if self.expert_format == "exl3" else None),
+                "exl3_cuda_source": self.exl3_cuda_source,
+                # prefill tile vs grouped kernel sum K in different orders; BM/tile shape do not
+                "exl3_prefill_kernel": (os.environ.get("DSV41_EXL3_PREFILL_KERNEL", "tile")
+                                        if self.expert_format == "exl3" else None),
+                "early_verify": EARLY_VERIFY,
+                "early_draft": EARLY_DRAFT,
+                "exl3_dense": (self.exl3_dense.source_sha256 if self.exl3_dense is not None else None),
+                "exl3_dense_version": 1,
                 "attn_staged": os.environ.get("DSV41_ATTN_STAGED", "0"),
                 "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
                 "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
@@ -1461,8 +1512,9 @@ class V41Engine:
                 self.fast.build_lut()
                 # prefill routes through Model.moe, which takes the same table when it is there
                 self.model.slot_lut = self.fast.lut
-                if self.ep.active and self.kernel == "triton-fp4":
-                    # Stable, compact per-layer IDs: resident owned experts plus one null.
+                if self.ep.active and self.kernel in ("triton-fp4", "exl3-cuda"):
+                    # Stable, compact per-layer IDs: resident owned experts plus one null (EXL3 is
+                    # TP with no null slot: its entry is -1, which the router never selects).
                     # Built once on the host; serving needs only a fixed-shape device gather.
                     routes = {}
                     for L in range(len(self.W.layers)):
@@ -1470,7 +1522,8 @@ class V41Engine:
                         ids = torch.full((384,), len(owned), dtype=torch.int32)
                         for i, (e, _) in enumerate(owned):
                             ids[e] = i
-                        slots = torch.tensor([s for _, s in owned] + [self.store.null_slot], dtype=torch.int32)
+                        null = self.store.null_slot if self.store.null_slot is not None else -1
+                        slots = torch.tensor([s for _, s in owned] + [null], dtype=torch.int32)
                         routes[L] = (ids.to(device), slots.to(device))
                     self.model.prefill_routes = routes
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
@@ -2457,6 +2510,33 @@ class V41Engine:
                 return 2 if check['reason'] == 'urgent' else 1
         return 0
 
+    def _engram_rows_async(self, hashes):
+        """Start the verify block's hash-id D2H on a side stream; return the `rows` callable
+        FastDecoder.step invokes at its first Engram boundary. The callable waits for that copy
+        only (not for anything queued after the hash on the main stream) and submits the reads."""
+        main = torch.cuda.current_stream()
+        side = getattr(self, "_hash_stream", None)
+        if side is None:
+            side = self._hash_stream = torch.cuda.Stream(device=self.device)
+            self._hash_pinned = {}
+        key = (tuple(hashes.shape), hashes.dtype)
+        buf = self._hash_pinned.get(key)
+        if buf is None:
+            buf = self._hash_pinned[key] = torch.empty(hashes.shape, dtype=hashes.dtype, pin_memory=True)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            buf.copy_(hashes, non_blocking=True)
+        hashes.record_stream(side)
+        done = torch.cuda.Event()
+        done.record(side)
+
+        def rows():
+            done.synchronize()
+            h_np = buf.numpy()
+            return {L: (self.eg_pool.submit(self.tables[L].read_raw, h_np[:, li, :]), self.tables[L].to_device)
+                    for li, L in enumerate(self.args.engram_layer_ids)}
+        return rows
+
     def maintain_decode(self, n_out: int) -> int:
         """Re-fit the resident experts mid-decode. Both ranks reach this unconditionally when
         rank 0's control() flag says so -- the top of a decode step is a lockstep point, the same
@@ -2893,6 +2973,8 @@ class V41Engine:
         self._decode_adapt_mark = ((n_out, decode_snapshot()) if decode_adapt else None)
         self._urgent_adapt = None
         self._urgent_graph_count = len(self.fast.graphs) if self.fast is not None else 0
+        if self.fast is not None:
+            self.fast._ahead = None   # never carry a queued draft across requests
         if decode_adapt and ADAPT.urgent:
             from engine.urgent_adapt import UrgentAdaptWindow
             self._urgent_adapt = UrgentAdaptWindow(n_out, self._decode_adapt_mark[1],
@@ -2903,6 +2985,8 @@ class V41Engine:
                               self._decode_adapt_due(n_out) if (decode_adapt and n_out < max_tokens
                                                                and tok not in stop_ids) else 0):
             if self.ep.control_flag:
+                if self.fast is not None:
+                    self.fast._ahead = None   # an adaptation pass may recapture graphs over d_out
                 self.maintain_decode(n_out)
             t_iter = time.perf_counter()
             # A step that captures a CUDA graph (first use of a width/parity/bucket, or the
@@ -2993,20 +3077,35 @@ class V41Engine:
                     if ph is not None:
                         ph.mark("hash")
                     # both tables' rows are read in background threads (NVMe only, no CUDA calls there) and
-                    # each is dequantized on the main thread when its layer needs it. The hash ids go to the
-                    # host HERE, before any graph is queued: a .cpu() later would wait for the whole step.
-                    h_np = hashes.cpu().numpy()
-                    if ph is not None:
-                        ph.mark("hash_d2h")
-                    futs = {L: (self.eg_pool.submit(self.tables[L].read_raw, h_np[:, li, :]), self.tables[L].to_device)
-                            for li, L in enumerate(self.args.engram_layer_ids)}
-                    if ph is not None:
-                        ph.mark("submit")
-                    if getattr(self, "_cooperative_decode", False):
-                        from engine.decode_events import VerifyStep
-                        logits, mh = yield VerifyStep(block, pos, lambda: futs)
+                    # each is dequantized on the main thread when its layer needs it.
+                    if EARLY_VERIFY and not getattr(self, "_cooperative_decode", False):
+                        # The hash ids leave on a side stream, so the host does not wait for the
+                        # drafter before it queues the verify: FastDecoder.step replays layer 0 (no
+                        # Engram) first and calls `rows` only at the layer-1 boundary. Before this,
+                        # .cpu() here returned when the drafter finished and the GPU then idled
+                        # ~1.3 ms a step while the host prepared and queued layer 0. Same work,
+                        # same stream order on the GPU; only the host's waiting moved.
+                        rows = self._engram_rows_async(hashes)
+                        if ph is not None:
+                            ph.mark("hash_d2h")
+                            ph.mark("submit")
+                        logits, mh = self.fast.step(block, pos, rows)
                     else:
-                        logits, mh = self.fast.step(block, pos, lambda: futs)
+                        # The hash ids go to the host HERE, before any graph is queued: a .cpu()
+                        # later would wait for the whole step.
+                        h_np = hashes.cpu().numpy()
+                        if ph is not None:
+                            ph.mark("hash_d2h")
+                        futs = {L: (self.eg_pool.submit(self.tables[L].read_raw, h_np[:, li, :]),
+                                    self.tables[L].to_device)
+                                for li, L in enumerate(self.args.engram_layer_ids)}
+                        if ph is not None:
+                            ph.mark("submit")
+                        if getattr(self, "_cooperative_decode", False):
+                            from engine.decode_events import VerifyStep
+                            logits, mh = yield VerifyStep(block, pos, lambda: futs)
+                        else:
+                            logits, mh = self.fast.step(block, pos, lambda: futs)
                     if ph is not None:
                         ph.mark("step")
                 else:
@@ -3040,7 +3139,20 @@ class V41Engine:
                     acc = am[:depth].eq(block[1:]).to(torch.int32).cumprod(0)
                     vout[0] = acc.sum()
                     vout[1:].copy_(am)
-                    vhost.copy_(vout)
+                    # Both ranks take this branch together (lean and the modes come from control()),
+                    # so the drafter's collectives stay paired.
+                    ahead = (EARLY_DRAFT and not copied and lookup is None and bypass is None
+                             and conf_pol is None and not getattr(self, "_cooperative_decode", False))
+                    if ahead:
+                        vhost.copy_(vout, non_blocking=True)
+                        # the urgent-adaptation check reads these at the top of the next step
+                        m.stage_decode_miss()
+                        _vready = torch.cuda.Event()
+                        _vready.record()
+                        ahead = self.fast.draft_ahead(vout[:1], am, pos)
+                        _vready.synchronize()
+                    else:
+                        vhost.copy_(vout)
                     v = vhost.tolist()
                     a, cand = v[0], v[1:]
                     new = cand[:a]
@@ -3074,6 +3186,9 @@ class V41Engine:
                     emitted = emitted[:max_tokens - n_out]
                     pos = pos + a + 1
                     tok = emitted[-1] if emitted else tok
+                    if ahead and bonus is not None:
+                        # what draft() will be asked next; a stop or a clamp ends the loop instead
+                        self.fast._ahead = (tok, pos - 1)
                     if emitted:
                         if lookup is not None:
                             lookup.extend(emitted)
@@ -3370,6 +3485,13 @@ class V41Engine:
             "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
             "fp4_cuda_v2": self.fp4_cuda_v2,
             "fp4_cuda_source": self.fp4_cuda_source,
+            "exl3_cuda_source": self.exl3_cuda_source,
+            "early_verify": EARLY_VERIFY,
+            "early_draft": EARLY_DRAFT,
+            "exl3_dense": (os.path.basename(self.exl3_dense.path) if self.exl3_dense is not None else None),
+            "exl3_dense_gib": (round(self.exl3_dense.bytes / 2**30, 2) if self.exl3_dense is not None else 0),
+            "exl3_merged": (os.environ.get("DSV41_EXL3_MERGED", "1") == "1"
+                            if self.expert_format == "exl3" else None),
             "batched_verify": self.batched_verify,
             "batched_verify_source": self.batched_verify_source,
             "kv_cache_qdq": bool(M_.KV_CACHE_QDQ),

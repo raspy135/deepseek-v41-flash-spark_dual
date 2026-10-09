@@ -56,6 +56,12 @@ _PREFILL_OFF = dict(pf_indexed=False, pf_hc=False, pf_index=False, pf_scaled=Fal
 CONFIGS['fused_pf_old'] = dict(CONFIGS['fused'], **_PREFILL_OFF)
 CONFIGS['fused_pf_new'] = dict(CONFIGS['fused'], pf_indexed=True, pf_hc=True, pf_index=True,
                                pf_scaled=True, pf_tiles=True)
+# Host ordering only (engine/v41_engine.py EARLY_VERIFY / EARLY_DRAFT): outputs must not change.
+CONFIGS['early_off'] = dict(CONFIGS['fused_pf_new'], early_verify=False, early_draft=False)
+CONFIGS['early_on'] = dict(CONFIGS['fused_pf_new'], early_verify=True, early_draft=True)
+# Decode attention + shared expert from the EXL3 dense pack (load with DSV41_EXL3_DENSE=1): numerics change.
+CONFIGS['x3_off'] = dict(CONFIGS['early_on'], x3=False)
+CONFIGS['x3_on'] = dict(CONFIGS['early_on'], x3=True)
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -125,6 +131,12 @@ def set_config(e, cfg):
             t.direct = cfg['engram_direct']  # read per gather by EngramTable._gather_rows_uncached
             t.direct_gather = t._ab_native[1] if t.direct else None
             t.native_gather = t._ab_native[0]
+    if 'x3' in cfg:
+        assert e.exl3_dense is not None, 'load with DSV41_EXL3_DENSE=1'
+        for L, w in enumerate(e.W.layers):
+            w._x3 = e.exl3_dense.layers[L] if cfg['x3'] else None
+    if 'early_draft' in cfg:
+        V.EARLY_VERIFY, V.EARLY_DRAFT = cfg['early_verify'], cfg['early_draft']  # read per step
     if lean.router_bf16:
         lean.prepare_router_weights([w.gate_w for w in e.W.layers])
 
@@ -146,9 +158,10 @@ def main():
     assert args.a in CONFIGS and args.b in CONFIGS and 1 <= args.prompts <= len(PROMPTS)
     V.save_prune_db = lambda *a, **kw: None
     root = os.environ['MODEL_DIR']
-    e = V.V41Engine(root, max_seq=32768, arena_gb=90.2,
+    e = V.V41Engine(root, max_seq=32768, arena_gb=float(os.environ.get('DSV41_BENCH_ARENA_GB', '90.2')),
                    trace_stats='/app/results/trace-union/stats/coverage.json',
-                   spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6)
+                   spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6,
+                   expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     e.confidence_depth_policy = None
     e.depth_policy.pinned = 3
     assert e.fast is not None and e.fast.lean is not None
@@ -205,7 +218,7 @@ def main():
     usable = [i for i in range(len(ids)) if by[(i, args.a)]['steps'] >= 8 and by[(i, args.b)]['steps'] >= 8]
     # Target arithmetic keys; draft-only and exact-schedule (fp8_bn/fp8_bk) differences must leave
     # greedy outputs bit-identical, so those A/Bs assert it.
-    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused'] + list(_PREFILL_OFF)
+    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused', 'x3'] + list(_PREFILL_OFF)
     draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in target_keys)
     report['summary'] = {
         'draft_only': draft_only,

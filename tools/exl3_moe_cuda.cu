@@ -307,6 +307,179 @@ void grouped_launch(const void* x0, const void* x1, const int64_t* tp0, const in
 #undef EXL3_LAUNCH
 }
 
+// ---------------------------------------------------------------- prefill: one decode per tile, MT m-tiles
+
+// One warp's NT n-tiles over the WHOLE K range, for the MT 16-row m-tiles of its block: every trellis
+// tile is decoded into mma fragments once and multiplied into all live m-tiles. grouped_kernel (the
+// decode kernel) instead gives each 16-row m-tile its own program, which decodes -- and reads from
+// DRAM -- the expert's weights again for every 16 rows of a prefill block.
+template <int CB, int K2, int NT, int PF, int MT>
+__device__ __forceinline__ void prefill_tiles(const uint32_t* __restrict__ T, int NTILES, int KT, int nt0,
+                                              const half* __restrict__ X, int K, const int* rows_sh, int nmt,
+                                              int lane, float (&acc)[MT][NT][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + (size_t)nt0 * TW + lane;
+    const int g = lane >> 2, t = lane & 3;
+    const half* xr0[MT];
+    const half* xr1[MT];
+    bool ok0[MT], ok1[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        const int r0 = rows_sh[m * 16 + g], r1 = rows_sh[m * 16 + g + 8];
+        ok0[m] = r0 >= 0;
+        ok1[m] = r1 >= 0;
+        xr0[m] = X + (size_t)(ok0[m] ? r0 : 0) * K + 2 * t;
+        xr1[m] = X + (size_t)(ok1[m] ? r1 : 0) * K + 2 * t;
+    }
+    uint32_t pf[PF][NT][LW];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < KT)
+#pragma unroll
+            for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
+
+    for (int ib = 0; ib < KT; ib += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int it = ib + d;
+            if (it < KT) {
+                uint32_t b[NT][2][2];
+#pragma unroll
+                for (int i = 0; i < NT; ++i) decode_tile<CB, K2>(pf[d][i], map, lane, b[i][0], b[i][1]);
+                if (it + PF < KT)
+#pragma unroll
+                    for (int i = 0; i < NT; ++i)
+                        load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
+                const int k = it * 16;
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    if (m < nmt) {
+                        uint32_t a[4] = {load_pair(xr0[m] + k, ok0[m]), load_pair(xr1[m] + k, ok1[m]),
+                                         load_pair(xr0[m] + k + 8, ok0[m]), load_pair(xr1[m] + k + 8, ok1[m])};
+#pragma unroll
+                        for (int i = 0; i < NT; ++i) {
+                            mma16816(acc[m][i][0], a, b[i][0]);
+                            mma16816(acc[m][i][1], a, b[i][1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Program (n block, routing block u, matrix): MT*16 member rows of one arena slot times the warps' NT
+// n-tiles each. Members are build_routing's block (row*32 + k codes, -1 padding at the end), so the
+// live rows of a block are a prefix and m-tiles past it are skipped. No split-K: Z is [mats, P, N].
+template <int CB, int NT, int W, int PF, int MT, int LO, int HI>
+__global__ void __launch_bounds__(W * 32) prefill_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int slots) {
+    const int u = blockIdx.y;
+    if (u >= ucount[0]) return;
+    const int e = uids[u];
+    if (e < 0) return;
+    const int mat = blockIdx.z;
+    __shared__ int rows_sh[MT * 16];
+    for (int i = threadIdx.x; i < MT * 16; i += W * 32) {
+        const int code = members[(size_t)u * MT * 16 + i];
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    int nmt = 0;
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+        if (rows_sh[m * 16] >= 0) nmt = m + 1;
+    if (nmt == 0) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int NTILES = N >> 4, KT = K >> 4;
+    const int nt0 = (blockIdx.x * W + warp) * NT;
+    if (nt0 >= NTILES) return;
+    const half* X = mat ? X1 : X0;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+
+    float acc[MT][NT][2][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
+
+    switch (k2) {
+#define EXL3_PCASE(K2_)                                                                                         \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            prefill_tiles<CB, K2_, NT, PF, MT>(T, NTILES, KT, nt0, X, K, rows_sh, nmt, lane, acc);              \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        EXL3_PCASE(2) EXL3_PCASE(3) EXL3_PCASE(4) EXL3_PCASE(5) EXL3_PCASE(6) EXL3_PCASE(7) EXL3_PCASE(8)
+        EXL3_PCASE(9) EXL3_PCASE(10)
+#undef EXL3_PCASE
+        default:
+            __trap();
+    }
+
+    float* Zm = Z + (size_t)mat * P * N;
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        if (m >= nmt) break;
+        const int r0 = rows_sh[m * 16 + g], r1 = rows_sh[m * 16 + g + 8];
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = (nt0 + i) * 16 + h * 8 + 2 * t;
+                if (r0 >= 0)
+                    *reinterpret_cast<float2*>(Zm + (size_t)r0 * N + col) = make_float2(acc[m][i][h][0], acc[m][i][h][1]);
+                if (r1 >= 0)
+                    *reinterpret_cast<float2*>(Zm + (size_t)r1 * N + col) = make_float2(acc[m][i][h][2], acc[m][i][h][3]);
+            }
+    }
+}
+
+template <int CB>
+void prefill_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                    const int* k2_1, const int* uids, const int* ucount, const int* members, float* z, int K, int N,
+                    int P, int slots, int nblocks, int mats, int bm, int nt, int warps, int pf, int lo, int hi,
+                    cudaStream_t stream) {
+    EXL3_CHECK(lo >= 4 && hi <= 6, "prefill kernel is built for 2- and 3-bit trellis (K2 4..6)");
+    const int ntiles = N / 16;
+#define EXL3_PLAUNCH(NT_, W_, PF_, MT_)                                                                         \
+    {                                                                                                           \
+        dim3 grid((unsigned)((ntiles + NT_ * W_ - 1) / (NT_ * W_)), (unsigned)nblocks, (unsigned)mats);         \
+        prefill_kernel<CB, NT_, W_, PF_, MT_, 4, 6><<<grid, W_ * 32, 0, stream>>>(                              \
+            (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
+    }
+    if (bm == 64 && nt == 4 && warps == 4 && pf == 2) EXL3_PLAUNCH(4, 4, 2, 4)
+    else if (bm == 64 && nt == 2 && warps == 4 && pf == 2) EXL3_PLAUNCH(2, 4, 2, 4)
+    else if (bm == 64 && nt == 4 && warps == 2 && pf == 2) EXL3_PLAUNCH(4, 2, 2, 4)
+    else if (bm == 64 && nt == 2 && warps == 8 && pf == 2) EXL3_PLAUNCH(2, 8, 2, 4)
+    else if (bm == 32 && nt == 4 && warps == 4 && pf == 2) EXL3_PLAUNCH(4, 4, 2, 2)
+    else if (bm == 32 && nt == 8 && warps == 4 && pf == 2) EXL3_PLAUNCH(8, 4, 2, 2)
+    else if (bm == 64 && nt == 4 && warps == 4 && pf == 3) EXL3_PLAUNCH(4, 4, 3, 4)
+    else if (bm == 32 && nt == 2 && warps == 4 && pf == 2) EXL3_PLAUNCH(2, 4, 2, 2)
+    else if (bm == 32 && nt == 4 && warps == 2 && pf == 2) EXL3_PLAUNCH(4, 2, 2, 2)
+    else if (bm == 32 && nt == 2 && warps == 8 && pf == 2) EXL3_PLAUNCH(2, 8, 2, 2)
+    else if (bm == 32 && nt == 4 && warps == 8 && pf == 2) EXL3_PLAUNCH(4, 8, 2, 2)
+    else if (bm == 32 && nt == 4 && warps == 4 && pf == 3) EXL3_PLAUNCH(4, 4, 3, 2)
+    else if (bm == 32 && nt == 4 && warps == 4 && pf == 4) EXL3_PLAUNCH(4, 4, 4, 2)
+    else if (bm == 48 && nt == 4 && warps == 4 && pf == 2) EXL3_PLAUNCH(4, 4, 2, 3)
+    else if (bm == 16 && nt == 8 && warps == 4 && pf == 2) EXL3_PLAUNCH(8, 4, 2, 1)
+    else if (bm == 16 && nt == 4 && warps == 4 && pf == 2) EXL3_PLAUNCH(4, 4, 2, 1)
+    else EXL3_CHECK(false, "unsupported prefill tile setting");
+#undef EXL3_PLAUNCH
+}
+
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
@@ -395,6 +568,47 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
     half* o = xd + (size_t)p * N + n;
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// Dense matrices (engine/exl3_dense.py): one program per (row, 128-block of K). Row r belongs to
+// group r % G (wo_a's head groups, stacked row-major as [T, G, K]); G = 1 for an ordinary matrix.
+template <typename TIN>
+__global__ void dense_rot_kernel(const TIN* __restrict__ x, int x_stride, const half* __restrict__ suh,
+                                 half* __restrict__ out, int K, int G) {
+    const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+    const half* s = suh + (size_t)(r % G) * K + blk * 128 + 4 * lane;
+    const TIN* xr = x + (size_t)r * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = to_f<TIN>(xr[j]) * __half2float(s[j]);
+    fwht128(v, lane);
+    half* o = out + (size_t)r * K + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// Splits summed in order, rotated, * svh of the row's group; bf16 (out_bf16) or fp32 out.
+__global__ void dense_out_kernel(const float* __restrict__ Z, const half* __restrict__ svh, void* __restrict__ out,
+                                 int rows, int N, int SK, int G, int out_bf16) {
+    const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+    const int n = blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float s = 0.f;
+        for (int q = 0; q < SK; ++q) s += Z[((size_t)q * rows + r) * N + n + j];
+        v[j] = s;
+    }
+    fwht128(v, lane);
+    const half* sv = svh + (size_t)(r % G) * N + n;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float y = v[j] * HAD_SCALE * __half2float(sv[j]);
+        if (out_bf16)
+            reinterpret_cast<__nv_bfloat16*>(out)[(size_t)r * N + n + j] = __float2bfloat16_rn(y);
+        else
+            reinterpret_cast<float*>(out)[(size_t)r * N + n + j] = y;
+    }
 }
 
 // down_epilogue then combine in one launch: rotate * svh_d, then sum over the top-k slots in order.
@@ -503,28 +717,42 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
 }
 
 // Decode grouping: distinct arena slots in first-occurrence order, O(P^2) and FIXED SHAPE, so it
-// is graph-capturable.  The arena can have >10k slots but a decode call routes at most ~64 picks,
-// so scanning the picks (not every slot) is both cheap and independent of the arena size.  Thread 0
-// does it serially; P<=64 makes that a few hundred iterations.
-__global__ void group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids,
-                                   int* __restrict__ ucount, int* __restrict__ members, int P, int slots,
-                                   int maxm) {
-    if (threadIdx.x != 0) return;
-    int n = 0;
-    for (int i = 0; i < P; ++i) {
-        const int e = pick[i];
-        bool first = true;
+// is graph-capturable.  The arena can have >10k slots but a decode call routes at most 64 picks,
+// so scanning the picks (not every slot) is both cheap and independent of the arena size.
+//
+// One thread per pick (two warps): pick i is a group leader if no earlier pick names its slot; its
+// group index is the number of leaders before it (two ballots), and it writes its own uid and
+// members.  Same output as the serial scan it replaced -- leaders in first-occurrence order,
+// members ascending -- which took 38-48 us a layer on the decode critical path (thread 0 alone,
+// a dependent global load per comparison); this takes a few.
+__global__ void __launch_bounds__(64) group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+                                                         int* __restrict__ ucount, int* __restrict__ members,
+                                                         int P, int slots, int maxm) {
+    __shared__ int sp[64];
+    __shared__ unsigned lead0;
+    const int i = threadIdx.x, lane = i & 31;
+    if (i < P) sp[i] = pick[i];
+    __syncthreads();
+    bool lead = false;
+    int e = 0;
+    if (i < P) {
+        e = sp[i];
+        lead = true;
         for (int j = 0; j < i; ++j)
-            if (pick[j] == e) { first = false; break; }
-        if (!first) continue;
+            if (sp[j] == e) { lead = false; break; }
+    }
+    const unsigned b = __ballot_sync(0xffffffffu, lead);
+    if (i == 0) lead0 = b;
+    __syncthreads();
+    const int n = __popc(b & ((1u << lane) - 1u)) + (i >= 32 ? __popc(lead0) : 0);
+    if (lead) {
         uids[n] = e;
         int m = 0;
         for (int j = i; j < P && m < maxm; ++j)
-            if (pick[j] == e) members[n * maxm + m++] = (j / slots) * 32 + (j % slots);
+            if (sp[j] == e) members[n * maxm + m++] = (j / slots) * 32 + (j % slots);
         for (; m < maxm; ++m) members[n * maxm + m] = -1;
-        ++n;
     }
-    ucount[0] = n;
+    if (i == 63) ucount[0] = __popc(lead0) + __popc(b);
 }
 
 }  // namespace exl3
@@ -538,7 +766,8 @@ void exl3m_group(const int* pick, int* uids, int* ucount, int* members, int R, i
     // decode-sized: group the picks, not the arena.  E is unused here (kept for ABI stability).
     (void)E;
     const int P = R * slots;
-    exl3::group_small_kernel<<<1, 32, 0, s>>>(pick, uids, ucount, members, P, slots, maxm);
+    EXL3_CHECK(P <= 64, "decode grouping takes at most 64 picks");
+    exl3::group_small_kernel<<<1, 64, 0, s>>>(pick, uids, ucount, members, P, slots, maxm);
 }
 
 void exl3m_rot_in(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
@@ -565,6 +794,14 @@ void exl3m_grouped(const void* X0, const void* X1, const int64_t* tp0, const int
                                  nexp_max, mats, nt, warps, pf, lo, hi, s);
 }
 
+void exl3m_prefill(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                   const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K, int N,
+                   int P, int slots, int nblocks, int mats, int bm, int nt, int warps, int pf, int lo, int hi,
+                   cudaStream_t s) {
+    exl3::prefill_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats,
+                            bm, nt, warps, pf, lo, hi, s);
+}
+
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,
                   void* xd, int rows, int P, int N, int SK, int slots, int E, int suh_d_stride, float limit,
                   int act_mode, cudaStream_t s) {
@@ -572,6 +809,23 @@ void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void
     exl3::gateup_epilogue_kernel<<<grid, 32, 0, s>>>(Z, pick, (const half*)svh_g, (const half*)svh_u,
                                                      (const half*)suh_d, (half*)xd, P, N, SK, E, suh_d_stride,
                                                      limit, act_mode);
+}
+
+void exl3m_dense_rot(const void* x, int x_stride, const void* suh, void* out, int rows, int K, int G, int x_bf16,
+                     cudaStream_t s) {
+    dim3 grid((unsigned)rows, (unsigned)(K / 128));
+    if (x_bf16)
+        exl3::dense_rot_kernel<__nv_bfloat16><<<grid, 32, 0, s>>>((const __nv_bfloat16*)x, x_stride,
+                                                                  (const half*)suh, (half*)out, K, G);
+    else
+        exl3::dense_rot_kernel<half><<<grid, 32, 0, s>>>((const half*)x, x_stride, (const half*)suh, (half*)out,
+                                                         K, G);
+}
+
+void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N, int SK, int G, int out_bf16,
+                     cudaStream_t s) {
+    dim3 grid((unsigned)rows, (unsigned)(N / 128));
+    exl3::dense_out_kernel<<<grid, 32, 0, s>>>(Z, (const half*)svh, out, rows, N, SK, G, out_bf16);
 }
 
 void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, float* y, const float* wts, float* out,

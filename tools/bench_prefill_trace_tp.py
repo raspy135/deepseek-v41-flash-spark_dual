@@ -65,6 +65,13 @@ ARMS = {
     # + prefill-only dot_scaled experts (DSV41_FP4_PREFILL_DOT_SCALED), and its 32-row tiles
     'all_sc': dict(indexed=True, hc=True, index=True, scaled=True),
     'all_sct': dict(indexed=True, hc=True, index=True, scaled=True, tiles=True),
+    # EXPERT_FORMAT=exl3 (DSV41_BENCH_EXPERT_FORMAT=exl3): the decode-shaped grouped kernel vs the
+    # prefill tile kernel (tools/exl3_moe_cuda.py PREFILL_*), serving's attention/HC/indexer switches on
+    'x3_grouped': dict(indexed=True, hc=True, index=True, x3='grouped', x3_bm=64),
+    'x3_tile': dict(indexed=True, hc=True, index=True, x3='tile', x3_tile='4x2x2', x3_bm=32),
+    'x3_tile16': dict(indexed=True, hc=True, index=True, x3='tile', x3_tile='4x4x2', x3_bm=16),
+    # the tile kernel with routing grouped by unique() per layer instead of the static compact routes
+    'x3_tile_unique': dict(indexed=True, hc=True, index=True, x3='tile', x3_tile='4x2x2', x3_bm=32, fixed=False),
 }
 
 
@@ -79,6 +86,11 @@ def set_arm(e, name):
     M.PREFILL_ATTN_INDEXED, M.HC_PREFILL_FUSED, M.INDEX_FUSED = cfg['indexed'], cfg['hc'], cfg['index']
     import fp4_moe as K  # the module the engine's moe_fn reads at call time
     K.PREFILL_DOT_SCALED, K.PREFILL_SCALED_TILES = cfg.get('scaled', False), cfg.get('tiles', False)
+    os.environ['DSV41_PREFILL_FIXED_ROUTING'] = '1' if cfg.get('fixed', True) else '0'  # read per MoE call
+    if 'x3' in cfg:
+        import exl3_moe_cuda as XC  # read per call by moe_forward_prefill
+        XC.PREFILL_KERNEL, XC.PREFILL_BM = cfg['x3'], cfg['x3_bm']
+        XC.PREFILL_TILE = cfg.get('x3_tile', XC.PREFILL_TILE)
     assert len(set(e.ep.gather_objects(json.dumps([name, cfg], sort_keys=True)))) == 1
 
 
@@ -172,7 +184,8 @@ def main():
     max_tokens = max([args.tokens] + [t for _, t in longs])
     e = V.V41Engine(root, max_seq=args.max_seq or max(65536, 1 << (max_tokens + 1024).bit_length()), arena_gb=90.2,
                    trace_stats='/app/results/trace-union/stats/coverage.json',
-                   spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6)
+                   spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6,
+                   expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     os.makedirs(args.out, exist_ok=True)
     owner = os.stat('/app/results')
     tok, enc = Tok(root), load_encoding_module(root)

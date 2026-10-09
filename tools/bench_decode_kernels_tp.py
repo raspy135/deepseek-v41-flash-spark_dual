@@ -25,7 +25,7 @@ from bench_decode_block_tp import WORKLOADS
 from torch.profiler import profile, ProfilerActivity
 
 FAMILIES = (
-    (r'_moe_|cb3|fp4_moe', 'routed experts'),
+    (r'_moe_|cb3|fp4_moe|exl3::', 'routed experts'),
     (r'_fp8_|_fp4_linear|_fp4_grouped', 'dense projections'),
     (r'nccl', 'nccl'),
     (r'bf16_s161616gemm|nvjet', 'bf16 gemm'),
@@ -54,7 +54,8 @@ def main():
     root = os.environ['MODEL_DIR']
     e = V.V41Engine(root, max_seq=524288, arena_gb=90,
                    trace_stats='/app/results/trace-union/stats/coverage.json',
-                   spec=True, prune_keep=.61, transient_slots=16, keep_free_gb=6)
+                   spec=True, prune_keep=.61, transient_slots=16, keep_free_gb=6,
+                   expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     tok, enc = Tok(root), load_encoding_module(root)
     eos = tok.token_to_id(enc.eos_token)
     greedy = [(n, p) for n, p, t in WORKLOADS if t == 0 and n in ('html', 'python', 'explain')]

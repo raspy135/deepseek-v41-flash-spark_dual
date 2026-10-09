@@ -84,6 +84,10 @@ LEAN_SOFTMAX = os.environ.get("DSV41_DECODE_LEAN_SOFTMAX", "1") == "1"
 LEAN_MOE = os.environ.get("DSV41_DECODE_LEAN_MOE", "1") == "1"
 # Within LEAN: the torch verify attention gathers its keys straight into fp32 (_attention_lean).
 LEAN_ATTN = os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1"
+# EXPERT_FORMAT=exl3: LEAN_MOE's two shared gathers for the EXL3 routed experts too (_moe_merged_exl3),
+# over the RoCE one-shot path instead of moe_forward's two NCCL ring gathers. Exact (same kernels,
+# same fp32 sum order); changes the collectives both ranks run, so the boot guard pins it.
+EXL3_MERGED = os.environ.get("DSV41_EXL3_MERGED", "1") == "1"
 
 
 def merge_decode_projections(weights) -> int:
@@ -274,6 +278,8 @@ class FastDecoder:
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
         self.d_probs = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)
+        # (tok, last_main_pos) of a greedy draft already queued by draft_ahead(), or None
+        self._ahead = None
         self.d_conf = torch.zeros(T_DRAFT, dtype=torch.float32, device=dev)   # raw logits, SPEC_CONF only
         self.d_top2 = torch.zeros(T_DRAFT, 2, dtype=torch.long, device=dev)   # drafter top-2, TREE_PROBE only
         # Mode-independent draft constants.  They used to be rebuilt by captured fill/arange
@@ -489,7 +495,12 @@ class FastDecoder:
         fq = (self._step_memo(("fq", freqs.data_ptr()), lambda: freqs[pos]) if lean_step
               else freqs[pos])
         both = getattr(w, "_wqkv_a", None) if MERGED_PROJ else None
-        if both is not None:
+        x3 = getattr(w, "_x3", None) if mtp_last is None else None
+        if x3 is not None:
+            # EXL3 decode matrices (engine/exl3_dense.py): two GEMVs, each with its own input rotation
+            self._pf_wait("qkv")
+            q_lin, kv_lin = x3.wq_a(x), x3.wkv(x)
+        elif both is not None:
             self._pf_wait("qkv")
             qkv = R.qlinear(x, both)
             # contiguous: the norms' reductions then see exactly the tensors the split path makes
@@ -504,7 +515,8 @@ class FastDecoder:
             return self._attention_lean(x, qr, kv_lin, w, L, ring, fq, pos, sh_state)
         self._pf_wait("qkv")
         self._pf_wait("wq_b")
-        q = self._rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
+        q_b = x3.wq_b(qr) if x3 is not None else R.qlinear(qr, w.wq_b)
+        q = self._rope(q_b.view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim), fq)
         kv = self._rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq)
         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
@@ -575,6 +587,8 @@ class FastDecoder:
                 o = (self._verify_attention_product("thn,tnd->thd", probs, keys) if mtp_last is None
                      else torch.einsum("thn,tnd->thd", probs, keys)).to(torch.bfloat16)
         o = self._rope(o, fq, inverse=True).reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)
+        if x3 is not None:
+            return x3.wo_b(x3.wo_a(o))
         o = R.wo_a_proj(o, w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
 
@@ -588,7 +602,9 @@ class FastDecoder:
         rd = a.rope_head_dim
         self._pf_wait("qkv")
         self._pf_wait("wq_b")
-        qf = self.lean.rope(R.qlinear(qr, w.wq_b).view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim),
+        x3 = getattr(w, "_x3", None)
+        q_b = x3.wq_b(qr) if x3 is not None else R.qlinear(qr, w.wq_b)
+        qf = self.lean.rope(q_b.view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim),
                             fq, rd, out_f32=True)
         kv = self.lean.rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq, rd)
         slot_w, slot_r, wmask = self._step_memo("win", lambda: self._window(pos))
@@ -603,8 +619,8 @@ class FastDecoder:
         prefetch = self.attn_prefetch_mb and self.l2pf_side is not None
         if prefetch:
             self.l2pf_side.wait_stream(torch.cuda.current_stream())
-            l2pf.touch(self.l2pf_side, [w.wo_a, w.wo_b], self.attn_prefetch_mb * 1024**2,
-                        mode="bulk", pace=0)
+            l2pf.touch(self.l2pf_side, [x3.wo_a, x3.wo_b] if x3 is not None else [w.wo_a, w.wo_b],
+                        self.attn_prefetch_mb * 1024**2, mode="bulk", pace=0)
         kvf = self.lean.keys_f32(ring, slot_r, cache, idx,
                                dtype=torch.bfloat16 if self.staged_attention == 2 else torch.float32)
         if self.staged_attention:
@@ -617,6 +633,8 @@ class FastDecoder:
         o = self.lean.rope(raw, fq, rd, inverse=True)
         if prefetch:
             torch.cuda.current_stream().wait_stream(self.l2pf_side)
+        if x3 is not None:
+            return x3.wo_b(x3.wo_a(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)))
         o = R.wo_a_proj(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1), w.wo_a, tiled=True)
         return R.qlinear(o.flatten(1), w.wo_b)
 
@@ -775,9 +793,14 @@ class FastDecoder:
         self._tap('h_in', L, h)
         if self.qkv_prefetch_mb and self.l2pf_side is not None and self.lean is not None:
             mb = self.qkv_prefetch_mb * 1024 ** 2
-            qkv = [w._wqkv_a] if getattr(w, "_wqkv_a", None) is not None else [w.wq_a, w.wkv]
+            x3 = getattr(w, "_x3", None)
+            if x3 is not None:
+                qkv, wq_b = [x3.wq_a, x3.wkv], x3.wq_b
+            else:
+                qkv = [w._wqkv_a] if getattr(w, "_wqkv_a", None) is not None else [w.wq_a, w.wkv]
+                wq_b = w.wq_b
             first = min(mb, sum(l2pf.raw(t).numel() * l2pf.raw(t).element_size() for t in qkv))
-            self._prefetch([("qkv", qkv, first), ("wq_b", [w.wq_b], mb - first)])
+            self._prefetch([("qkv", qkv, first), ("wq_b", [wq_b], mb - first)])
         if L in self.W.engram:
             h = R.engram_forward(h, self.eg_rows[L], self.W.engram[L], a)
         if L in a.dspark_target_layer_ids:
@@ -794,7 +817,9 @@ class FastDecoder:
         y = self._attention(y, w, L, self.c.win[L], self.m.freqs_c if w.ratio else self.m.freqs_w, self.pos, sh_state)
         self._tap('attn_out', L, y)
         if self.sh_prefetch_mb and self.l2pf_side is not None and getattr(w, "_sh_w13", None) is not None:
-            self._prefetch([("shared", [w._sh_w13, w.sh_w2], self.sh_prefetch_mb * 1024 ** 2)])
+            x3d = getattr(self.eng, "exl3_dense", None) if getattr(w, "_x3", None) is not None else None
+            targets = x3d.shared_targets(L) if x3d is not None else [w._sh_w13, w.sh_w2]
+            self._prefetch([("shared", targets, self.sh_prefetch_mb * 1024 ** 2)])
         if self.lean is not None:
             # written in place: hc_post reads a tile's residual streams before it stores the tile
             h = _hc_post_fused(y, residual, attn_post, attn_comb, out=self.h)
@@ -888,6 +913,8 @@ class FastDecoder:
             return False
         store = self.m.store
         arena = getattr(store, "arena", None)
+        if getattr(self.eng, "kernel", None) == "exl3-cuda":
+            return self._merged_check_exl3(arena)
         if getattr(store, "null_slot", None) is None or not getattr(arena, "tp_output", False):
             return False
         if getattr(arena, "tp_world", 1) != 2 or getattr(self.eng, "kernel", None) != "triton-fp4":
@@ -907,6 +934,100 @@ class FastDecoder:
         return (w13 is not None and isinstance(w.sh_w2, OutputParallelWeight)
                 and type(w.sh_w2.local) is FP8Weight and w.sh_w1.N == arena.w1.shape[1]
                 and w.sh_w2.local.shape[0] == arena.w2.shape[1] and T_VERIFY * self.a.n_activated_experts <= 64)
+
+    def _merged_check_exl3(self, arena) -> bool:
+        """The EXL3 twin of the FP4 conditions below: TP2 output layout, FP8 shared expert whose
+        column split matches the arena's, decode-sized blocks, activations not fake-quantized."""
+        if not EXL3_MERGED or getattr(arena, "tp_world", 1) != 2:
+            return False
+        try:
+            import exl3_moe as X3
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(arena, X3.Exl3Arena) or R.act_qdq_fp8 is R._ACT_QDQ_REF:
+            return False
+        from engine.tensor_parallel import OutputParallelWeight
+        from fp8_linear import FP8Weight
+        w = self.W.layers[0]
+        return (getattr(w, "_sh_w13", None) is not None and isinstance(w.sh_w2, OutputParallelWeight)
+                and type(w.sh_w2.local) is FP8Weight and w.sh_w1.N == arena.inter
+                and w.sh_w2.local.shape[0] == arena.down_n and T_VERIFY * self.a.n_activated_experts <= 64)
+
+    def _moe_merged_exl3(self, L, w):
+        """_moe_merged for EXL3 routed experts (tools/exl3_moe_cuda.py's decode kernels).
+
+        Same two collectives as the FP4 version. The routed intermediate here is the fp16 ROTATED
+        down input (gateup_epilogue's Xd) and the shared one is bf16; both are 16-bit, so they are
+        stacked as raw words and gathered as one buffer, then each half is read back in its own
+        dtype -- a gather moves bytes, so neither changes. The outputs are summed in fp32 before the
+        second gather, routed first, which is what hc_post(x2=) computed after two gathers."""
+        import exl3_moe_cuda as XC
+        a = self.a
+        arena = self.m.store.arena
+        x = self.y
+        T, k = self.route_idx.shape
+        P = T * k
+        inter, down_n, world = arena.inter, arena.down_n, arena.tp_world
+        side = self.shared_stream
+        main = torch.cuda.current_stream(self.dev)
+        h_all = torch.empty(P + T, inter, dtype=torch.int16, device=x.device)
+        x3d = getattr(self.eng, "exl3_dense", None) if getattr(w, "_x3", None) is not None else None
+        if x3d is not None:
+            # the shared expert is one more EXL3 expert: slot L of a 5-bit arena, weight 1; its
+            # gathered half is the fp16 rotated down input, like the routed rows above it
+            sh_arena = x3d.shared_arena
+            sh_pick = x3d.shared_pick[L, :T]
+            sh_grp = XC.decode_group(sh_pick, T, 1, sh_arena)
+
+        def shared_up():
+            if x3d is not None:
+                XC.decode_up(x, sh_pick, sh_grp, sh_arena, T, 1, a.swiglu_limit, h_all[P:].view(torch.float16))
+                return
+            gu = R.qlinear(x, w._sh_w13)
+            self.lean.swiglu(gu, w.sh_w1.N, a.swiglu_limit, out=h_all[P:].view(torch.bfloat16))
+
+        if side is not None:
+            side.wait_stream(main)
+            self._pf_wait("shared", side)
+            with torch.cuda.stream(side):
+                shared_up()
+        else:
+            self._pf_wait("shared")
+        torch.index_select(self.lut[L], 0, self.route_idx.view(-1), out=self.slots.view(-1))
+        pick = self.slots.view(-1)
+        grp = XC.decode_group(pick, T, k, arena)
+        XC.decode_up(x, pick, grp, arena, T, k, a.swiglu_limit, h_all[:P].view(torch.float16))
+        if side is not None:
+            main.wait_stream(side)
+        else:
+            shared_up()
+        gathered = torch.empty(world * (P + T), inter, dtype=torch.int16, device=x.device)
+        if self.l2pf_side is not None:
+            self.l2pf_side.wait_stream(main)
+            l2pf.touch(self.l2pf_side, self._l2pf_targets(L), l2pf.budget_bytes())
+        _comm.all_gather_fast(gathered, h_all)
+        if self.l2pf_side is not None:
+            main.wait_stream(self.l2pf_side)
+        full = gathered.view(world, P + T, inter).transpose(0, 1).reshape(P + T, world * inter)
+        def shared_down():
+            if x3d is not None:
+                return XC.decode_down(full[P:].view(torch.float16), sh_pick, sh_grp, x3d.ones[:T], sh_arena, T, 1)
+            return R.mm(full[P:].view(torch.bfloat16), w.sh_w2.local)
+
+        if side is not None:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                local_s = shared_down()
+        local = XC.decode_down(full[:P].view(torch.float16), pick, grp, self.route_w, arena, T, k)
+        if side is not None:
+            main.wait_stream(side)
+            local_s.record_stream(main)
+        else:
+            local_s = shared_down()
+        local += local_s
+        out = torch.empty(world * T, down_n, dtype=torch.float32, device=x.device)
+        _comm.all_gather_fast(out, local)
+        _hc_post_fused(out, self.h, self.ffn_post, self.ffn_comb, out=self.h, split_w=down_n)
 
     def _moe_merged(self, L, w):
         """_routed_experts() + _shared_ffn() + the add, with two all-gathers instead of four.
@@ -987,6 +1108,10 @@ class FastDecoder:
         if L + 1 >= len(self.W.layers):
             return []
         nxt = self.W.layers[L + 1]
+        x3 = getattr(nxt, "_x3", None)
+        if x3 is not None:
+            return ([x3.wq_a, x3.wkv, x3.wq_b, x3.wo_b, x3.wo_a, nxt.hc_attn_fn, nxt.hc_ffn_fn]
+                    + self.eng.exl3_dense.shared_targets(L + 1))
         names = ("wq_a", "wkv", "wq_b", "wo_b", "wo_a", "hc_attn_fn", "hc_ffn_fn",
                  "sh_w1", "sh_w2", "sh_w3")
         return [getattr(nxt, n) for n in names if getattr(nxt, n, None) is not None]
@@ -995,7 +1120,10 @@ class FastDecoder:
         a = self.a
         w = self.W.layers[L]
         if L not in self.stream_layers and self._moe_merged_ok(w):
-            self._moe_merged(L, w)
+            if getattr(self.eng, "kernel", None) == "exl3-cuda":
+                self._moe_merged_exl3(L, w)
+            else:
+                self._moe_merged(L, w)
             self.pre_mix.copy_(self.ffn_pre)
             return
         self._pf_join()
@@ -1480,12 +1608,17 @@ class FastDecoder:
                 self.c.pending.update(pending)
             self.prepare_pending_buffers()  # capture's warm-up/capture runs overwrite the buffers
         t0 = time.perf_counter()
-        futs = rows_fn() if rows_fn is not None else None  # {layer: Future} -- reads already in flight
+        gA, gB, gF, gD, segs = self.graphs[graph_key] if self.use_graphs else (None,) * 5
+        # {layer: Future} -- reads already in flight. With segments, the call waits until the first
+        # Engram boundary: the caller's `rows` may block on the hash ids, and the segment before
+        # that boundary needs none (v41_engine._engram_rows_async).
+        futs = rows_fn() if rows_fn is not None and segs is None else None
         _ev_layers = self._ev_begin("layers")
         if self.use_graphs:
-            gA, gB, gF, gD, segs = self.graphs[graph_key]
             if segs is not None:
                 for lo, g, gB in segs:
+                    if futs is None and rows_fn is not None and lo in self.a.engram_layer_ids:
+                        futs = rows_fn()
                     if futs is not None and lo in futs:
                         # this boundary's rows were read while the previous segment ran on the GPU
                         t0r = time.perf_counter()
@@ -1550,7 +1683,29 @@ class FastDecoder:
             self.rs_steps += 1
         return self.logits, self.main_hidden
 
+    def draft_ahead(self, count: torch.Tensor, argmax: torch.Tensor, pos: int) -> bool:
+        """Queue the greedy drafter for a verify block's outcome before the host has read it.
+
+        `count` is the block's accepted-draft count and `argmax` the target's per-row argmax, both
+        on the GPU: the next draft starts from token argmax[count] at main position pos + count,
+        which is what the host would pass to draft() after reading them. Writing d_tok/d_last
+        on the device lets the drafter run while the host reads the result, emits tokens and runs
+        the per-step control handshake; draft() then returns this draft if its arguments match
+        (the caller records them in self._ahead), else drafts again. Greedy graphs only."""
+        if not (self.use_graphs and self.draft_graphs is not None):
+            return False
+        torch.index_select(argmax, 0, count, out=self.d_tok)
+        torch.add(count, pos, out=self.d_last)
+        self.d_temp.zero_()
+        t0 = time.perf_counter()
+        self.draft_graphs[0].replay()
+        self.stats["draft_s"] += time.perf_counter() - t0
+        return True
+
     def draft(self, tok: int, last_main_pos: int, temperature: float):
+        ahead, self._ahead = self._ahead, None
+        if ahead is not None and temperature <= 0 and ahead == (tok, last_main_pos):
+            return self.d_out, self.d_probs
         self.d_tok.fill_(tok); self.d_last.fill_(last_main_pos); self.d_temp.fill_(temperature)
         greedy = temperature <= 0
         if not greedy:

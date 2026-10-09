@@ -28,10 +28,42 @@ def ok(cond, msg):
         fails.append(msg)
 
 
+def serial_group(pick, slots, maxm=16):
+    """The serial scan exl3m_group's kernel replaced: leaders in first-occurrence order, members ascending."""
+    uids, members = [], []
+    for i, e in enumerate(pick):
+        if e in pick[:i]:
+            continue
+        m = [(j // slots) * 32 + (j % slots) for j in range(i, len(pick)) if pick[j] == e][:maxm]
+        uids.append(e)
+        members.append(m + [-1] * (maxm - len(m)))
+    return uids, members
+
+
+def check_grouping():
+    g = torch.Generator().manual_seed(1)
+    for T in (1, 2, 4, 6, 8, 10):
+        for pool in (3, 9, 40, 1000):
+            P = T * 6
+            if P > 64:
+                continue
+            pick = torch.randint(-1, pool, (P,), generator=g, dtype=torch.int32)
+            arena = type("A", (), {"slots": 13522})()
+            uids, ucount, members = XC.decode_group(pick.cuda(), T, 6, arena)
+            ru, rm = serial_group(pick.tolist(), 6)
+            n = int(ucount.item())
+            same = (n == len(ru) and uids[:n].tolist() == ru and members[:n].tolist() == rm)
+            if not same:
+                ok(False, f"grouping T={T} pool={pool}")
+                return
+    ok(True, "decode grouping == serial scan (T 1-10, pools 3-1000, -1 picks)")
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no CUDA")
         return 0
+    check_grouping()
     src = SourceCheckpoint(SRC)
     bits = src.layer_bits()
     l3 = [L for L in range(40) if bits[L] == 3][: max(1, E // 2)]

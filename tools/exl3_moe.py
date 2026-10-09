@@ -156,15 +156,18 @@ _CUDA = None
 @torch.no_grad()
 def moe_forward_exl3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
                      swiglu_limit: float = 10.0, out_dtype: torch.dtype = torch.bfloat16, **kwargs):
-    """Engine entry point. The CUDA kernel handles decode-sized calls (the graph path); the torch
-    reference covers prefill until the P4 kernel lands. The reference is NOT graph-capturable, so
-    prefill must stay eager (it is).
+    """Engine entry point. CUDA kernels for both shapes: decode-sized calls (P <= 64, the graph
+    path) and prefill (exl3_moe_cuda.moe_forward_prefill: the tile kernel, with the engine's static
+    per-layer routes when it passes routing_ids/routing_slot_map). The torch reference remains the
+    fallback without nvcc; it is NOT graph-capturable.
     """
     if cuda_available():
         import exl3_moe_cuda as XC
         if slots.numel() <= 64:
             return XC.moe_forward(x, slots, weights, arena, swiglu_limit).to(out_dtype)
-        return XC.moe_forward_prefill(x, slots, weights, arena, swiglu_limit).to(out_dtype)
+        return XC.moe_forward_prefill(x, slots, weights, arena, swiglu_limit,
+                                      routing_ids=kwargs.get("routing_ids"),
+                                      routing_slot_map=kwargs.get("routing_slot_map")).to(out_dtype)
     return moe_forward_exl3_ref(x, slots, weights, arena, swiglu_limit, out_dtype=out_dtype)
 
 

@@ -1071,10 +1071,29 @@ class Model:
         tot = self._miss_tot.sum(dim=0)
         return float(tot[0]), float(tot[1])
 
+    def stage_decode_miss(self):
+        """Queue the decode counter pair's copy into pinned memory on the current stream, without
+        waiting; the next decode_miss_snapshot() returns it. The greedy loop calls this right
+        after a verify block and before it queues the next draft (DSV41_EARLY_DRAFT), then waits
+        for the copy with the block's own readback. The drafter records no misses, so these are
+        the values a synchronous read after the draft returns -- without the host waiting for
+        the drafter, which a .tolist() on the stream did at the top of every step."""
+        if self._miss_phase is None:
+            return
+        src = self._miss_phase[1]
+        pin = getattr(self, "_miss_pin", None)
+        if pin is None or pin.shape != src.shape or pin.dtype != src.dtype:
+            pin = self._miss_pin = torch.empty(src.shape, dtype=src.dtype, pin_memory=True)
+        pin.copy_(src, non_blocking=True)
+        self._miss_staged = True
+
     def decode_miss_snapshot(self):
         """Existing decode-only counters: one tiny readback, no new per-layer work."""
         if self._miss_phase is None:
             return None
+        if getattr(self, "_miss_staged", False):
+            self._miss_staged = False
+            return tuple(self._miss_pin.tolist())
         return tuple(self._miss_phase[1].tolist())
 
     def miss_mass_snapshot(self):
@@ -1085,6 +1104,7 @@ class Model:
 
     def reset_prune_miss(self):
         self._want_counts = self._want_mass = self._miss_tot = None
+        self._miss_staged = False
 
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
@@ -1251,7 +1271,14 @@ class Model:
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
             self.stats["ep_calls"] += 1                      # ep_s/ep_calls = per-collective cost
         elif not sector_stream:
-            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, prefill=prefill).float()
+            # TP without a null slot (EXPERT_FORMAT=exl3): the same static per-layer compact routes as
+            # the branch above, so prefill routing needs no unique() and no host sync per layer.
+            route = (getattr(self, "prefill_routes", {}).get(L)
+                     if prefill and not streaming and not rescued else None)
+            route_args = {}
+            if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
+                route_args = dict(routing_ids=route[0][indices], routing_slot_map=route[1])
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, prefill=prefill, **route_args).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         # A TP shared expert's RowParallelWeight reduces before BF16 rounding inside
